@@ -1,0 +1,8 @@
+{
+  "name": "stub",
+  "version": "0.1.0",
+  "protocol": "1.0",
+  "capabilities": ["stub.echo", "stub.fail"],
+  "entry": "./stub.sh",
+  "description": "Self-contained stub plugin for the opurom-core test suite"
+}

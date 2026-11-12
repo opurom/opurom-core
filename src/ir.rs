@@ -17,6 +17,8 @@ pub struct Action {
     pub op: Op,
     pub target: String,
     pub value: Option<Value>,
+    /// State whose current value is read when this action executes.
+    pub value_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +27,8 @@ pub struct Node {
     pub kind: String,
     pub props: Map<String, Json>,
     pub children: Vec<Node>,
-    pub events: HashMap<String, Action>,
+    pub when: Option<String>,
+    pub events: HashMap<String, Vec<Action>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +75,10 @@ fn typed_value(json: &Json, declared: &Value, name: &str) -> Result<Value, CoreE
     })
 }
 
+fn same_declared_type(left: &Value, right: &Value) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
 fn parse_state(items: &[Json]) -> Result<(Vec<StateDecl>, HashMap<String, Value>), CoreError> {
     let mut decls = Vec::with_capacity(items.len());
     let mut types = HashMap::new();
@@ -100,7 +107,11 @@ fn parse_state(items: &[Json]) -> Result<(Vec<StateDecl>, HashMap<String, Value>
                     .ok_or_else(|| invalid(format!("{at}.init must be a string for type string")))?
                     .to_owned(),
             ),
-            _ => return Err(invalid(format!("{at}.type {kind:?} is not int, bool or string"))),
+            _ => {
+                return Err(invalid(format!(
+                    "{at}.type {kind:?} is not int, bool or string"
+                )))
+            }
         };
         if types.insert(name.clone(), value.clone()).is_some() {
             return Err(invalid(format!("duplicate state name {name:?}")));
@@ -108,6 +119,38 @@ fn parse_state(items: &[Json]) -> Result<(Vec<StateDecl>, HashMap<String, Value>
         decls.push(StateDecl { name, value });
     }
     Ok((decls, types))
+}
+
+fn validate_value_from(
+    object: &Map<String, Json>,
+    target: &str,
+    declared: &Value,
+    types: &HashMap<String, Value>,
+    at: &str,
+    require_int: bool,
+) -> Result<String, CoreError> {
+    let source = object
+        .get("valueFrom")
+        .and_then(Json::as_str)
+        .ok_or_else(|| invalid(format!("{at}.valueFrom must be a string state name")))?
+        .to_owned();
+    let source_declared = types.get(&source).ok_or_else(|| {
+        invalid(format!(
+            "{at}.valueFrom {source:?} is not declared in state"
+        ))
+    })?;
+    if require_int && !matches!(source_declared, Value::Int(_)) {
+        return Err(invalid(format!(
+            "{at}: add requires an int valueFrom source, {source:?} is {}",
+            source_declared.type_name()
+        )));
+    }
+    if !same_declared_type(declared, source_declared) {
+        return Err(invalid(format!(
+            "{at}: valueFrom {source:?} must have the same declared type as {target:?}"
+        )));
+    }
+    Ok(source)
 }
 
 fn parse_action(
@@ -121,13 +164,19 @@ fn parse_action(
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
     let op = string_field(object, "op", at)?;
     let target = string_field(object, "target", at)?;
-    let declared = types.get(&target).ok_or_else(|| {
-        invalid(format!(
-            "{at}.target {target:?} is not declared in state"
-        ))
-    })?;
+    let declared = types
+        .get(&target)
+        .ok_or_else(|| invalid(format!("{at}.target {target:?} is not declared in state")))?;
     let raw_value = object.get("value");
-    let value = match op.as_str() {
+    let raw_from = object.get("valueFrom");
+    if raw_value.is_some() && raw_from.is_some() {
+        return Err(invalid(format!(
+            "{at}: value and valueFrom are mutually exclusive"
+        )));
+    }
+    let value;
+    let value_from;
+    match op.as_str() {
         "add" => {
             if !matches!(declared, Value::Int(_)) {
                 return Err(invalid(format!(
@@ -135,10 +184,18 @@ fn parse_action(
                     declared.type_name()
                 )));
             }
-            let n = raw_value
-                .and_then(Json::as_i64)
-                .ok_or_else(|| invalid(format!("{at}: add requires an integer value")))?;
-            Some(Value::Int(n))
+            if raw_from.is_some() {
+                value = None;
+                value_from = Some(validate_value_from(
+                    object, &target, declared, types, at, true,
+                )?);
+            } else {
+                let n = raw_value
+                    .and_then(Json::as_i64)
+                    .ok_or_else(|| invalid(format!("{at}: add requires an integer value")))?;
+                value = Some(Value::Int(n));
+                value_from = None;
+            }
         }
         "toggle" => {
             if !matches!(declared, Value::Bool(_)) {
@@ -147,14 +204,24 @@ fn parse_action(
                     declared.type_name()
                 )));
             }
-            if raw_value.is_some() {
+            if raw_value.is_some() || raw_from.is_some() {
                 return Err(invalid(format!("{at}: toggle must not have a value")));
             }
-            None
+            value = None;
+            value_from = None;
         }
-        "set" => match raw_value {
-            Some(raw) => Some(typed_value(raw, declared, &target)?),
-            None => {
+        "set" => match (raw_value, raw_from) {
+            (Some(raw), None) => {
+                value = Some(typed_value(raw, declared, &target)?);
+                value_from = None;
+            }
+            (None, Some(_)) => {
+                value = None;
+                value_from = Some(validate_value_from(
+                    object, &target, declared, types, at, false,
+                )?);
+            }
+            (None, None) => {
                 if event != "input" {
                     return Err(invalid(format!(
                         "{at}: set without value is only legal for input events"
@@ -165,7 +232,13 @@ fn parse_action(
                         "{at}: input set without value requires a string target"
                     )));
                 }
-                None
+                value = None;
+                value_from = None;
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "{at}: value and valueFrom are mutually exclusive"
+                )))
             }
         },
         _ => return Err(invalid(format!("{at}.op {op:?} is not set, add or toggle"))),
@@ -175,7 +248,39 @@ fn parse_action(
         "add" => Op::Add,
         _ => Op::Toggle,
     };
-    Ok(Action { op, target, value })
+    Ok(Action {
+        op,
+        target,
+        value,
+        value_from,
+    })
+}
+
+fn parse_actions(
+    json: &Json,
+    event: &str,
+    types: &HashMap<String, Value>,
+    at: &str,
+) -> Result<Vec<Action>, CoreError> {
+    let object = json
+        .as_object()
+        .ok_or_else(|| invalid(format!("{at} must be an object")))?;
+    let Some(raw_actions) = object.get("actions") else {
+        return Ok(vec![parse_action(json, event, types, at)?]);
+    };
+    if object.contains_key("op") {
+        return Err(invalid(format!(
+            "{at}: actions wrapper must not also contain op"
+        )));
+    }
+    let actions = raw_actions
+        .as_array()
+        .ok_or_else(|| invalid(format!("{at}.actions must be an array")))?;
+    actions
+        .iter()
+        .enumerate()
+        .map(|(i, action)| parse_action(action, event, types, &format!("{at}.actions[{i}]")))
+        .collect()
 }
 
 fn parse_node(
@@ -211,6 +316,11 @@ fn parse_node(
             &format!("{at}.children[{i}]"),
         )?);
     }
+    let when = match object.get("when") {
+        None => None,
+        Some(Json::String(value)) => Some(value.clone()),
+        Some(_) => return Err(invalid(format!("{at}.when must be a string"))),
+    };
     let events_json = field(object, "events", at)?
         .as_object()
         .ok_or_else(|| invalid(format!("{at}.events must be an object")))?;
@@ -218,7 +328,7 @@ fn parse_node(
     for (event, action) in events_json {
         events.insert(
             event.clone(),
-            parse_action(action, event, types, &format!("{at}.events.{event}"))?,
+            parse_actions(action, event, types, &format!("{at}.events.{event}"))?,
         );
     }
     Ok(Node {
@@ -226,6 +336,7 @@ fn parse_node(
         kind,
         props,
         children,
+        when,
         events,
     })
 }
@@ -244,7 +355,11 @@ impl Ir {
                     "unsupported IR version {v:?}; expected {IR_VERSION:?}"
                 )))
             }
-            _ => return Err(invalid(format!("root.ir must be the string {IR_VERSION:?}"))),
+            _ => {
+                return Err(invalid(format!(
+                    "root.ir must be the string {IR_VERSION:?}"
+                )))
+            }
         };
         let app = string_field(object, "app", "root")?;
         let state_json = field(object, "state", "root")?

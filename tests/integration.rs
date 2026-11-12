@@ -69,7 +69,10 @@ fn rejects_bad_ir_version() {
     let bad = GOLDEN.replace("\"ir\": \"0.1\"", "\"ir\": \"0.2\"");
     assert_ne!(bad, GOLDEN);
     let error = Runtime::from_ir_json(&bad).unwrap_err();
-    assert!(error.to_string().contains("unsupported IR version"), "{error}");
+    assert!(
+        error.to_string().contains("unsupported IR version"),
+        "{error}"
+    );
 
     let missing = GOLDEN.replace("\"ir\": \"0.1\",", "");
     let error = Runtime::from_ir_json(&missing).unwrap_err();
@@ -390,10 +393,7 @@ fn plugin_failures_count_and_success_resets_them() {
     let bus = PluginBus::default();
     bus.register("flaky", |_| Err("backend down".to_owned()));
     for _ in 0..3 {
-        assert!(matches!(
-            bus.call("flaky", ""),
-            Err(PluginError::Failed(_))
-        ));
+        assert!(matches!(bus.call("flaky", ""), Err(PluginError::Failed(_))));
     }
     assert!(matches!(
         bus.call("flaky", ""),
@@ -535,10 +535,7 @@ fn cli_drives_ir_from_a_file_and_stdin() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/counter.opuir.json"
     );
-    let (code, stdout, stderr) = run_cli(
-        path,
-        "tap 4\ninput 1 hello\nstate\nnonsense\nquit\n",
-    );
+    let (code, stdout, stderr) = run_cli(path, "tap 4\ninput 1 hello\nstate\nnonsense\nquit\n");
     assert_eq!(code, 0, "{stderr}");
     assert!(
         stdout.contains(r#"state [{"name":"count","value":0}] version 0"#),
