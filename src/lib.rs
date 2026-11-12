@@ -1,7 +1,9 @@
 //! OPUROM kernel, round 2: IR v0.1 + R2 extensions (multi-action events,
 //! `valueFrom`), a bounded priority scheduler, a fault-isolating plugin bus,
-//! a process-isolated plugin host and a bounded resource cache.
+//! a process-isolated plugin host, a bounded resource cache and the R3
+//! deterministic cooperative scheduler.
 
+pub mod async_sched;
 pub mod error;
 pub mod host;
 pub mod ir;
@@ -11,6 +13,7 @@ pub mod resource;
 pub mod scheduler;
 pub mod state;
 
+pub use async_sched::{AsyncScheduler, TaskContext, TaskId};
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use host::{AdapterFault, Host};
 pub use ir::{Action, Ir, Node, Op, StateDecl, IR_VERSION};
