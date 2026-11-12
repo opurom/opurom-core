@@ -1,4 +1,5 @@
 use crate::error::SchedulerError;
+use crate::parallel_sched::WorkStealingScheduler;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -63,6 +64,14 @@ impl<T> TaskHandle<T> {
 }
 
 impl Scheduler {
+    /// R9 builder for a bounded, multi-threaded work-stealing scheduler.
+    ///
+    /// The returned scheduler has its own `spawn`/`join` API: one worker is
+    /// deterministic FIFO, and more workers use per-worker deques and stealing.
+    pub fn with_workers(workers: usize) -> WorkStealingScheduler {
+        WorkStealingScheduler::with_workers(workers)
+    }
+
     /// Bounded worker pool. Higher `priority` runs first; equal priorities are FIFO.
     pub fn new(workers: usize) -> Self {
         let shared = Arc::new(Shared {

@@ -1,13 +1,14 @@
 # opurom-core
 
-Round 2/3 **kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
+R2/R3/R9 **kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other OPUROM project. It implements
 the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the R2 additions from
 [IR_R2_ADDENDUM.md](../opurom-spec/IR_R2_ADDENDUM.md), the process-isolated plugin host
-from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), and the R3 deterministic
-cooperative scheduler from [R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md). It is **not** the
-whole framework: no renderer, compiler, target emitters, platform adapters, GUI or build
-pipeline live here.
+from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the R3 deterministic
+cooperative scheduler from [R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md), and the R9
+multi-threaded work-stealing scheduler from [R9_ADDENDUM.md](../opurom-spec/R9_ADDENDUM.md) section 5.
+It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
+GUI or build pipeline live here.
 
 ## Build and verify
 
@@ -15,12 +16,16 @@ pipeline live here.
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Users/mac/work/opurom/opurom-core
 cargo fmt --all
-cargo test
+cargo test --offline
+RUSTFLAGS="-D warnings" cargo test --offline
+cargo run --offline --example parallel_speedup
 ```
 
-Verified on Rust 1.99.1: **75 integration tests passed (20 from round 1, 38 from round 2,
-17 new), 0 failed, 0 ignored; 0 doc tests; zero compiler warnings**. Dependencies are
-`serde_json` and `serde_core` (no derive, no network fetch needed beyond the crates.io index).
+`cargo test --offline -- --nocapture` also prints the R9 test's measured `Instant` timings.
+Verified on Rust 1.99.1: **85 integration tests passed (20 R1, 38 R2, 17 R3, 10 R9; all 75
+pre-existing R8 tests remain green), 0 failed, 0 ignored; 0 unit tests; 0 doc tests; zero
+compiler warnings**. Dependencies are `serde_json` and `serde_core`; the R9 scheduler uses
+pure `std` and adds no crate.
 
 ## API
 
@@ -45,11 +50,12 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | `Node.events` | `HashMap<String, Vec<Action>>`: an event maps to an **ordered action list**. A v0.1 single action object is stored as a one-element list, so every round 1 IR file keeps working. |
 | `Node.when` | `Option<String>`: the optional conditional node field is **preserved**; the kernel does not interpret it (hiding subtrees is a renderer concern). |
 | `Action` | `{ op, target, value: Option<Value>, value_from: Option<String> }`. `value` and `value_from` are mutually exclusive. |
-| `Runtime::from_ir_json(&str)` | Builds the state map and the node-id → event-name → ordered action list. Malformed JSON and malformed IR return readable `CoreError`s; no `unwrap`/`panic` on input. |
+| `Runtime::from_ir_json(&str)` | Builds the state map and the node-id -> event-name -> ordered action list. Malformed JSON and malformed IR return readable `CoreError`s; no `unwrap`/`panic` on input. |
 | `Runtime::state(name)`, `snapshot()`, `version()` | `snapshot()` returns `Vec<Patch>` in state declaration order. |
 | `Runtime::dispatch(Event)` | `Event::Tap { node_id }` / `Event::Input { node_id, text }`. Applies every action of the bound event **in order and atomically**: the actions run against a working copy, and the copy is committed only when all of them succeed. Patches are emitted in action order, one per resulting state change. `add` uses `checked_add`, so overflow is an error with no state change. Errors (unknown node, unbound event, bad type) leave state and version untouched. |
 | `Patch`, `Value` | `Patch { name, value }`; `Value::Int(i64) \| Bool(bool) \| Str(String)`. Both serialize with `serde_json::to_string` as `{"name":"count","value":1}`. |
-| `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | Bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. |
+| `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | R8 legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
+| `Scheduler::with_workers(n)` -> `WorkStealingScheduler` | R9 builder for N OS worker threads and a bounded total task queue. `spawn(task)` returns a `WorkStealingTaskHandle<T>` with `join() -> Result<T, SchedulerError>`; `spawn_on(worker, task)` pins a task to one worker's deque and gives its closure the executing worker id. Builder methods: `with_queue_capacity`, `with_failure_threshold`, `with_cooldown`, `with_clock`. One worker is deterministic FIFO; more workers use round-robin injection, per-worker deques and stealing. `shutdown()` drains work and joins every thread; `Drop` does the same. |
 | `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()` | Deterministic R3 cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. See [the R3 section](#deterministic-async-scheduler-r3); it is **not** async I/O. |
 | `PluginBus::new(failure_threshold)` (default 3), `register`, `call`, `is_disabled` | Handler signature `Fn(&str) -> Result<String, String> + Send + Sync`. Every call runs inside `catch_unwind(AssertUnwindSafe(..))`. Handler `Err` and panics increment a consecutive-failure counter; a success resets it; at the threshold the plugin is disabled and later calls return the distinct `PluginError::Disabled`. Other plugins and the runtime keep working. |
 | `Host::new()` / `with_threshold(n)`, `run(primary, fallback)`, `record_error`, `record_success`, `degraded()` | Standalone degradation policy, no adapter crate dependency. Three consecutive primary `Err`s flip `degraded()` to true and `active_adapter()` to `"headless"`; once degraded, `run` calls only the fallback. A success resets the consecutive count. |
@@ -125,10 +131,57 @@ Rules, all deterministic:
   `HashMap`, clock, thread or random source influences it. A panicking task
   unwinds into the caller of `tick`/`drain`.
 
+## Parallel work-stealing scheduler (R9)
+
+`Scheduler::with_workers(n)` builds a `WorkStealingScheduler` using only `std::thread`,
+`Mutex`, `Condvar`, `VecDeque` and channels. It starts N real worker threads. Each thread owns
+a deque; `spawn` injects tasks round robin. A worker pops from its own deque (back for N > 1)
+and, when idle, steals from the front of another worker's deque. `with_queue_capacity` limits
+the total number of queued tasks across all deques; a full queue rejects `spawn` with
+`SchedulerError::QueueFull` instead of blocking. With one worker, submission is a deterministic
+round-robin fallback to that one deque and execution is FIFO. With more workers, completion
+order is unspecified but every accepted result is delivered.
+
+`catch_unwind` wraps each task. A panic becomes `SchedulerError::TaskPanicked(String)` and does
+not kill the worker; later tasks still run. `with_failure_threshold(k)` and
+`with_cooldown(ticks)` configure the circuit breaker: k consecutive task failures open it, new
+spawns return `SchedulerError::CircuitOpen { retry_after }`, and the first spawn at or after
+the injected clock's cooldown closes it. `Clock` / `CounterClock` let tests advance logical
+time without wall-clock sleeps; `SystemClock` is the default. A success resets consecutive
+failures while the circuit is closed. Panic isolation contains unwinding Rust panics, not
+`abort` or a process kill.
+
+`measure_speedup(workers, tasks, iterations)` runs the same CPU-bound integer workload with 1
+worker and N workers, times each run with `Instant`, and returns both durations, both result
+vectors and `ratio = one_worker / many_workers`. The integration test asserts complete,
+identical results and that the ratio was computed from the two durations; it deliberately does
+**not** assert a fixed speedup. The example prints the measured numbers:
+
+```sh
+cargo run --offline --example parallel_speedup
+# optional: cargo run --offline --example parallel_speedup -- 16 300000 8
+```
+
+One real debug run on a 12-logical-CPU macOS host (Rust 1.99.1, 16 tasks, 300,000 iterations
+per task, 8 workers) printed:
+
+| run | workers | `Instant` elapsed (ms) | result checksum |
+| --- | ---: | ---: | ---: |
+| 1-worker | 1 | 28.328 | 7297643462028919011 |
+| N-worker | 8 | 5.903 | 7297643462028919011 |
+
+Measured ratio: `28.328 / 5.903 = 4.799x`. These are observed numbers from that run, not an
+estimate; they vary with host core count, load and build profile.
+
+Honest scope: no GPU scheduling, no OS async I/O, no priority preemption and no cross-process
+scheduling; those are R10+. One mutex protects all deques (not lock-free); there is no
+cancellation, timeout, task metrics or real-time scheduling. The legacy `Scheduler::new`
+priority pool remains separate and unchanged.
+
 ## Plugin ABI (protocol v1)
 
 Plugins are **separate processes**. A plugin crash, hang or protocol violation is contained by
-the OS process boundary — the kernel never links plugin code into its own address space.
+the OS process boundary - the kernel never links plugin code into its own address space.
 
 ### Transport
 
@@ -178,14 +231,14 @@ and symlinks pointing outside are rejected).
 
 ### Fault policy
 
-- 3 consecutive **timeouts / protocol violations / crashes** ⇒ the plugin is marked `Disabled`
+- 3 consecutive **timeouts / protocol violations / crashes** => the plugin is marked `Disabled`
   and its process is killed. Other plugins keep serving.
-- A successful call resets the counter — but only when no crash happened. A crash is never
+- A successful call resets the counter - but only when no crash happened. A crash is never
   cleared by a later success.
 - After a fault the faulty process is killed and the next call starts a fresh process with a
   fresh handshake.
 - `catch_unwind` guards the host entry points. It cannot contain an abort, a `SIGSEGV` or a
-  `panic = "abort"` build — process isolation is the real containment here.
+  `panic = "abort"` build - process isolation is the real containment here.
 
 ## Resource manager
 
@@ -240,22 +293,26 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Area | Implemented and verified here | Not implemented (planned / belongs to another repo) |
 | --- | --- | --- |
 | IR v0.1 loading | Version, state types, unique names/ids, action legality, malformed-JSON diagnostics; negative tests in `tests/integration.rs` | Node `kind` whitelist, theme values and prop semantics are not validated (fields are preserved); interpolation `{name}` is a renderer concern |
-| IR R2 extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` preserved on nodes; empty action lists | Interpretation of `when` (subtree hiding), the other R2 prop/theme/node-kind additions — those belong to the renderer and compiler |
+| IR R2 extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` preserved on nodes; empty action lists | Interpretation of `when` (subtree hiding), the other R2 prop/theme/node-kind additions - those belong to the renderer and compiler |
 | Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity | Derived/computed state, multi-state transactions, undo, persistence, animation |
-| Scheduler | Bounded worker pool, priority ordering, FIFO tie-break, graceful drain, panic containment; 3 tests | Work stealing, cancellation, timeouts, task metrics, real-time scheduling |
+| Scheduler (R8 + R9) | R8 bounded priority pool unchanged (3 tests); R9 N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) | No GPU scheduling, no OS async I/O, no priority preemption, no cross-process scheduling; no cancellation, timeouts, task metrics, real-time scheduling or lock-free deques; R10+ |
 | Async scheduler (R3) | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism; 17 tests. No wall clock, threads or randomness | OS async I/O, reactor/epoll, OS timers, network concurrency; R4+ for real async I/O |
 | Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests | Unload/reload, recovery after cooldown |
-| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, 3-strike `Disabled` breaker, crash-vs-timeout counter rule, `list()`; 18 tests against a real stub process | **No sandboxing**: no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits (rlimits) for the child. **No plugin signing or signature verification**, no trust chain, no version pinning. **No remote marketplace** — the local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
+| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, 3-strike `Disabled` breaker, crash-vs-timeout counter rule, `list()`; 18 tests against a real stub process | **No sandboxing**: no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits (rlimits) for the child. **No plugin signing or signature verification**, no trust chain, no version pinning. **No remote marketplace** - the local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
 | Resource manager | Bounded LRU cache with a byte budget, deterministic eviction order, budget-exceeded error, zero-size handling; 6 tests | Memory pressure heuristics, per-plugin quotas, cache persistence, metrics |
-| Runtime ↔ plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values | Automatic plugin discovery, capability-to-state mapping, streaming/long-lived plugin calls |
-| Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests | Real `PlatformAdapter` trait, actual adapter swap, recovery, frame presentation — those live in `opurom-platform`. This `Host` is a small standalone policy with no cross-repo dependency |
-| CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand | `opurom build/dev/test`, hot reload, watch mode (see `opurom-cli`) |
+| Runtime <-> plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values | Automatic plugin discovery, capability-to-state mapping, streaming/long-lived plugin calls |
+| Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests | Real `PlatformAdapter` trait, actual adapter swap, recovery, frame presentation - those live in `opurom-platform`. This `Host` is a small standalone policy with no cross-repo dependency |
+| CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings | `opurom build/dev/test`, hot reload, watch mode (see `opurom-cli`) |
 | Renderer / pipeline | Nothing | RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP, debugger |
-| Quality evidence | `cargo test`: 75 passed, 0 failed, no warnings | No performance, fps, cold-start or binary-size numbers are reported: no GPU backend or device matrix exists yet. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Quality evidence | `cargo test --offline`: 85 passed, 0 failed, 0 ignored, no warnings; `RUSTFLAGS="-D warnings" cargo test --offline` also green; one real 1-worker vs N-worker `Instant` measurement is printed by `parallel_speedup` | No fps, cold-start, binary-size, GPU or competitive benchmark numbers; the only performance figure is the measured CPU-bound scheduler ratio above. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 **Gap summary:** a narrow, tested kernel slice, not a shipping SDK. Process isolation of
 plugins is real and verified, but it is **not** a security boundary: a plugin still runs with
-the kernel's user privileges until R3 adds OS-level sandboxing. The R3 scheduler is a
-deterministic queue only: it never performs I/O, and real async I/O/network concurrency
-remains R4+ work. Cross-repo end-to-end execution, real platform adapters, renderer
-output and any benchmark figures are outside this round.
+the kernel's user privileges until R3 adds OS-level sandboxing. The R3 scheduler remains a
+deterministic queue only: it never performs I/O, and OS async I/O/network concurrency remains
+R4+ work. The R9 scheduler is real OS-threaded work stealing with a bounded queue and panic
+isolation, but it has no GPU scheduling, OS async I/O, priority preemption, cross-process
+scheduling, cancellation, timeouts, task metrics or lock-free deques; those stay R10+.
+Cross-repo end-to-end execution, real platform adapters, renderer output, fps and competitive
+benchmarks are outside this round; the only reported performance numbers are the real
+1-worker/N-worker `Instant` timings above.
