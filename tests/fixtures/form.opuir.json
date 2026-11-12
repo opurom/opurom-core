@@ -1,0 +1,53 @@
+{
+  "ir": "0.1",
+  "app": "Form",
+  "state": [
+    { "name": "label", "type": "string", "init": "hi" },
+    { "name": "flag", "type": "bool", "init": false },
+    { "name": "n", "type": "int", "init": 7 }
+  ],
+  "tree": {
+    "id": 0,
+    "kind": "Column",
+    "props": {},
+    "children": [
+      {
+        "id": 1,
+        "kind": "Input",
+        "props": {},
+        "children": [],
+        "events": { "input": { "op": "set", "target": "label" } }
+      },
+      {
+        "id": 2,
+        "kind": "Button",
+        "props": {},
+        "children": [],
+        "events": { "tap": { "op": "toggle", "target": "flag" } }
+      },
+      {
+        "id": 3,
+        "kind": "Button",
+        "props": {},
+        "children": [],
+        "events": { "tap": { "op": "set", "target": "n", "value": 9 } }
+      },
+      {
+        "id": 4,
+        "kind": "Button",
+        "props": {},
+        "children": [],
+        "events": { "tap": { "op": "set", "target": "label", "value": "bye" } }
+      },
+      {
+        "id": 5,
+        "kind": "Button",
+        "props": {},
+        "children": [],
+        "events": { "tap": { "op": "add", "target": "n", "value": 2 } }
+      }
+    ],
+    "events": {}
+  },
+  "theme": { "mode": "system", "accent": "#4F46E5", "radius": 12 }
+}
