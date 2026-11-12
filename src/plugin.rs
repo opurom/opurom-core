@@ -1,4 +1,4 @@
-use crate::error::PluginError;
+use crate::error::{panic_message, PluginError};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
@@ -82,15 +82,5 @@ impl PluginBus {
 impl Default for PluginBus {
     fn default() -> Self {
         PluginBus::new(3)
-    }
-}
-
-fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&'static str>() {
-        (*message).to_owned()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
     }
 }

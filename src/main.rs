@@ -1,12 +1,59 @@
-use opurom_core::{Event, Runtime};
+use opurom_core::{Event, PluginHost, Runtime};
+use serde_json::json;
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: opurom-core <app.opuir.json>");
+    let mut args = std::env::args_os().skip(1);
+    let Some(first) = args.next() else {
+        eprintln!(
+            "usage: opurom-core <app.opuir.json> | opurom-core plugins <pluginDir> <capability>"
+        );
         return ExitCode::from(2);
     };
+    if first == "plugins" {
+        return run_plugins(args);
+    }
+    run_ir(first, args)
+}
+
+/// `opurom-core plugins <pluginDir> <capability>` loads the plugin, handshakes,
+/// invokes the capability with `{}` and prints the JSON result.
+fn run_plugins(mut args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
+    let Some(dir) = args.next() else {
+        eprintln!("usage: opurom-core plugins <pluginDir> <capability>");
+        return ExitCode::from(2);
+    };
+    let Some(capability) = args.next() else {
+        eprintln!("usage: opurom-core plugins <pluginDir> <capability>");
+        return ExitCode::from(2);
+    };
+    let capability = capability.to_string_lossy().into_owned();
+    // The CLI acts as the app: it allows exactly the capability it was asked for.
+    let host = PluginHost::new([capability.clone()]);
+    if let Err(error) = host.load(&dir) {
+        eprintln!("error: cannot load plugin: {error}");
+        return ExitCode::from(1);
+    }
+    match host.invoke(&capability, json!({})) {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("error: cannot encode plugin result: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            eprintln!("error: plugin invocation failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) => {

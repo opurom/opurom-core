@@ -1,7 +1,11 @@
-use crate::error::CoreError;
+use crate::error::{CoreError, PluginError};
 use crate::ir::{Action, Ir, Node, Op};
+use crate::resource::{ResourceError, ResourceManager};
 use serde_core::ser::{Serialize, SerializeStruct, Serializer};
+use serde_json::Value as Json;
 use std::collections::HashMap;
+
+pub const DEFAULT_RESOURCE_BUDGET: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -56,19 +60,148 @@ pub struct Runtime {
     app: String,
     values: Vec<(String, Value)>,
     index: HashMap<String, usize>,
-    actions: HashMap<u32, HashMap<String, Action>>,
+    actions: HashMap<u32, HashMap<String, Vec<Action>>>,
+    resources: ResourceManager<String, Json>,
     version: u64,
 }
 
-fn collect_actions(node: &Node, out: &mut HashMap<u32, HashMap<String, Action>>) {
+fn collect_actions(node: &Node, out: &mut HashMap<u32, HashMap<String, Vec<Action>>>) {
     out.insert(node.id, node.events.clone());
     for child in &node.children {
         collect_actions(child, out);
     }
 }
 
+fn same_type(left: &Value, right: &Value) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
+fn state_value(
+    values: &[(String, Value)],
+    index: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Value, CoreError> {
+    let position = *index
+        .get(name)
+        .ok_or_else(|| CoreError::UnknownState(name.to_owned()))?;
+    Ok(values[position].1.clone())
+}
+
+fn apply_action(
+    action: &Action,
+    values: &mut Vec<(String, Value)>,
+    index: &HashMap<String, usize>,
+    text: Option<&str>,
+) -> Result<Patch, CoreError> {
+    let position = *index
+        .get(&action.target)
+        .ok_or_else(|| CoreError::UnknownState(action.target.clone()))?;
+    let current = values[position].1.clone();
+    if action.value.is_some() && action.value_from.is_some() {
+        return Err(CoreError::InvalidIr(format!(
+            "action on {} has both value and valueFrom",
+            action.target
+        )));
+    }
+    let next = match action.op {
+        Op::Set => {
+            if let Some(source) = &action.value_from {
+                let value = state_value(values, index, source)?;
+                if !same_type(&current, &value) {
+                    return Err(CoreError::TypeMismatch {
+                        name: source.clone(),
+                        expected: current.type_name(),
+                    });
+                }
+                value
+            } else if let Some(value) = &action.value {
+                value.clone()
+            } else {
+                Value::Str(
+                    text.ok_or_else(|| {
+                        CoreError::InvalidIr(format!(
+                            "set on {} has no value to apply",
+                            action.target
+                        ))
+                    })?
+                    .to_owned(),
+                )
+            }
+        }
+        Op::Add => {
+            let delta = if let Some(source) = &action.value_from {
+                match state_value(values, index, source)? {
+                    Value::Int(value) => value,
+                    _ => {
+                        return Err(CoreError::TypeMismatch {
+                            name: source.clone(),
+                            expected: "int",
+                        })
+                    }
+                }
+            } else if let Some(Value::Int(value)) = action.value {
+                value
+            } else {
+                return Err(CoreError::TypeMismatch {
+                    name: action.target.clone(),
+                    expected: "int",
+                });
+            };
+            match &current {
+                Value::Int(value) => {
+                    Value::Int(
+                        value
+                            .checked_add(delta)
+                            .ok_or_else(|| CoreError::Overflow {
+                                name: action.target.clone(),
+                            })?,
+                    )
+                }
+                _ => {
+                    return Err(CoreError::TypeMismatch {
+                        name: action.target.clone(),
+                        expected: "int",
+                    })
+                }
+            }
+        }
+        Op::Toggle => {
+            if action.value.is_some() || action.value_from.is_some() {
+                return Err(CoreError::InvalidIr(format!(
+                    "toggle on {} must not have a value",
+                    action.target
+                )));
+            }
+            match &current {
+                Value::Bool(value) => Value::Bool(!value),
+                _ => {
+                    return Err(CoreError::TypeMismatch {
+                        name: action.target.clone(),
+                        expected: "bool",
+                    })
+                }
+            }
+        }
+    };
+    if !same_type(&current, &next) {
+        return Err(CoreError::TypeMismatch {
+            name: action.target.clone(),
+            expected: current.type_name(),
+        });
+    }
+    values[position].1 = next.clone();
+    Ok(Patch {
+        name: action.target.clone(),
+        value: next,
+    })
+}
+
 impl Runtime {
     pub fn from_ir_json(json: &str) -> Result<Runtime, CoreError> {
+        Self::from_ir_json_with_budget(json, DEFAULT_RESOURCE_BUDGET)
+    }
+
+    pub fn from_ir_json_with_budget(json: &str, budget: usize) -> Result<Runtime, CoreError> {
         let ir = Ir::parse(json)?;
         let mut actions = HashMap::new();
         collect_actions(&ir.tree, &mut actions);
@@ -87,6 +220,7 @@ impl Runtime {
             values,
             index,
             actions,
+            resources: ResourceManager::new(budget),
             version: 0,
         })
     }
@@ -100,9 +234,7 @@ impl Runtime {
     }
 
     pub fn state(&self, name: &str) -> Option<&Value> {
-        self.index
-            .get(name)
-            .map(|&i| &self.values[i].1)
+        self.index.get(name).map(|&i| &self.values[i].1)
     }
 
     pub fn snapshot(&self) -> Vec<Patch> {
@@ -120,76 +252,67 @@ impl Runtime {
             Event::Tap { node_id } => (node_id, "tap", None),
             Event::Input { node_id, text } => (node_id, "input", Some(text)),
         };
-        let action = self
+        let actions = self
             .actions
             .get(&node_id)
             .ok_or(CoreError::UnknownNode(node_id))?
             .get(event_name)
-            .cloned()
             .ok_or_else(|| CoreError::UnboundEvent {
                 node_id,
                 event: event_name.to_owned(),
             })?;
-        let position = *self
-            .index
-            .get(&action.target)
-            .ok_or_else(|| CoreError::UnknownState(action.target.clone()))?;
-        let current = &self.values[position].1;
-        let next = match action.op {
-            Op::Set => match action.value {
-                Some(value) => value,
-                None => match text {
-                    Some(text) => Value::Str(text),
-                    None => {
-                        return Err(CoreError::InvalidIr(format!(
-                            "set on {} has no value to apply",
-                            action.target
-                        )))
-                    }
-                },
-            },
-            Op::Add => match (current, action.value) {
-                (Value::Int(current), Some(Value::Int(delta))) => Value::Int(
-                    current
-                        .checked_add(delta)
-                        .ok_or_else(|| CoreError::Overflow {
-                            name: action.target.clone(),
-                        })?,
-                ),
-                _ => {
-                    return Err(CoreError::TypeMismatch {
-                        name: action.target.clone(),
-                        expected: "int",
-                    })
-                }
-            },
-            Op::Toggle => match current {
-                Value::Bool(current) => Value::Bool(!current),
-                _ => {
-                    return Err(CoreError::TypeMismatch {
-                        name: action.target.clone(),
-                        expected: "bool",
-                    })
-                }
-            },
-        };
-        let type_matches = matches!(
-            (current, &next),
-            (Value::Int(_), Value::Int(_))
-                | (Value::Bool(_), Value::Bool(_))
-                | (Value::Str(_), Value::Str(_))
-        );
-        if !type_matches {
-            return Err(CoreError::TypeMismatch {
-                name: action.target.clone(),
-                expected: current.type_name(),
-            });
+        if actions.is_empty() {
+            return Ok(Vec::new());
         }
-        self.values[position].1 = next.clone();
-        self.version += 1;
-        Ok(vec![Patch {
-            name: action.target,
-            value: next,
-        }])
+        let mut working = self.values.clone();
+        let mut patches = Vec::with_capacity(actions.len());
+        for action in actions {
+            patches.push(apply_action(
+                action,
+                &mut working,
+                &self.index,
+                text.as_deref(),
+            )?);
+        }
+        let version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Overflow {
+                name: "version".to_owned(),
+            })?;
+        self.values = working;
+        self.version = version;
+        Ok(patches)
+    }
+
+    /// Invokes a plugin once per key and caches its JSON result under the runtime byte budget.
+    pub fn invoke_plugin<F>(
+        &mut self,
+        capability: &str,
+        params: Json,
+        invoke: F,
+    ) -> Result<Json, CoreError>
+    where
+        F: FnOnce(&str, Json) -> Result<Json, PluginError>,
+    {
+        let key = serde_json::to_string(&serde_json::json!([capability, &params]))
+            .map_err(|error| CoreError::Resource(ResourceError::InvalidValue(error.to_string())))?;
+        if let Some(cached) = self.resources.get(&key) {
+            return Ok(cached);
+        }
+        let result = invoke(capability, params).map_err(CoreError::Plugin)?;
+        let bytes = serde_json::to_vec(&result)
+            .map_err(|error| CoreError::Resource(ResourceError::InvalidValue(error.to_string())))?;
+        // A result larger than the whole budget is not cached, but the call still
+        // succeeds: the cache is an optimisation, not a contract.
+        match self.resources.insert(key, result.clone(), bytes.len()) {
+            Ok(_) => Ok(result),
+            Err(ResourceError::BudgetExceeded { .. }) => Ok(result),
+            Err(error) => Err(CoreError::Resource(error)),
+        }
+    }
+
+    pub fn resource_cache(&self) -> &ResourceManager<String, Json> {
+        &self.resources
     }
 }
