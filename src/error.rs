@@ -90,6 +90,9 @@ impl std::error::Error for PluginError {}
 pub enum SchedulerError {
     ShuttingDown,
     TaskFailed,
+    TaskPanicked(String),
+    QueueFull { capacity: usize },
+    CircuitOpen { retry_after: u64 },
 }
 
 impl fmt::Display for SchedulerError {
@@ -97,6 +100,14 @@ impl fmt::Display for SchedulerError {
         match self {
             Self::ShuttingDown => write!(f, "scheduler is shutting down"),
             Self::TaskFailed => write!(f, "task panicked or was dropped"),
+            Self::TaskPanicked(message) => write!(f, "task panicked: {message}"),
+            Self::QueueFull { capacity } => {
+                write!(f, "task queue is full ({capacity} pending tasks)")
+            }
+            Self::CircuitOpen { retry_after } => write!(
+                f,
+                "scheduler circuit is open; retry after {retry_after} clock ticks"
+            ),
         }
     }
 }
