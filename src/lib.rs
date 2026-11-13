@@ -24,7 +24,7 @@ pub use parallel_sched::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, SpeedupMeasurement, SystemClock,
     WorkStealingScheduler, WorkStealingTaskHandle,
 };
-pub use plugin::PluginBus;
+pub use plugin::{PluginBus, PluginMetrics};
 pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAULT_PLUGIN_TIMEOUT};
 pub use resource::{ResourceError, ResourceManager};
 pub use scheduler::{Scheduler, TaskHandle};

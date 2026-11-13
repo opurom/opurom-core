@@ -21,11 +21,31 @@ struct Entry {
     circuit: Circuit,
 }
 
+/// Exact, deterministic counters observed on a [`PluginBus`].
+///
+/// `trips` counts closed circuits that reached the failure threshold; a trip
+/// opens the circuit when a cooldown is configured and disables it otherwise,
+/// so `openings <= trips`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PluginMetrics {
+    /// Every invocation of [`PluginBus::call`], successful or not.
+    pub calls: u64,
+    /// Closed circuits that reached the failure threshold.
+    pub trips: u64,
+    /// Transitions into the open state (trips with a finite cooldown).
+    pub openings: u64,
+    /// Calls admitted through an open circuit after its cooldown elapsed.
+    pub trials: u64,
+    /// Admitted trials that succeeded and closed the circuit again.
+    pub recoveries: u64,
+}
+
 pub struct PluginBus {
     failure_threshold: u32,
     cooldown: Option<u64>,
     clock: Arc<dyn Clock>,
     entries: Mutex<HashMap<String, Entry>>,
+    metrics: Mutex<PluginMetrics>,
 }
 
 impl PluginBus {
@@ -36,6 +56,7 @@ impl PluginBus {
             cooldown: None,
             clock: Arc::new(SystemClock),
             entries: Mutex::new(HashMap::new()),
+            metrics: Mutex::new(PluginMetrics::default()),
         }
     }
 
@@ -49,6 +70,11 @@ impl PluginBus {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    fn record(&self, apply: impl FnOnce(&mut PluginMetrics)) {
+        let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        apply(&mut metrics);
     }
 
     pub fn register<F>(&self, name: impl Into<String>, handler: F)
@@ -66,6 +92,7 @@ impl PluginBus {
     }
 
     pub fn call(&self, name: &str, input: &str) -> Result<String, PluginError> {
+        self.record(|m| m.calls += 1);
         let handler = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             let Some(entry) = entries.get_mut(name) else {
@@ -88,6 +115,7 @@ impl PluginBus {
                     // trial in flight and only this call reaches the handler.
                     *retry_at = now.saturating_add(*cooldown);
                     *trial = true;
+                    self.record(|m| m.trials += 1);
                 }
                 Circuit::Closed(_) => {}
             }
@@ -101,16 +129,23 @@ impl PluginBus {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(name) {
             if result.is_ok() {
+                if matches!(entry.circuit, Circuit::Open { .. }) {
+                    self.record(|m| m.recoveries += 1);
+                }
                 entry.circuit = Circuit::Closed(0);
             } else if let Circuit::Closed(failures) = &mut entry.circuit {
                 *failures = failures.saturating_add(1);
                 if *failures >= self.failure_threshold {
+                    self.record(|m| m.trips += 1);
                     entry.circuit = match self.cooldown {
-                        Some(cooldown) => Circuit::Open {
-                            retry_at: self.clock.now().saturating_add(cooldown),
-                            cooldown,
-                            trial: false,
-                        },
+                        Some(cooldown) => {
+                            self.record(|m| m.openings += 1);
+                            Circuit::Open {
+                                retry_at: self.clock.now().saturating_add(cooldown),
+                                cooldown,
+                                trial: false,
+                            }
+                        }
                         None => Circuit::Disabled,
                     };
                 }
@@ -136,6 +171,11 @@ impl PluginBus {
             Some(Circuit::Open { retry_at, .. }) => Some(retry_at.saturating_sub(self.clock.now())),
             _ => None,
         }
+    }
+
+    /// Snapshot of the exact current counters; deterministic, no estimation.
+    pub fn metrics(&self) -> PluginMetrics {
+        *self.metrics.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
