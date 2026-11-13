@@ -2,16 +2,16 @@
 
 **Kernel slice** of the Opurom kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other Opurom project. It implements
-the state/event part of [IR 0.1.0](../opurom-examples/golden/the IR format) plus the interactive UI additions from
-[the IR format](../opurom-examples/golden/the IR format), the process-isolated plugin host
-from [the plugin protocol](../opurom-examples/golden/the plugin protocol), the deterministic
-cooperative scheduler from [the framework rules](../opurom-examples/golden/the framework rules) framework rules
+the state/event part of [IR 0.1.0](the IR format) plus the interactive UI additions from
+[the IR format](the IR format), the process-isolated plugin host
+from [the plugin protocol](the plugin protocol), the deterministic
+cooperative scheduler from [the framework rules](the framework rules) framework rules
 extended by the `SchedulingHook` scheduling-extension trait and a kernel
 `RenderingHook` rendering-extension seam,
 the multi-threaded work-stealing scheduler from
-[the framework rules](../opurom-examples/golden/the framework rules) framework rules,
+[the framework rules](the framework rules) framework rules,
 and the explicit native-capability permission gate from
-[the component catalog rules](../opurom-examples/golden/the component catalog rules) framework rules.
+[the component catalog rules](the component catalog rules) framework rules.
 It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
 GUI or build pipeline live here.
 
@@ -164,7 +164,7 @@ driven by a logical tick counter: a schedulable coroutine queue. It is **NOT
 OS async I/O**, **NOT reactor/epoll**, and **NOT a claim about network
 concurrency**: there is no reactor, no epoll/kqueue, no thread pool, no
 sockets, no randomness and no wall clock. It implements
-[framework rules of the framework rules](../opurom-examples/golden/the framework rules).
+[framework rules of the framework rules](the framework rules).
 
 ```rust
 use opurom_core::{AsyncScheduler, TaskId};
