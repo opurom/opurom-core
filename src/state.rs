@@ -1,9 +1,11 @@
 use crate::error::{CoreError, PluginError};
 use crate::ir::{Action, Ir, Node, Op};
+use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
 use serde_core::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::Value as Json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const DEFAULT_RESOURCE_BUDGET: usize = 64 * 1024;
 
@@ -64,6 +66,8 @@ pub struct Runtime {
     guards: HashMap<u32, Vec<String>>,
     resources: ResourceManager<String, Json>,
     version: u64,
+    tree: Node,
+    hook: Option<Arc<dyn RenderingHook>>,
 }
 
 fn collect_tree(
@@ -231,6 +235,7 @@ impl Runtime {
             .enumerate()
             .map(|(i, (name, _))| (name.clone(), i))
             .collect();
+        let tree = ir.tree;
         Ok(Runtime {
             app: ir.app,
             values,
@@ -239,7 +244,28 @@ impl Runtime {
             guards,
             resources: ResourceManager::new(budget),
             version: 0,
+            tree,
+            hook: None,
         })
+    }
+
+    /// Registers the rendering extension before the display list is produced.
+    pub fn with_rendering_hook(mut self, hook: Arc<dyn RenderingHook>) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
+    /// The display list handed to the renderer: the parsed IR tree, after the
+    /// registered rendering hook has observed and decorated it. Without a
+    /// hook this is the parsed tree unchanged.
+    pub fn display_list(&self) -> Node {
+        let list = self.tree.clone();
+        if let Some(hook) = &self.hook {
+            hook.observe(&list);
+            hook.decorate(&list)
+        } else {
+            list
+        }
     }
 
     pub fn app(&self) -> &str {

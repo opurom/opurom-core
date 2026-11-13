@@ -6,7 +6,8 @@ the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the interact
 [IR_ADDITIONS.md](../opurom-spec/IR_ADDITIONS.md), the process-isolated plugin host
 from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the deterministic
 cooperative scheduler from [COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md) section 4
-extended by the `SchedulingHook` scheduling-extension trait,
+extended by the `SchedulingHook` scheduling-extension trait and a kernel
+`RenderingHook` rendering-extension seam,
 the multi-threaded work-stealing scheduler from
 [PRODUCTION_BREADTH.md](../opurom-spec/PRODUCTION_BREADTH.md) section 5,
 and the explicit native-capability permission gate from
@@ -27,12 +28,12 @@ cargo run --offline --example parallel_speedup
 `cargo test --offline -- --nocapture` also prints the work-stealing scheduler test's measured
 `Instant` timings.
 Integration tests cover IR validation, interactive UI actions, conditional event dispatch, the
-deterministic cooperative scheduler and its scheduling hook, the work-stealing scheduler and
-native capability permissions.
-The Rust suite contains 113 integration tests and no unit or doc tests. Dependencies are
-`serde_json` and `serde_core`; the work-stealing scheduler, the capability gate and the
-scheduling hook use pure `std` and add no crate. The capability tests drive a real shell plugin
-process through JSON lines, including crashes, malformed frames, cooldown recovery and PID
+deterministic cooperative scheduler and its scheduling hook, the work-stealing scheduler, native
+capability permissions and the kernel rendering extension.
+The Rust suite contains 116 integration tests and no unit or doc tests. Dependencies are
+`serde_json` and `serde_core`; the work-stealing scheduler, the capability gate, the scheduling
+hook and the rendering hook use pure `std` and add no crate. The capability tests drive a real
+shell plugin process through JSON lines, including crashes, malformed frames, cooldown recovery and PID
 reaping.
 
 ## API
@@ -60,6 +61,7 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | `Action` | `{ op, target, value: Option<Value>, value_from: Option<String> }`. `value` and `value_from` are mutually exclusive. |
 | `Runtime::from_ir_json(&str)` | Builds the state map and the node-id -> event-name -> ordered action list. Malformed JSON and malformed IR return readable `CoreError`s; no `unwrap`/`panic` on input. |
 | `Runtime::state(name)`, `snapshot()`, `version()` | `snapshot()` returns `Vec<Patch>` in state declaration order. |
+| `Runtime::with_rendering_hook(Arc<dyn RenderingHook>)`, `display_list()` | Registers the kernel rendering extension and returns the display list handed to the renderer: the parsed IR tree after the hook has observed and decorated it. Without a hook `display_list()` returns the parsed tree unchanged, so the default path is a byte-identical no-op. See [the rendering extension section](#rendering-extension-hook). |
 | `Runtime::dispatch(Event)` | `Event::Tap { node_id }` / `Event::Input { node_id, text }`. Applies every action of the bound event **in order and atomically**: the actions run against a working copy, and the copy is committed only when all of them succeed. Patches are emitted in action order, one per resulting state change. `add` uses `checked_add`, so overflow is an error with no state change. Errors (unknown node, unbound event, bad type) leave state and version untouched. A bound event on a hidden node returns an empty patch list without changing state or version. |
 | `Patch`, `Value` | `Patch { name, value }`; `Value::Int(i64) \| Bool(bool) \| Str(String)`. Both serialize with `serde_json::to_string` as `{"name":"count","value":1}`. |
 | `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | Legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
@@ -110,6 +112,48 @@ let json = std::fs::read_to_string("app.opuir.json")?;
 let mut runtime = Runtime::from_ir_json(&json)?;
 assert_eq!(runtime.state("visible"), Some(&Value::Bool(false)));
 assert!(runtime.dispatch(Event::Tap { node_id: 7 })?.is_empty());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### Rendering extension hook
+
+`RenderingHook` is the kernel's standardized extension interface for rendering extensions: a hook
+may observe the display list before it is handed to the renderer and may decorate the tree it
+hands over. Both methods are pure functions of the parsed tree, so the same IR always yields the
+same list.
+
+`Runtime::display_list()` produces that list: it clones the parsed IR tree, lets the registered
+hook observe it, then returns the hook's decorated tree. Without a hook, or with a hook that keeps
+both default methods, the returned tree is the parsed tree unchanged.
+
+| Method | Contract |
+| --- | --- |
+| `observe(&Node)` | Read-only pass over the display list before decoration. The default does nothing. |
+| `decorate(&Node) -> Node` | The tree to hand to the renderer; the default returns the observed list unchanged. |
+
+`with_rendering_hook(Arc::new(hook))` registers the hook on the runtime before the first
+`display_list()` call.
+
+```rust
+use opurom_core::{Node, RenderingHook, Runtime};
+use serde_json::json;
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct AppendLabel;
+
+impl RenderingHook for AppendLabel {
+    fn decorate(&self, list: &Node) -> Node {
+        let mut decorated = list.clone();
+        decorated.props.insert("decorated".to_owned(), json!(true));
+        decorated
+    }
+}
+
+let json = std::fs::read_to_string("app.opuir.json")?;
+let runtime = Runtime::from_ir_json(&json)?.with_rendering_hook(Arc::new(AppendLabel));
+let list = runtime.display_list();
+assert_eq!(list.props.get("decorated"), Some(&json!(true)));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -425,8 +469,8 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Runtime <-> plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values |
 | Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests. The real `PlatformAdapter` trait, the actual adapter swap and frame presentation live in `opurom-platform`; this `Host` is a small standalone policy with no cross-repo dependency |
 | CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings. `opurom build/dev/test`, hot reload and watch mode live in `opurom-cli` |
-| Renderer / pipeline | Nothing: RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
-| Quality evidence | 113 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Rendering extension | Kernel rendering seam: a registered `RenderingHook` observes and decorates the display list before the renderer, and `display_list()` is byte-identical to the parsed tree without a hook. RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
+| Quality evidence | 116 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 Process isolation of plugins is real and verified. The permission gate and the deterministic mock
 devices are application-level, and the cooperative scheduler is a deterministic queue only: it
