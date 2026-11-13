@@ -29,7 +29,7 @@ cargo run --offline --example parallel_speedup
 Integration tests cover IR validation, interactive UI actions, conditional event dispatch, the
 deterministic cooperative scheduler and its scheduling hook, the work-stealing scheduler and
 native capability permissions.
-The Rust suite contains 110 integration tests and no unit or doc tests. Dependencies are
+The Rust suite contains 113 integration tests and no unit or doc tests. Dependencies are
 `serde_json` and `serde_core`; the work-stealing scheduler, the capability gate and the
 scheduling hook use pure `std` and add no crate. The capability tests drive a real shell plugin
 process through JSON lines, including crashes, malformed frames, cooldown recovery and PID
@@ -245,7 +245,11 @@ per task, 8 workers) printed:
 Measured ratio: `28.328 / 5.903 = 4.799x`. These are observed numbers from that run, not an
 estimate; they vary with host core count, load and build profile.
 
-One mutex protects all deques (not lock-free); there is no cancellation, timeout, task metrics
+`metrics()` returns one `SchedulerMetrics` snapshot — `spawned`, `completed`, `panicked`,
+`pending` and `steals` — read under the same state lock, so one query reports every
+introspection counter; a spawn rejected by the bound or a closed circuit never counts.
+
+One mutex protects all deques (not lock-free); there is no cancellation, timeout
 or real-time scheduling, and no GPU scheduling, OS async I/O, priority preemption or
 cross-process scheduling. The legacy `Scheduler::new` priority pool remains separate and
 unchanged.
@@ -412,7 +416,7 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | IR v0.1 loading | Version, state types, unique names/ids, action legality, malformed-JSON diagnostics; negative tests in `tests/integration.rs`. Node `kind` whitelist, theme values and prop semantics are not validated (fields are preserved); interpolation `{name}` is a renderer concern |
 | Interactive UI IR extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` conditions gate event dispatch on hidden nodes and their subtrees; empty action lists. Prop values, theme tokens and node kinds are preserved for the renderer and compiler |
 | Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity |
-| Priority pool and work-stealing scheduler | Bounded priority pool unchanged (3 tests); N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) |
+| Priority pool and work-stealing scheduler | Bounded priority pool unchanged (3 tests); N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join, one `SchedulerMetrics` query over spawned/completed/panicked/pending/steals counters and measured 1-worker vs N-worker `Instant` timings (13 tests) |
 | Async scheduler | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism, `SchedulingHook` reordering and admission with admitted/rejected/executed counters; 23 tests. No wall clock, threads or randomness |
 | Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests |
 | Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, legacy 3-strike `Disabled` breaker, configurable breaker with cooldown/half-open recovery, typed `CircuitOpen` errors, crash/malformed-frame isolation, `list()` and `shutdown()`; 18 existing tests plus 7 native-capability process tests. No OS-level sandboxing (no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits for the child), no plugin signing or signature verification, no trust chain and no version pinning. The local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
@@ -422,7 +426,7 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests. The real `PlatformAdapter` trait, the actual adapter swap and frame presentation live in `opurom-platform`; this `Host` is a small standalone policy with no cross-repo dependency |
 | CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings. `opurom build/dev/test`, hot reload and watch mode live in `opurom-cli` |
 | Renderer / pipeline | Nothing: RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
-| Quality evidence | 110 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Quality evidence | 113 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 Process isolation of plugins is real and verified. The permission gate and the deterministic mock
 devices are application-level, and the cooperative scheduler is a deterministic queue only: it

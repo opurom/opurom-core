@@ -1,6 +1,6 @@
 use opurom_core::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, Scheduler, SchedulerError,
-    WorkStealingTaskHandle,
+    SchedulerMetrics, WorkStealingTaskHandle,
 };
 use std::fmt::Debug;
 use std::sync::{mpsc, Arc, Mutex};
@@ -321,4 +321,76 @@ fn scheduler_builder_clamps_invalid_sizes() {
     assert!(!scheduler.circuit_open());
     assert_eq!(scheduler.steals(), 0);
     scheduler.shutdown();
+}
+
+#[test]
+fn metrics_snapshot_counts_accepted_and_completed_tasks() {
+    let scheduler = Scheduler::with_workers(1).with_queue_capacity(8);
+    assert_eq!(
+        scheduler.metrics(),
+        SchedulerMetrics::default(),
+        "a fresh scheduler starts at zero"
+    );
+
+    let handles = (0..4i32)
+        .map(|i| scheduler.spawn(move || i * 2).unwrap())
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results, vec![0, 2, 4, 6]);
+    assert_eq!(
+        scheduler.metrics(),
+        SchedulerMetrics {
+            spawned: 4,
+            completed: 4,
+            panicked: 0,
+            pending: 0,
+            steals: 0,
+        },
+        "one worker never steals and every accepted task completes"
+    );
+    scheduler.shutdown();
+}
+
+#[test]
+fn metrics_count_a_panicking_task_exactly_once() {
+    let scheduler = Scheduler::with_workers(2).with_queue_capacity(8);
+    let ok = scheduler.spawn(|| 7).unwrap();
+    let boom = scheduler
+        .spawn(|| -> i32 { panic!("metrics probe") })
+        .unwrap();
+    assert_eq!(ok.join().unwrap(), 7);
+    assert!(typed_panic_message(boom).contains("metrics probe"));
+
+    let metrics = scheduler.metrics();
+    assert_eq!(
+        (
+            metrics.spawned,
+            metrics.completed,
+            metrics.panicked,
+            metrics.pending
+        ),
+        (2, 2, 1, 0),
+        "a panic completes the task and increments the panic counter once"
+    );
+    scheduler.shutdown();
+    let after = scheduler.metrics();
+    assert_eq!(after.completed, after.spawned, "every worker has joined");
+}
+
+#[test]
+fn metrics_ignore_spawns_the_scheduler_rejects() {
+    let scheduler = Scheduler::with_workers(1);
+    scheduler.shutdown();
+    match scheduler.spawn(|| 1) {
+        Err(SchedulerError::ShuttingDown) => {}
+        other => panic!("expected ShuttingDown, got {other:?}"),
+    }
+    assert_eq!(
+        scheduler.metrics(),
+        SchedulerMetrics::default(),
+        "a rejected spawn never counts"
+    );
 }
