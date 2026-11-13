@@ -1,4 +1,4 @@
-//! R9 multi-threaded work-stealing scheduler.
+//! Multi-threaded work-stealing scheduler.
 //!
 //! Every worker owns a deque. Submissions are distributed round robin; a worker
 //! takes work from its own deque and, when empty, steals from the front of

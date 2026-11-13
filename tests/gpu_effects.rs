@@ -303,7 +303,7 @@ fn measured_scheduler_speedup_reports_real_timings() {
     assert_eq!(measurement.ratio, computed_ratio);
     assert!(measurement.ratio > 0.0);
     eprintln!(
-        "R9 measured scheduler timings: 1 worker {:?}, {} workers {:?}, measured ratio {:.3}x",
+        "measured scheduler timings: 1 worker {:?}, {} workers {:?}, measured ratio {:.3}x",
         measurement.one_worker, measurement.workers, measurement.many_workers, measurement.ratio
     );
 }

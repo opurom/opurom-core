@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX-shell mock devices for the R10 core tests. The host runs this plugin
+# POSIX-shell mock devices for the core tests. The host runs this plugin
 # with the plugin directory as its working directory.
 #
 #   schedule  comma-separated behavior per invoke; the last entry repeats:

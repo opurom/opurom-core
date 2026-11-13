@@ -86,7 +86,7 @@ fn write_manifest(dir: &Path, edit: impl FnOnce(&mut Json)) {
     fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
 }
 
-// --- IR_R2 multi-action events ------------------------------------------
+// --- multi-action events --------------------------------------------------
 
 #[test]
 fn multi_action_event_emits_ordered_patches() {

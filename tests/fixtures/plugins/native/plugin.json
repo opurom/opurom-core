@@ -11,5 +11,5 @@
     "share.send"
   ],
   "entry": "./native.sh",
-  "description": "Deterministic mock native devices for R10 core tests"
+  "description": "Deterministic mock native devices for the core tests"
 }

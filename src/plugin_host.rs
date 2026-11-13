@@ -171,7 +171,7 @@ impl LoadedPlugin {
     }
 
     fn record_success(&mut self) {
-        // The finite-cooldown R10 policy follows R9: success resets the streak.
+        // The finite-cooldown policy resets the streak on success.
         // The legacy permanent-disable policy keeps a crash sticky.
         if self.trial || self.breaker.cooldown.is_some() {
             self.trial = false;
@@ -195,7 +195,7 @@ impl LoadedPlugin {
                 self.opened_at = Some(self.breaker.clock.now());
                 self.status = PluginStatus::CircuitOpen;
             } else {
-                // R2/R9 callers rely on a permanent disable; finite cooldown is opt-in.
+                // The legacy callers rely on a permanent disable; finite cooldown is opt-in.
                 self.opened_at = None;
                 self.status = PluginStatus::Disabled;
             }
@@ -380,7 +380,7 @@ impl PluginHost {
         })
     }
 
-    /// Introspection for the R10 breaker states and tests. Returns 0 if absent.
+    /// Introspection for the breaker states and tests. Returns 0 if absent.
     pub fn consecutive_failures(&self, plugin: &str) -> u32 {
         lock(&self.plugins)
             .get(plugin)

@@ -1,14 +1,15 @@
 # opurom-core
 
-R2/R3/R9/R10 **kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
+**Kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other OPUROM project. It implements
-the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the R2 additions from
-[IR_R2_ADDENDUM.md](../opurom-spec/IR_R2_ADDENDUM.md), the process-isolated plugin host
-from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the R3 deterministic
-cooperative scheduler from [R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md), the R9
-multi-threaded work-stealing scheduler from [R9_ADDENDUM.md](../opurom-spec/R9_ADDENDUM.md) section 5,
-and the R10 explicit native-capability permission gate from
-[R10_ADDENDUM.md](../opurom-spec/R10_ADDENDUM.md) section 4.
+the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the interactive UI additions from
+[IR_ADDITIONS.md](../opurom-spec/IR_ADDITIONS.md), the process-isolated plugin host
+from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the deterministic
+cooperative scheduler from [COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md) section 4,
+the multi-threaded work-stealing scheduler from
+[PRODUCTION_BREADTH.md](../opurom-spec/PRODUCTION_BREADTH.md) section 5,
+and the explicit native-capability permission gate from
+[COMPONENT_LIBRARY_HARDENING.md](../opurom-spec/COMPONENT_LIBRARY_HARDENING.md) section 4.
 It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
 GUI or build pipeline live here.
 
@@ -16,19 +17,21 @@ GUI or build pipeline live here.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-cd /Users/mac/work/opurom/opurom-core
+cd opurom-core
 cargo fmt --all
 cargo test --offline
 RUSTFLAGS="-D warnings" cargo test --offline
 cargo run --offline --example parallel_speedup
 ```
 
-`cargo test --offline -- --nocapture` also prints the R9 test's measured `Instant` timings.
-Verified on Rust 1.99.1: **92 integration tests passed (20 R1, 38 R2, 17 R3, 10 R9, 7 R10;
-all 85 pre-existing R9 tests remain green), 0 failed, 0 ignored; 0 unit tests; 0 doc tests; zero
-compiler warnings**. Dependencies are `serde_json` and `serde_core`; the R9 scheduler and R10
-capability gate use pure `std` and add no crate. The R10 tests drive a real shell plugin process
-through JSON lines, including crashes, malformed frames, cooldown recovery and PID reaping.
+`cargo test --offline -- --nocapture` also prints the work-stealing scheduler test's measured
+`Instant` timings.
+Verified on Rust 1.99.1: **92 integration tests passed (20 base, 38 interactive UI, 17 scheduler,
+10 work-stealing scheduler, 7 native capabilities), 0 failed, 0 ignored; 0 unit tests; 0 doc
+tests; zero compiler warnings**. Dependencies are `serde_json` and `serde_core`; the
+work-stealing scheduler and the capability gate use pure `std` and add no crate. The
+capability tests drive a real shell plugin process through JSON lines, including crashes,
+malformed frames, cooldown recovery and PID reaping.
 
 ## API
 
@@ -50,23 +53,23 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | Item | Notes |
 | --- | --- |
 | `Ir::parse(&str) -> Result<Ir, CoreError>` | Validates `ir == "0.1"`, state types (`int`/`bool`/`string` with matching `init`), unique state names, unique `u32` node ids, and action legality. `add` needs an int target + integer value, `toggle` needs a bool target and no value, `set` needs a type-matching value. A `set` without value is legal only on `input` events with a string target. `props` and `theme` are preserved but not interpreted. |
-| `Node.events` | `HashMap<String, Vec<Action>>`: an event maps to an **ordered action list**. A v0.1 single action object is stored as a one-element list, so every round 1 IR file keeps working. |
+| `Node.events` | `HashMap<String, Vec<Action>>`: an event maps to an **ordered action list**. A v0.1 single action object is stored as a one-element list, so every earlier IR file keeps working. |
 | `Node.when` | `Option<String>`: the optional conditional node field is **preserved**; the kernel does not interpret it (hiding subtrees is a renderer concern). |
 | `Action` | `{ op, target, value: Option<Value>, value_from: Option<String> }`. `value` and `value_from` are mutually exclusive. |
 | `Runtime::from_ir_json(&str)` | Builds the state map and the node-id -> event-name -> ordered action list. Malformed JSON and malformed IR return readable `CoreError`s; no `unwrap`/`panic` on input. |
 | `Runtime::state(name)`, `snapshot()`, `version()` | `snapshot()` returns `Vec<Patch>` in state declaration order. |
 | `Runtime::dispatch(Event)` | `Event::Tap { node_id }` / `Event::Input { node_id, text }`. Applies every action of the bound event **in order and atomically**: the actions run against a working copy, and the copy is committed only when all of them succeed. Patches are emitted in action order, one per resulting state change. `add` uses `checked_add`, so overflow is an error with no state change. Errors (unknown node, unbound event, bad type) leave state and version untouched. |
 | `Patch`, `Value` | `Patch { name, value }`; `Value::Int(i64) \| Bool(bool) \| Str(String)`. Both serialize with `serde_json::to_string` as `{"name":"count","value":1}`. |
-| `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | R8 legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
-| `Scheduler::with_workers(n)` -> `WorkStealingScheduler` | R9 builder for N OS worker threads and a bounded total task queue. `spawn(task)` returns a `WorkStealingTaskHandle<T>` with `join() -> Result<T, SchedulerError>`; `spawn_on(worker, task)` pins a task to one worker's deque and gives its closure the executing worker id. Builder methods: `with_queue_capacity`, `with_failure_threshold`, `with_cooldown`, `with_clock`. One worker is deterministic FIFO; more workers use round-robin injection, per-worker deques and stealing. `shutdown()` drains work and joins every thread; `Drop` does the same. |
-| `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()` | Deterministic R3 cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. See [the R3 section](#deterministic-async-scheduler-r3); it is **not** async I/O. |
+| `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | Legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
+| `Scheduler::with_workers(n)` -> `WorkStealingScheduler` | Builder for N OS worker threads and a bounded total task queue. `spawn(task)` returns a `WorkStealingTaskHandle<T>` with `join() -> Result<T, SchedulerError>`; `spawn_on(worker, task)` pins a task to one worker's deque and gives its closure the executing worker id. Builder methods: `with_queue_capacity`, `with_failure_threshold`, `with_cooldown`, `with_clock`. One worker is deterministic FIFO; more workers use round-robin injection, per-worker deques and stealing. `shutdown()` drains work and joins every thread; `Drop` does the same. |
+| `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()` | Deterministic cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. See [the scheduler section](#deterministic-async-scheduler); it is **not** async I/O. |
 | `PluginBus::new(failure_threshold)` (default 3), `register`, `call`, `is_disabled` | Handler signature `Fn(&str) -> Result<String, String> + Send + Sync`. Every call runs inside `catch_unwind(AssertUnwindSafe(..))`. Handler `Err` and panics increment a consecutive-failure counter; a success resets it; at the threshold the plugin is disabled and later calls return the distinct `PluginError::Disabled`. Other plugins and the runtime keep working. |
 | `Host::new()` / `with_threshold(n)`, `run(primary, fallback)`, `record_error`, `record_success`, `degraded()` | Standalone degradation policy, no adapter crate dependency. Three consecutive primary `Err`s flip `degraded()` to true and `active_adapter()` to `"headless"`; once degraded, `run` calls only the fallback. A success resets the consecutive count. |
-| `NATIVE_CAPABILITIES`, `CapabilityHost::new(grants)` | R10 explicit grants for exactly `camera.takePhoto`, `geolocation.getCurrentPosition`, `bluetooth.scan`, `notification.show`, `payment.request` and `share.send`. `register(dir)` validates the manifest without spawning; `invoke(capability, params)` checks catalog, grant and declaration before lazy-loading the plugin. Denial returns `PluginError::NotAllowed`; an undeclared capability returns `PluginError::UnknownCapability`; neither starts a process. |
+| `NATIVE_CAPABILITIES`, `CapabilityHost::new(grants)` | Explicit grants for exactly `camera.takePhoto`, `geolocation.getCurrentPosition`, `bluetooth.scan`, `notification.show`, `payment.request` and `share.send`. `register(dir)` validates the manifest without spawning; `invoke(capability, params)` checks catalog, grant and declaration before lazy-loading the plugin. Denial returns `PluginError::NotAllowed`; an undeclared capability returns `PluginError::UnknownCapability`; neither starts a process. |
 | `CapabilityHost` / `PluginHost` builders and introspection | `with_failure_threshold(n)`, `with_cooldown(ticks)`, `with_clock(Arc<dyn Clock>)`, `with_timeout(Duration)`, `consecutive_failures(plugin)`, `circuit_open(plugin)`, `breaker_state(plugin)`, `retry_after(plugin)`, `shutdown()`. Builder methods configure the breaker before `load`/`register`; `shutdown` kills and reaps all plugin processes. |
-| `BreakerState`, `PluginStatus::CircuitOpen`, `PluginError::CircuitOpen { retry_after }` | R10 breaker states are `Closed`, `HalfOpen` and `Open`. After cooldown one half-open trial closes on success or reopens on failure. The legacy default remains a permanent `Disabled` status after three faults; finite cooldown is opt-in. |
+| `BreakerState`, `PluginStatus::CircuitOpen`, `PluginError::CircuitOpen { retry_after }` | Breaker states are `Closed`, `HalfOpen` and `Open`. After cooldown one half-open trial closes on success or reopens on failure. The legacy default remains a permanent `Disabled` status after three faults; finite cooldown is opt-in. |
 
-### IR R2 additions
+### Interactive UI IR additions
 
 `events.<name>` accepts either one action object (v0.1) or a wrapper object:
 
@@ -85,14 +88,14 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
   when the IR is parsed, not when it runs.
 - `toggle` never carries a value: `value` and `valueFrom` are both rejected for it.
 
-## Deterministic async scheduler (R3)
+## Deterministic async scheduler
 
 `AsyncScheduler` is a **deterministic, single-threaded, cooperative scheduler**
 driven by a logical tick counter: a schedulable coroutine queue. It is **NOT
 OS async I/O**, **NOT reactor/epoll**, and **NOT a claim about network
 concurrency**: there is no reactor, no epoll/kqueue, no thread pool, no
-sockets, no randomness and no wall clock. Real async I/O stays R4+ work. It
-implements [section 4 of R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md).
+sockets, no randomness and no wall clock. It implements
+[section 4 of COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md).
 
 ```rust
 use opurom_core::{AsyncScheduler, TaskId};
@@ -137,7 +140,7 @@ Rules, all deterministic:
   `HashMap`, clock, thread or random source influences it. A panicking task
   unwinds into the caller of `tick`/`drain`.
 
-## Parallel work-stealing scheduler (R9)
+## Parallel work-stealing scheduler
 
 `Scheduler::with_workers(n)` builds a `WorkStealingScheduler` using only `std::thread`,
 `Mutex`, `Condvar`, `VecDeque` and channels. It starts N real worker threads. Each thread owns
@@ -179,10 +182,10 @@ per task, 8 workers) printed:
 Measured ratio: `28.328 / 5.903 = 4.799x`. These are observed numbers from that run, not an
 estimate; they vary with host core count, load and build profile.
 
-Honest scope: no GPU scheduling, no OS async I/O, no priority preemption and no cross-process
-scheduling; those are R10+. One mutex protects all deques (not lock-free); there is no
-cancellation, timeout, task metrics or real-time scheduling. The legacy `Scheduler::new`
-priority pool remains separate and unchanged.
+One mutex protects all deques (not lock-free); there is no cancellation, timeout, task metrics
+or real-time scheduling, and no GPU scheduling, OS async I/O, priority preemption or
+cross-process scheduling. The legacy `Scheduler::new` priority pool remains separate and
+unchanged.
 
 ## Plugin ABI (protocol v1)
 
@@ -240,19 +243,19 @@ and symlinks pointing outside are rejected).
 - The legacy default is unchanged: 3 consecutive **timeouts / protocol violations / crashes**
   mark the plugin `Disabled` and kill its process. Other plugins keep serving. A crash remains
   sticky in this permanent-disable mode.
-- With `with_failure_threshold(n)` and `with_cooldown(ticks)`, the R10/R9-style breaker has
+- With `with_failure_threshold(n)` and `with_cooldown(ticks)`, the breaker has
   `Closed`, `HalfOpen` and `Open` states. `with_clock` injects a logical clock; an open circuit
   returns `PluginError::CircuitOpen { retry_after }`. At cooldown one trial closes on success or
   reopens on failure. In this mode a success resets the consecutive-failure streak.
 - After any fault the faulty process is killed and the next call starts a fresh process with a
   fresh handshake. An abrupt exit or malformed JSON-lines frame is reported as
   `PluginError::Crashed` or `PluginError::ProtocolViolation`; the host process survives.
-- `shutdown()` kills and reaps all loaded plugin processes. The R10 test checks every recorded
-  child PID after crashes, malformed frames and shutdown.
+- `shutdown()` kills and reaps all loaded plugin processes. The capability test checks every
+  recorded child PID after crashes, malformed frames and shutdown.
 - `catch_unwind` guards the host entry points. It cannot contain an abort, a `SIGSEGV` or a
   `panic = "abort"` build - process isolation is the real containment here.
 
-### Native capability permissions (R10)
+### Native capability permissions
 
 `CapabilityHost` is a lazy, application-level permission gate in front of `PluginHost`.
 `NATIVE_CAPABILITIES` contains exactly six capabilities:
@@ -289,7 +292,7 @@ The devices in `tests/fixtures/plugins/native/` are **deterministic mocks** spea
 lines over a real process boundary. There are no real OS permission prompts, no real camera or
 Bluetooth hardware, no real payment provider and no real share sheet. This permission sandbox is
 **not** an OS-level sandbox: no seatbelt, landlock, seccomp, filesystem or network namespace
-restriction, or rlimits are applied. Those remain R11+ work.
+restriction, or rlimits are applied.
 
 ## Resource manager
 
@@ -336,36 +339,31 @@ opurom-core plugins /path/to/plugin camera.takePhoto
 Fixtures in `tests/fixtures/`: `counter.opuir.json` is a copy of the spec's golden IR,
 `form.opuir.json` exercises string input, bool toggle and typed set, `bad-version.opuir.json`
 is a negative case. `tests/fixtures/plugins/stub/` is a self-contained stub plugin (a POSIX
-shell script) used by the round 2 tests; its behaviour is driven by a `schedule` file, so one
+shell script) used by the interactive UI tests; its behaviour is driven by a `schedule` file, so one
 fixture covers handshake, success, unknown capability, timeout, crash and protocol violations.
 
-## Honest status
+## Status
 
-| Area | Implemented and verified here | Not implemented (planned / belongs to another repo) |
-| --- | --- | --- |
-| IR v0.1 loading | Version, state types, unique names/ids, action legality, malformed-JSON diagnostics; negative tests in `tests/integration.rs` | Node `kind` whitelist, theme values and prop semantics are not validated (fields are preserved); interpolation `{name}` is a renderer concern |
-| IR R2 extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` preserved on nodes; empty action lists | Interpretation of `when` (subtree hiding), the other R2 prop/theme/node-kind additions - those belong to the renderer and compiler |
-| Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity | Derived/computed state, multi-state transactions, undo, persistence, animation |
-| Scheduler (R8 + R9) | R8 bounded priority pool unchanged (3 tests); R9 N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) | No GPU scheduling, no OS async I/O, no priority preemption, no cross-process scheduling; no cancellation, timeouts, task metrics, real-time scheduling or lock-free deques; R11+ |
-| Async scheduler (R3) | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism; 17 tests. No wall clock, threads or randomness | OS async I/O, reactor/epoll, OS timers, network concurrency; R4+ for real async I/O |
-| Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests | Unload/reload, recovery after cooldown |
-| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, legacy 3-strike `Disabled` breaker, configurable R10 breaker with cooldown/half-open recovery, typed `CircuitOpen` errors, crash/malformed-frame isolation, `list()` and `shutdown()`; 18 existing tests plus 7 R10 process tests | **No OS-level sandboxing**: no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits (rlimits) for the child. **No plugin signing or signature verification**, no trust chain, no version pinning. **No remote marketplace** - the local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
-| Native capability permissions (R10) | Exact six-capability catalog, explicit grants, lazy manifest registration, typed `NotAllowed`/`UnknownCapability` denial before spawn, deterministic mock replies, permission matrix and no-child-process checks in `tests/r10.rs` | Real OS permission prompts, real camera/Bluetooth/geolocation/payment/share hardware, platform bindings, a public marketplace, and an OS security boundary; R11+ |
-| Resource manager | Bounded LRU cache with a byte budget, deterministic eviction order, budget-exceeded error, zero-size handling; 6 tests | Memory pressure heuristics, per-plugin quotas, cache persistence, metrics |
-| Runtime <-> plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values | Automatic plugin discovery, capability-to-state mapping, streaming/long-lived plugin calls |
-| Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests | Real `PlatformAdapter` trait, actual adapter swap, recovery, frame presentation - those live in `opurom-platform`. This `Host` is a small standalone policy with no cross-repo dependency |
-| CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings | `opurom build/dev/test`, hot reload, watch mode (see `opurom-cli`) |
-| Renderer / pipeline | Nothing | RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP, debugger |
-| Quality evidence | `cargo fmt --all`; `cargo test --offline`: 92 passed, 0 failed, 0 ignored, no warnings; `RUSTFLAGS="-D warnings" cargo test --offline` also green; one real 1-worker vs N-worker `Instant` measurement is printed by `parallel_speedup` | No fps, cold-start, binary-size, GPU or competitive benchmark numbers; the only performance figure is the measured CPU-bound scheduler ratio above. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Area | Implementation |
+| --- | --- |
+| IR v0.1 loading | Version, state types, unique names/ids, action legality, malformed-JSON diagnostics; negative tests in `tests/integration.rs`. Node `kind` whitelist, theme values and prop semantics are not validated (fields are preserved); interpolation `{name}` is a renderer concern |
+| Interactive UI IR extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` preserved on nodes; empty action lists. The remaining prop/theme/node-kind additions belong to the renderer and compiler |
+| Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity |
+| Priority pool and work-stealing scheduler | Bounded priority pool unchanged (3 tests); N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) |
+| Async scheduler | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism; 17 tests. No wall clock, threads or randomness |
+| Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests |
+| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, legacy 3-strike `Disabled` breaker, configurable breaker with cooldown/half-open recovery, typed `CircuitOpen` errors, crash/malformed-frame isolation, `list()` and `shutdown()`; 18 existing tests plus 7 native-capability process tests. No OS-level sandboxing (no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits for the child), no plugin signing or signature verification, no trust chain and no version pinning. The local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
+| Native capability permissions | Exact six-capability catalog, explicit grants, lazy manifest registration, typed `NotAllowed`/`UnknownCapability` denial before spawn, deterministic mock replies, permission matrix and no-child-process checks in `tests/capabilities.rs` |
+| Resource manager | Bounded LRU cache with a byte budget, deterministic eviction order, budget-exceeded error, zero-size handling; 6 tests |
+| Runtime <-> plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values |
+| Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests. The real `PlatformAdapter` trait, the actual adapter swap and frame presentation live in `opurom-platform`; this `Host` is a small standalone policy with no cross-repo dependency |
+| CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings. `opurom build/dev/test`, hot reload and watch mode live in `opurom-cli` |
+| Renderer / pipeline | Nothing: RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
+| Quality evidence | `cargo fmt --all`; `cargo test --offline`: 92 passed, 0 failed, 0 ignored, no warnings; `RUSTFLAGS="-D warnings" cargo test --offline` also green; one real 1-worker vs N-worker `Instant` measurement is printed by `parallel_speedup`. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
-**Gap summary:** a narrow, tested kernel slice, not a shipping SDK. Process isolation of
-plugins is real and verified, but it is **not** a security boundary: a plugin still runs with
-the kernel's user privileges until R11 adds OS-level sandboxing. R10 adds an explicit
-application-level permission gate and deterministic mock devices, not real hardware or OS
-permission prompts. The R3 scheduler remains a deterministic queue only: it never performs I/O,
-and OS async I/O/network concurrency remains R4+ work. The R9 scheduler is real OS-threaded work
-stealing with a bounded queue and panic isolation, but it has no GPU scheduling, OS async I/O,
-priority preemption, cross-process scheduling, cancellation, timeouts, task metrics or lock-free
-deques; those stay R11+. Cross-repo end-to-end execution, real platform adapters, renderer
-output, fps and competitive benchmarks are outside this round; the only reported performance
+Process isolation of plugins is real and verified. The permission gate and the deterministic mock
+devices are application-level, and the cooperative scheduler is a deterministic queue only: it
+never performs I/O. The work-stealing scheduler is real OS-threaded work stealing with a bounded
+queue and panic isolation. Cross-repo end-to-end execution, real platform adapters, renderer
+output, fps and competitive benchmarks are outside this repository; the only reported performance
 numbers are the real 1-worker/N-worker `Instant` timings above.

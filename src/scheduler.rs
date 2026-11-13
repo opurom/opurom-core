@@ -64,7 +64,7 @@ impl<T> TaskHandle<T> {
 }
 
 impl Scheduler {
-    /// R9 builder for a bounded, multi-threaded work-stealing scheduler.
+    /// Builder for a bounded, multi-threaded work-stealing scheduler.
     ///
     /// The returned scheduler has its own `spawn`/`join` API: one worker is
     /// deterministic FIFO, and more workers use per-worker deques and stealing.

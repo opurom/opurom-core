@@ -25,7 +25,7 @@ fn print_measurement(measurement: &SpeedupMeasurement) {
     let one_checksum = checksum(&measurement.one_results);
     let many_checksum = checksum(&measurement.many_results);
 
-    println!("OPUROM R9 MEASURED parallel speedup (std::thread, CPU-bound integer workload)");
+    println!("OPUROM MEASURED parallel speedup (std::thread, CPU-bound integer workload)");
     println!(
         "tasks={} iterations_per_task={} n_workers={}",
         measurement.tasks, measurement.iterations, measurement.workers

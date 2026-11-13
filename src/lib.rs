@@ -1,5 +1,5 @@
-//! OPUROM kernel: IR v0.1 / R2 extensions, a bounded priority scheduler, an
-//! R3 deterministic cooperative scheduler, the R9 multi-threaded
+//! OPUROM kernel: IR v0.1 and its interactive UI extensions, a bounded priority
+//! scheduler, a deterministic cooperative scheduler, a multi-threaded
 //! work-stealing scheduler, a fault-isolating plugin bus, a process-isolated
 //! plugin host, and a bounded resource cache.
 

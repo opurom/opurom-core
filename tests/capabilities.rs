@@ -13,7 +13,7 @@ use std::time::Duration;
 const NATIVE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/plugins/native");
 
 fn native_plugin(tag: &str, schedule: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("opurom-core-r10-{tag}"));
+    let dir = std::env::temp_dir().join(format!("opurom-core-capabilities-{tag}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     for file in ["plugin.json", "native.sh"] {

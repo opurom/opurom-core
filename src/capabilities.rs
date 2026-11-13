@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The six R10 native capabilities. Grants are exact strings from this list.
+/// The six native capabilities. Grants are exact strings from this list.
 pub const NATIVE_CAPABILITIES: [&str; 6] = [
     "camera.takePhoto",
     "geolocation.getCurrentPosition",

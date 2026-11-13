@@ -8,7 +8,7 @@
 //!
 //! This is a schedulable **coroutine queue**, NOT OS async I/O: no reactor,
 //! no epoll/kqueue, no sockets, no OS timers, and no claim about network
-//! concurrency. Real async I/O is R4+ work.
+//! concurrency. Real async I/O is not implemented here.
 
 use std::cmp::Reverse;
 
