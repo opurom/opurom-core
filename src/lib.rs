@@ -11,6 +11,7 @@ pub mod ir;
 pub mod parallel_sched;
 pub mod plugin;
 pub mod plugin_host;
+pub mod render;
 pub mod resource;
 pub mod scheduler;
 pub mod state;
@@ -26,6 +27,7 @@ pub use parallel_sched::{
 };
 pub use plugin::{PluginBus, PluginMetrics};
 pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAULT_PLUGIN_TIMEOUT};
+pub use render::RenderingHook;
 pub use resource::{ResourceError, ResourceManager};
 pub use scheduler::{Scheduler, TaskHandle};
 pub use state::{Event, Patch, Runtime, Value, DEFAULT_RESOURCE_BUDGET};
