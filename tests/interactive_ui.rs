@@ -390,6 +390,202 @@ fn node_when_field_is_preserved_in_the_parsed_ir() {
 }
 
 #[test]
+fn a_hidden_node_dispatch_is_inert_until_its_condition_turns_true() {
+    let ir = ir_with_tree(
+        json!([
+            {"name": "visible", "type": "bool", "init": false},
+            {"name": "count", "type": "int", "init": 0},
+            {"name": "label", "type": "string", "init": "idle"}
+        ]),
+        json!({
+            "id": 0, "kind": "Column", "props": {}, "events": {},
+            "children": [
+                {"id": 1, "kind": "Switch", "props": {}, "children": [],
+                 "events": {"tap": {"op": "toggle", "target": "visible"}}},
+                {"id": 2, "kind": "Button", "props": {}, "children": [],
+                 "when": "visible",
+                 "events": {
+                     "tap": {"op": "add", "target": "count", "value": 1},
+                     "input": {"op": "set", "target": "label"}
+                 }}
+            ]
+        }),
+    );
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 2 })
+        .unwrap()
+        .is_empty());
+    assert!(runtime
+        .dispatch(Event::Input {
+            node_id: 2,
+            text: "typed".to_owned(),
+        })
+        .unwrap()
+        .is_empty());
+    assert_eq!(runtime.version(), 0);
+    assert_eq!(runtime.state("count"), Some(&Value::Int(0)));
+    assert_eq!(runtime.state("label"), Some(&Value::Str("idle".to_owned())));
+    assert_eq!(runtime.snapshot()[1].value, Value::Int(0));
+
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 1 }).unwrap(),
+        vec![patch("visible", Value::Bool(true))]
+    );
+    assert_eq!(runtime.version(), 1);
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 2 }).unwrap(),
+        vec![patch("count", Value::Int(1))]
+    );
+    assert_eq!(
+        runtime
+            .dispatch(Event::Input {
+                node_id: 2,
+                text: "typed".to_owned(),
+            })
+            .unwrap(),
+        vec![patch("label", Value::Str("typed".to_owned()))]
+    );
+    assert_eq!(runtime.version(), 3);
+
+    runtime.dispatch(Event::Tap { node_id: 1 }).unwrap();
+    let version = runtime.version();
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 2 })
+        .unwrap()
+        .is_empty());
+    assert_eq!(runtime.version(), version);
+    assert_eq!(runtime.state("count"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn an_ancestor_condition_covers_the_whole_subtree() {
+    let ir = ir_with_tree(
+        json!([
+            {"name": "outer", "type": "bool", "init": false},
+            {"name": "inner", "type": "bool", "init": true},
+            {"name": "count", "type": "int", "init": 0}
+        ]),
+        json!({
+            "id": 0, "kind": "Column", "props": {}, "events": {},
+            "children": [
+                {"id": 1, "kind": "Container", "props": {}, "when": "outer", "events": {},
+                 "children": [
+                     {"id": 2, "kind": "Button", "props": {}, "children": [],
+                      "events": {"tap": {"op": "add", "target": "count", "value": 1}}},
+                     {"id": 3, "kind": "Button", "props": {}, "children": [],
+                      "when": "inner",
+                      "events": {"tap": {"op": "add", "target": "count", "value": 10}}}
+                 ]},
+                {"id": 4, "kind": "Switch", "props": {}, "children": [],
+                 "events": {"tap": {"op": "toggle", "target": "outer"}}},
+                {"id": 5, "kind": "Switch", "props": {}, "children": [],
+                 "events": {"tap": {"op": "toggle", "target": "inner"}}}
+            ]
+        }),
+    );
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 2 })
+        .unwrap()
+        .is_empty());
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 3 })
+        .unwrap()
+        .is_empty());
+
+    runtime.dispatch(Event::Tap { node_id: 4 }).unwrap();
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 2 }).unwrap(),
+        vec![patch("count", Value::Int(1))]
+    );
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 3 }).unwrap(),
+        vec![patch("count", Value::Int(11))]
+    );
+
+    runtime.dispatch(Event::Tap { node_id: 5 }).unwrap();
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 3 })
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 2 }).unwrap(),
+        vec![patch("count", Value::Int(12))]
+    );
+
+    runtime.dispatch(Event::Tap { node_id: 4 }).unwrap();
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 2 })
+        .unwrap()
+        .is_empty());
+    assert_eq!(runtime.state("count"), Some(&Value::Int(12)));
+}
+
+#[test]
+fn a_when_condition_must_name_a_declared_bool_state() {
+    let cases = [
+        (
+            json!([{"name": "count", "type": "int", "init": 0}]),
+            json!("count"),
+            "must name a bool state",
+        ),
+        (
+            json!([{"name": "visible", "type": "bool", "init": true}]),
+            json!("missing"),
+            "is not declared in state",
+        ),
+    ];
+    for (state, when, expected) in cases {
+        let ir = ir_with_tree(
+            state,
+            json!({"id": 0, "kind": "Column", "props": {}, "children": [],
+                   "when": when, "events": {}}),
+        );
+        let error = Runtime::from_ir_json(&ir).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    let non_string = ir_with_tree(
+        json!([{"name": "visible", "type": "bool", "init": true}]),
+        json!({"id": 0, "kind": "Column", "props": {}, "children": [],
+               "when": 7, "events": {}}),
+    );
+    let error = Runtime::from_ir_json(&non_string).unwrap_err().to_string();
+    assert!(error.contains("when must be a string"), "{error}");
+}
+
+#[test]
+fn a_hidden_node_still_reports_unknown_and_unbound_events() {
+    let ir = ir_with_tree(
+        json!([{"name": "visible", "type": "bool", "init": false}]),
+        json!({
+            "id": 0, "kind": "Column", "props": {}, "events": {},
+            "when": "visible",
+            "children": [{"id": 1, "kind": "Button", "props": {}, "children": [],
+                          "events": {"tap": {"op": "toggle", "target": "visible"}}}]
+        }),
+    );
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert!(matches!(
+        runtime.dispatch(Event::Tap { node_id: 99 }),
+        Err(CoreError::UnknownNode(99))
+    ));
+    assert!(matches!(
+        runtime.dispatch(Event::Input {
+            node_id: 1,
+            text: "text".to_owned(),
+        }),
+        Err(CoreError::UnboundEvent { node_id: 1, .. })
+    ));
+    assert!(runtime
+        .dispatch(Event::Tap { node_id: 1 })
+        .unwrap()
+        .is_empty());
+    assert_eq!(runtime.version(), 0);
+}
+
+#[test]
 fn malformed_ir_is_rejected_with_a_readable_diagnostic() {
     let cases: Vec<(String, &str)> = vec![
         (
