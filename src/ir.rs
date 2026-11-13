@@ -9,6 +9,7 @@ pub const IR_VERSION: &str = "0.1";
 pub enum Op {
     Set,
     Add,
+    Sub,
     Toggle,
 }
 
@@ -141,7 +142,7 @@ fn validate_value_from(
     })?;
     if require_int && !matches!(source_declared, Value::Int(_)) {
         return Err(invalid(format!(
-            "{at}: add requires an int valueFrom source, {source:?} is {}",
+            "{at}: requires an int valueFrom source, {source:?} is {}",
             source_declared.type_name()
         )));
     }
@@ -177,10 +178,10 @@ fn parse_action(
     let value;
     let value_from;
     match op.as_str() {
-        "add" => {
+        "add" | "sub" => {
             if !matches!(declared, Value::Int(_)) {
                 return Err(invalid(format!(
-                    "{at}: add requires an int target, {target:?} is {}",
+                    "{at}: {op} requires an int target, {target:?} is {}",
                     declared.type_name()
                 )));
             }
@@ -192,7 +193,7 @@ fn parse_action(
             } else {
                 let n = raw_value
                     .and_then(Json::as_i64)
-                    .ok_or_else(|| invalid(format!("{at}: add requires an integer value")))?;
+                    .ok_or_else(|| invalid(format!("{at}: {op} requires an integer value")))?;
                 value = Some(Value::Int(n));
                 value_from = None;
             }
@@ -241,11 +242,16 @@ fn parse_action(
                 )))
             }
         },
-        _ => return Err(invalid(format!("{at}.op {op:?} is not set, add or toggle"))),
+        _ => {
+            return Err(invalid(format!(
+                "{at}.op {op:?} is not set, add, sub or toggle"
+            )))
+        }
     };
     let op = match op.as_str() {
         "set" => Op::Set,
         "add" => Op::Add,
+        "sub" => Op::Sub,
         _ => Op::Toggle,
     };
     Ok(Action {
