@@ -192,6 +192,59 @@ fn value_from_reads_the_current_state_at_execution_time() {
 }
 
 #[test]
+fn sub_action_subtracts_and_add_adds_state_values() {
+    // 10 - 3 = 7 for "sub"; 10 + 3 = 13 for "add".
+    for (op, expected) in [("sub", 7), ("add", 13)] {
+        let ir = ir_document(
+            json!([
+                {"name": "total", "type": "int", "init": 10},
+                {"name": "step", "type": "int", "init": 3}
+            ]),
+            json!({"tap": {"op": op, "target": "total", "valueFrom": "step"}}),
+        );
+        let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+        let patches = runtime.dispatch(Event::Tap { node_id: 0 }).unwrap();
+        assert_eq!(patches, vec![patch("total", Value::Int(expected))], "{op}");
+        assert_eq!(runtime.state("total"), Some(&Value::Int(expected)), "{op}");
+    }
+
+    // A literal "sub" value is subtracted as well.
+    let ir = ir_document(
+        json!([{"name": "total", "type": "int", "init": 10}]),
+        json!({"tap": {"op": "sub", "target": "total", "value": 4}}),
+    );
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert_eq!(
+        runtime.dispatch(Event::Tap { node_id: 0 }).unwrap(),
+        vec![patch("total", Value::Int(6))]
+    );
+}
+
+#[test]
+fn sub_action_is_validated_like_add() {
+    let int_state = json!([{"name": "total", "type": "int", "init": 10}]);
+    let cases = [
+        (
+            json!([{"name": "total", "type": "bool", "init": false}]),
+            json!({"tap": {"op": "sub", "target": "total", "value": 1}}),
+            "sub requires an int target",
+        ),
+        (
+            int_state,
+            json!({"tap": {"op": "sub", "target": "total"}}),
+            "sub requires an integer value",
+        ),
+    ];
+    for (state, events, expected) in cases {
+        let err = Runtime::from_ir_json(&ir_document(state, events)).unwrap_err();
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+    }
+}
+
+#[test]
 fn value_from_sees_values_changed_by_earlier_actions() {
     let ir = ir_document(
         json!([
@@ -365,7 +418,7 @@ fn malformed_ir_is_rejected_with_a_readable_diagnostic() {
                 json!([{"name": "a", "type": "int", "init": 0}]),
                 json!({"tap": {"actions": [{"op": "mul", "target": "a", "value": 1}]}}),
             ),
-            "not set, add or toggle",
+            "not set, add, sub or toggle",
         ),
         (
             ir_document(

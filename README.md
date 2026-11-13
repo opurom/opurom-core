@@ -16,7 +16,6 @@ GUI or build pipeline live here.
 ## Build and verify
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"
 cd opurom-core
 cargo fmt --all
 cargo test --offline

@@ -209,7 +209,7 @@ fn rejects_illegal_event_actions() {
         (
             int_state.clone(),
             json!({"tap": {"op": "mul", "target": "count", "value": 2}}),
-            "not set, add or toggle",
+            "not set, add, sub or toggle",
         ),
         (
             int_state.clone(),

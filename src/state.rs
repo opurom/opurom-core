@@ -128,7 +128,7 @@ fn apply_action(
                 )
             }
         }
-        Op::Add => {
+        Op::Add | Op::Sub => {
             let delta = if let Some(source) = &action.value_from {
                 match state_value(values, index, source)? {
                     Value::Int(value) => value,
@@ -149,13 +149,14 @@ fn apply_action(
             };
             match &current {
                 Value::Int(value) => {
-                    Value::Int(
-                        value
-                            .checked_add(delta)
-                            .ok_or_else(|| CoreError::Overflow {
-                                name: action.target.clone(),
-                            })?,
-                    )
+                    let next = if action.op == Op::Add {
+                        value.checked_add(delta)
+                    } else {
+                        value.checked_sub(delta)
+                    };
+                    Value::Int(next.ok_or_else(|| CoreError::Overflow {
+                        name: action.target.clone(),
+                    })?)
                 }
                 _ => {
                     return Err(CoreError::TypeMismatch {
