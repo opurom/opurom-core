@@ -1,12 +1,14 @@
 # opurom-core
 
-R2/R3/R9 **kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
+R2/R3/R9/R10 **kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other OPUROM project. It implements
 the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the R2 additions from
 [IR_R2_ADDENDUM.md](../opurom-spec/IR_R2_ADDENDUM.md), the process-isolated plugin host
 from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the R3 deterministic
-cooperative scheduler from [R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md), and the R9
-multi-threaded work-stealing scheduler from [R9_ADDENDUM.md](../opurom-spec/R9_ADDENDUM.md) section 5.
+cooperative scheduler from [R3_ADDENDUM.md](../opurom-spec/R3_ADDENDUM.md), the R9
+multi-threaded work-stealing scheduler from [R9_ADDENDUM.md](../opurom-spec/R9_ADDENDUM.md) section 5,
+and the R10 explicit native-capability permission gate from
+[R10_ADDENDUM.md](../opurom-spec/R10_ADDENDUM.md) section 4.
 It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
 GUI or build pipeline live here.
 
@@ -22,10 +24,11 @@ cargo run --offline --example parallel_speedup
 ```
 
 `cargo test --offline -- --nocapture` also prints the R9 test's measured `Instant` timings.
-Verified on Rust 1.99.1: **85 integration tests passed (20 R1, 38 R2, 17 R3, 10 R9; all 75
-pre-existing R8 tests remain green), 0 failed, 0 ignored; 0 unit tests; 0 doc tests; zero
-compiler warnings**. Dependencies are `serde_json` and `serde_core`; the R9 scheduler uses
-pure `std` and adds no crate.
+Verified on Rust 1.99.1: **92 integration tests passed (20 R1, 38 R2, 17 R3, 10 R9, 7 R10;
+all 85 pre-existing R9 tests remain green), 0 failed, 0 ignored; 0 unit tests; 0 doc tests; zero
+compiler warnings**. Dependencies are `serde_json` and `serde_core`; the R9 scheduler and R10
+capability gate use pure `std` and add no crate. The R10 tests drive a real shell plugin process
+through JSON lines, including crashes, malformed frames, cooldown recovery and PID reaping.
 
 ## API
 
@@ -59,6 +62,9 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()` | Deterministic R3 cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. See [the R3 section](#deterministic-async-scheduler-r3); it is **not** async I/O. |
 | `PluginBus::new(failure_threshold)` (default 3), `register`, `call`, `is_disabled` | Handler signature `Fn(&str) -> Result<String, String> + Send + Sync`. Every call runs inside `catch_unwind(AssertUnwindSafe(..))`. Handler `Err` and panics increment a consecutive-failure counter; a success resets it; at the threshold the plugin is disabled and later calls return the distinct `PluginError::Disabled`. Other plugins and the runtime keep working. |
 | `Host::new()` / `with_threshold(n)`, `run(primary, fallback)`, `record_error`, `record_success`, `degraded()` | Standalone degradation policy, no adapter crate dependency. Three consecutive primary `Err`s flip `degraded()` to true and `active_adapter()` to `"headless"`; once degraded, `run` calls only the fallback. A success resets the consecutive count. |
+| `NATIVE_CAPABILITIES`, `CapabilityHost::new(grants)` | R10 explicit grants for exactly `camera.takePhoto`, `geolocation.getCurrentPosition`, `bluetooth.scan`, `notification.show`, `payment.request` and `share.send`. `register(dir)` validates the manifest without spawning; `invoke(capability, params)` checks catalog, grant and declaration before lazy-loading the plugin. Denial returns `PluginError::NotAllowed`; an undeclared capability returns `PluginError::UnknownCapability`; neither starts a process. |
+| `CapabilityHost` / `PluginHost` builders and introspection | `with_failure_threshold(n)`, `with_cooldown(ticks)`, `with_clock(Arc<dyn Clock>)`, `with_timeout(Duration)`, `consecutive_failures(plugin)`, `circuit_open(plugin)`, `breaker_state(plugin)`, `retry_after(plugin)`, `shutdown()`. Builder methods configure the breaker before `load`/`register`; `shutdown` kills and reaps all plugin processes. |
+| `BreakerState`, `PluginStatus::CircuitOpen`, `PluginError::CircuitOpen { retry_after }` | R10 breaker states are `Closed`, `HalfOpen` and `Open`. After cooldown one half-open trial closes on success or reopens on failure. The legacy default remains a permanent `Disabled` status after three faults; finite cooldown is opt-in. |
 
 ### IR R2 additions
 
@@ -225,20 +231,65 @@ and symlinks pointing outside are rejected).
 | `PluginHost::load(dir) -> Result<PluginInfo, PluginError>` | Validates the manifest, spawns `entry`, performs the `hello` handshake and verifies that the advertised capabilities are a **subset** of the declared ones. |
 | `PluginHost::invoke(capability, params)` | Checks the allowlist, writes one JSON line, reads exactly one response with the matching id under the timeout, and validates `{id, ok, result\|error}`. |
 | `PluginHost::invoke_on(plugin, capability, params)` | Same, but targets one named plugin directly (used when two plugins share a capability name). |
-| `PluginHost::list() -> Result<Vec<PluginInfo>, PluginError>` | Reports `name`, `version`, `capabilities`, `status` (`Active`/`Disabled`) and the invocation count. |
-| `PluginInfo`, `PluginStatus` | Plain data types, no lifetime or borrow ties to the host. |
-| `PluginError` | `NotFound`, `Failed`, `Panicked`, `Disabled`, `Io`, `InvalidManifest`, `Spawn`, `Timeout`, `ProtocolViolation`, `Crashed`, `NotAllowed`, `UnknownCapability`, `AmbiguousCapability`. Every failure is a **value**; no panic crosses the boundary. |
+| `PluginHost::list() -> Result<Vec<PluginInfo>, PluginError>` | Reports `name`, `version`, `capabilities`, `status` (`Active`/`CircuitOpen`/`Disabled`) and the invocation count. |
+| `PluginInfo`, `PluginStatus`, `BreakerState` | Plain data types, no lifetime or borrow ties to the host. |
+| `PluginError` | `NotFound`, `Failed`, `Panicked`, `Disabled`, `Io`, `InvalidManifest`, `Spawn`, `Timeout`, `ProtocolViolation`, `Crashed`, `NotAllowed`, `UnknownCapability`, `AmbiguousCapability`, `CircuitOpen { retry_after }`. Every failure is a **value**; no panic crosses the boundary. |
 
 ### Fault policy
 
-- 3 consecutive **timeouts / protocol violations / crashes** => the plugin is marked `Disabled`
-  and its process is killed. Other plugins keep serving.
-- A successful call resets the counter - but only when no crash happened. A crash is never
-  cleared by a later success.
-- After a fault the faulty process is killed and the next call starts a fresh process with a
-  fresh handshake.
+- The legacy default is unchanged: 3 consecutive **timeouts / protocol violations / crashes**
+  mark the plugin `Disabled` and kill its process. Other plugins keep serving. A crash remains
+  sticky in this permanent-disable mode.
+- With `with_failure_threshold(n)` and `with_cooldown(ticks)`, the R10/R9-style breaker has
+  `Closed`, `HalfOpen` and `Open` states. `with_clock` injects a logical clock; an open circuit
+  returns `PluginError::CircuitOpen { retry_after }`. At cooldown one trial closes on success or
+  reopens on failure. In this mode a success resets the consecutive-failure streak.
+- After any fault the faulty process is killed and the next call starts a fresh process with a
+  fresh handshake. An abrupt exit or malformed JSON-lines frame is reported as
+  `PluginError::Crashed` or `PluginError::ProtocolViolation`; the host process survives.
+- `shutdown()` kills and reaps all loaded plugin processes. The R10 test checks every recorded
+  child PID after crashes, malformed frames and shutdown.
 - `catch_unwind` guards the host entry points. It cannot contain an abort, a `SIGSEGV` or a
   `panic = "abort"` build - process isolation is the real containment here.
+
+### Native capability permissions (R10)
+
+`CapabilityHost` is a lazy, application-level permission gate in front of `PluginHost`.
+`NATIVE_CAPABILITIES` contains exactly six capabilities:
+
+| Capability | Deterministic mock reply |
+| --- | --- |
+| `camera.takePhoto` | fixed image path, width and height |
+| `geolocation.getCurrentPosition` | fixed latitude, longitude and accuracy |
+| `bluetooth.scan` | one fixed beacon and RSSI |
+| `notification.show` | fixed delivery record |
+| `payment.request` | fixed approved transaction |
+| `share.send` | fixed share-sheet target |
+
+`CapabilityHost::new(grants)` receives an explicit set; there is no implicit grant.
+`register(dir)` reads and validates the manifest but does not spawn. `invoke` checks the catalog,
+then the grant, then the registered declaration, and only then calls `PluginHost::load`. A denied
+capability returns `PluginError::NotAllowed`; an undeclared capability returns
+`PluginError::UnknownCapability`; neither executes the plugin. The inner host repeats the
+allowlist check before writing a request.
+
+```rust
+use opurom_core::CapabilityHost;
+use serde_json::json;
+
+let host = CapabilityHost::new(["camera.takePhoto"]);
+host.register("tests/fixtures/plugins/native")?;
+let photo = host.invoke("camera.takePhoto", json!({}))?;
+assert_eq!(photo["mock"], true);
+host.shutdown();
+# Ok::<(), opurom_core::PluginError>(())
+```
+
+The devices in `tests/fixtures/plugins/native/` are **deterministic mocks** speaking real JSON
+lines over a real process boundary. There are no real OS permission prompts, no real camera or
+Bluetooth hardware, no real payment provider and no real share sheet. This permission sandbox is
+**not** an OS-level sandbox: no seatbelt, landlock, seccomp, filesystem or network namespace
+restriction, or rlimits are applied. Those remain R11+ work.
 
 ## Resource manager
 
@@ -295,24 +346,26 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | IR v0.1 loading | Version, state types, unique names/ids, action legality, malformed-JSON diagnostics; negative tests in `tests/integration.rs` | Node `kind` whitelist, theme values and prop semantics are not validated (fields are preserved); interpolation `{name}` is a renderer concern |
 | IR R2 extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` preserved on nodes; empty action lists | Interpretation of `when` (subtree hiding), the other R2 prop/theme/node-kind additions - those belong to the renderer and compiler |
 | Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity | Derived/computed state, multi-state transactions, undo, persistence, animation |
-| Scheduler (R8 + R9) | R8 bounded priority pool unchanged (3 tests); R9 N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) | No GPU scheduling, no OS async I/O, no priority preemption, no cross-process scheduling; no cancellation, timeouts, task metrics, real-time scheduling or lock-free deques; R10+ |
+| Scheduler (R8 + R9) | R8 bounded priority pool unchanged (3 tests); R9 N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) | No GPU scheduling, no OS async I/O, no priority preemption, no cross-process scheduling; no cancellation, timeouts, task metrics, real-time scheduling or lock-free deques; R11+ |
 | Async scheduler (R3) | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism; 17 tests. No wall clock, threads or randomness | OS async I/O, reactor/epoll, OS timers, network concurrency; R4+ for real async I/O |
 | Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests | Unload/reload, recovery after cooldown |
-| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, 3-strike `Disabled` breaker, crash-vs-timeout counter rule, `list()`; 18 tests against a real stub process | **No sandboxing**: no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits (rlimits) for the child. **No plugin signing or signature verification**, no trust chain, no version pinning. **No remote marketplace** - the local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
+| Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, legacy 3-strike `Disabled` breaker, configurable R10 breaker with cooldown/half-open recovery, typed `CircuitOpen` errors, crash/malformed-frame isolation, `list()` and `shutdown()`; 18 existing tests plus 7 R10 process tests | **No OS-level sandboxing**: no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits (rlimits) for the child. **No plugin signing or signature verification**, no trust chain, no version pinning. **No remote marketplace** - the local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
+| Native capability permissions (R10) | Exact six-capability catalog, explicit grants, lazy manifest registration, typed `NotAllowed`/`UnknownCapability` denial before spawn, deterministic mock replies, permission matrix and no-child-process checks in `tests/r10.rs` | Real OS permission prompts, real camera/Bluetooth/geolocation/payment/share hardware, platform bindings, a public marketplace, and an OS security boundary; R11+ |
 | Resource manager | Bounded LRU cache with a byte budget, deterministic eviction order, budget-exceeded error, zero-size handling; 6 tests | Memory pressure heuristics, per-plugin quotas, cache persistence, metrics |
 | Runtime <-> plugin bus | `Runtime::invoke_plugin` caches plugin results under the runtime byte budget and reports plugin errors as values | Automatic plugin discovery, capability-to-state mapping, streaming/long-lived plugin calls |
 | Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests | Real `PlatformAdapter` trait, actual adapter swap, recovery, frame presentation - those live in `opurom-platform`. This `Host` is a small standalone policy with no cross-repo dependency |
 | CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings | `opurom build/dev/test`, hot reload, watch mode (see `opurom-cli`) |
 | Renderer / pipeline | Nothing | RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP, debugger |
-| Quality evidence | `cargo test --offline`: 85 passed, 0 failed, 0 ignored, no warnings; `RUSTFLAGS="-D warnings" cargo test --offline` also green; one real 1-worker vs N-worker `Instant` measurement is printed by `parallel_speedup` | No fps, cold-start, binary-size, GPU or competitive benchmark numbers; the only performance figure is the measured CPU-bound scheduler ratio above. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Quality evidence | `cargo fmt --all`; `cargo test --offline`: 92 passed, 0 failed, 0 ignored, no warnings; `RUSTFLAGS="-D warnings" cargo test --offline` also green; one real 1-worker vs N-worker `Instant` measurement is printed by `parallel_speedup` | No fps, cold-start, binary-size, GPU or competitive benchmark numbers; the only performance figure is the measured CPU-bound scheduler ratio above. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 **Gap summary:** a narrow, tested kernel slice, not a shipping SDK. Process isolation of
 plugins is real and verified, but it is **not** a security boundary: a plugin still runs with
-the kernel's user privileges until R3 adds OS-level sandboxing. The R3 scheduler remains a
-deterministic queue only: it never performs I/O, and OS async I/O/network concurrency remains
-R4+ work. The R9 scheduler is real OS-threaded work stealing with a bounded queue and panic
-isolation, but it has no GPU scheduling, OS async I/O, priority preemption, cross-process
-scheduling, cancellation, timeouts, task metrics or lock-free deques; those stay R10+.
-Cross-repo end-to-end execution, real platform adapters, renderer output, fps and competitive
-benchmarks are outside this round; the only reported performance numbers are the real
-1-worker/N-worker `Instant` timings above.
+the kernel's user privileges until R11 adds OS-level sandboxing. R10 adds an explicit
+application-level permission gate and deterministic mock devices, not real hardware or OS
+permission prompts. The R3 scheduler remains a deterministic queue only: it never performs I/O,
+and OS async I/O/network concurrency remains R4+ work. The R9 scheduler is real OS-threaded work
+stealing with a bounded queue and panic isolation, but it has no GPU scheduling, OS async I/O,
+priority preemption, cross-process scheduling, cancellation, timeouts, task metrics or lock-free
+deques; those stay R11+. Cross-repo end-to-end execution, real platform adapters, renderer
+output, fps and competitive benchmarks are outside this round; the only reported performance
+numbers are the real 1-worker/N-worker `Instant` timings above.

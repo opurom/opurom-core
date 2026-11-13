@@ -1,4 +1,5 @@
 use crate::error::{panic_message, PluginError};
+use crate::parallel_sched::{Clock, SystemClock};
 use serde_json::{json, Map, Value as Json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,7 +23,15 @@ const READER_QUEUE: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginStatus {
     Active,
+    CircuitOpen,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerState {
+    Closed,
+    HalfOpen,
+    Open,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +50,20 @@ struct Manifest {
     capabilities: Vec<String>,
     dir: PathBuf,
     entry: PathBuf,
+}
+
+#[derive(Clone)]
+struct BreakerConfig {
+    threshold: u32,
+    cooldown: Option<u64>,
+    clock: Arc<dyn Clock>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PluginDeclaration {
+    pub name: String,
+    pub dir: PathBuf,
+    pub capabilities: Vec<String>,
 }
 
 enum ReadEvent {
@@ -71,11 +94,14 @@ struct LoadedPlugin {
     next_id: u64,
     faults: u32,
     crashed: bool,
+    opened_at: Option<u64>,
+    trial: bool,
+    breaker: BreakerConfig,
     process: Option<Process>,
 }
 
 impl LoadedPlugin {
-    fn new(manifest: Manifest) -> Self {
+    fn new(manifest: Manifest, breaker: BreakerConfig) -> Self {
         LoadedPlugin {
             manifest,
             advertised: Vec::new(),
@@ -84,6 +110,9 @@ impl LoadedPlugin {
             next_id: 1,
             faults: 0,
             crashed: false,
+            opened_at: None,
+            trial: false,
+            breaker,
             process: None,
         }
     }
@@ -100,7 +129,77 @@ impl LoadedPlugin {
 
     fn disable(&mut self) {
         self.status = PluginStatus::Disabled;
+        self.opened_at = None;
+        self.trial = false;
         self.process = None;
+    }
+
+    fn breaker_state(&self) -> BreakerState {
+        if self.status == PluginStatus::Disabled || self.opened_at.is_some() {
+            BreakerState::Open
+        } else if self.trial || self.faults > 0 {
+            BreakerState::HalfOpen
+        } else {
+            BreakerState::Closed
+        }
+    }
+
+    /// Blocks an open circuit, or starts one half-open trial after cooldown.
+    fn check_breaker(&mut self) -> Result<(), PluginError> {
+        if self.status == PluginStatus::Disabled {
+            return Err(PluginError::Disabled(self.manifest.name.clone()));
+        }
+        if let Some(opened_at) = self.opened_at {
+            let cooldown = self
+                .breaker
+                .cooldown
+                .ok_or_else(|| PluginError::Disabled(self.manifest.name.clone()))?;
+            let now = self.breaker.clock.now();
+            let retry_at = opened_at.saturating_add(cooldown);
+            if now < retry_at {
+                return Err(PluginError::CircuitOpen {
+                    retry_after: retry_at.saturating_sub(now),
+                });
+            }
+            self.opened_at = None;
+            self.status = PluginStatus::Active;
+            self.faults = 0;
+            self.crashed = false;
+            self.trial = true;
+        }
+        Ok(())
+    }
+
+    fn record_success(&mut self) {
+        // The finite-cooldown R10 policy follows R9: success resets the streak.
+        // The legacy permanent-disable policy keeps a crash sticky.
+        if self.trial || self.breaker.cooldown.is_some() {
+            self.trial = false;
+            self.faults = 0;
+            self.crashed = false;
+        } else if !self.crashed {
+            self.faults = 0;
+        }
+    }
+
+    fn record_fault(&mut self) {
+        if self.trial {
+            self.trial = false;
+            self.faults = self.breaker.threshold;
+        } else {
+            self.faults = self.faults.saturating_add(1);
+        }
+        self.process = None;
+        if self.faults >= self.breaker.threshold {
+            if self.breaker.cooldown.is_some() {
+                self.opened_at = Some(self.breaker.clock.now());
+                self.status = PluginStatus::CircuitOpen;
+            } else {
+                // R2/R9 callers rely on a permanent disable; finite cooldown is opt-in.
+                self.opened_at = None;
+                self.status = PluginStatus::Disabled;
+            }
+        }
     }
 
     fn restart(&mut self, timeout: Duration) -> Result<(), PluginError> {
@@ -130,10 +229,7 @@ impl LoadedPlugin {
         match self.restart(timeout) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.faults = self.faults.saturating_add(1);
-                if self.faults >= FAULT_THRESHOLD {
-                    self.disable();
-                }
+                self.record_fault();
                 Err(error)
             }
         }
@@ -145,6 +241,7 @@ impl LoadedPlugin {
         params: Json,
         timeout: Duration,
     ) -> Result<Json, PluginError> {
+        self.check_breaker()?;
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -167,10 +264,7 @@ impl LoadedPlugin {
         };
         match outcome {
             Ok(result) => {
-                // A success clears the fault counter only when no crash happened.
-                if !self.crashed {
-                    self.faults = 0;
-                }
+                self.record_success();
                 Ok(result)
             }
             Err(
@@ -178,15 +272,11 @@ impl LoadedPlugin {
                 | PluginError::ProtocolViolation(_)
                 | PluginError::Crashed(_)),
             ) => {
-                self.faults = self.faults.saturating_add(1);
                 if matches!(error, PluginError::Crashed(_)) {
                     self.crashed = true;
                 }
                 // A faulty process is killed; the next call starts a fresh one.
-                self.process = None;
-                if self.faults >= FAULT_THRESHOLD {
-                    self.disable();
-                }
+                self.record_fault();
                 Err(error)
             }
             Err(error) => Err(error),
@@ -197,6 +287,7 @@ impl LoadedPlugin {
 pub struct PluginHost {
     allowlist: HashSet<String>,
     timeout: Duration,
+    breaker: BreakerConfig,
     plugins: Mutex<HashMap<String, Arc<Mutex<LoadedPlugin>>>>,
 }
 
@@ -209,6 +300,11 @@ impl PluginHost {
         PluginHost {
             allowlist: allowlist.into_iter().map(Into::into).collect(),
             timeout: DEFAULT_PLUGIN_TIMEOUT,
+            breaker: BreakerConfig {
+                threshold: FAULT_THRESHOLD,
+                cooldown: None,
+                clock: Arc::new(SystemClock),
+            },
             plugins: Mutex::new(HashMap::new()),
         }
     }
@@ -223,10 +319,28 @@ impl PluginHost {
         self
     }
 
+    /// Consecutive process faults that open the circuit; configure before load.
+    pub fn with_failure_threshold(mut self, threshold: u32) -> Self {
+        self.breaker.threshold = threshold.max(1);
+        self
+    }
+
+    /// Cooldown in injected clock ticks; finite cooldown enables recovery.
+    pub fn with_cooldown(mut self, ticks: u64) -> Self {
+        self.breaker.cooldown = Some(ticks);
+        self
+    }
+
+    /// Logical clock for deterministic cooldown tests; configure before load.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.breaker.clock = clock;
+        self
+    }
+
     pub fn load(&self, dir: impl AsRef<Path>) -> Result<PluginInfo, PluginError> {
         guard(|| {
             let manifest = parse_manifest(dir.as_ref())?;
-            let mut loaded = LoadedPlugin::new(manifest.clone());
+            let mut loaded = LoadedPlugin::new(manifest.clone(), self.breaker.clone());
             loaded.restart(self.timeout)?;
             let info = loaded.info();
             let entry = Arc::new(Mutex::new(loaded));
@@ -264,6 +378,47 @@ impl PluginHost {
             infos.sort_by(|left, right| left.name.cmp(&right.name));
             Ok(infos)
         })
+    }
+
+    /// Introspection for the R10 breaker states and tests. Returns 0 if absent.
+    pub fn consecutive_failures(&self, plugin: &str) -> u32 {
+        lock(&self.plugins)
+            .get(plugin)
+            .map(|entry| lock(entry).faults)
+            .unwrap_or(0)
+    }
+
+    pub fn circuit_open(&self, plugin: &str) -> bool {
+        lock(&self.plugins)
+            .get(plugin)
+            .is_some_and(|entry| lock(entry).breaker_state() == BreakerState::Open)
+    }
+
+    pub fn breaker_state(&self, plugin: &str) -> Option<BreakerState> {
+        lock(&self.plugins)
+            .get(plugin)
+            .map(|entry| lock(entry).breaker_state())
+    }
+
+    pub fn retry_after(&self, plugin: &str) -> Option<u64> {
+        let entry = lock(&self.plugins).get(plugin).cloned()?;
+        let loaded = lock(&entry);
+        let opened_at = loaded.opened_at?;
+        let cooldown = loaded.breaker.cooldown?;
+        Some(
+            opened_at
+                .saturating_add(cooldown)
+                .saturating_sub(loaded.breaker.clock.now()),
+        )
+    }
+
+    /// Kills and reaps every loaded plugin process; later calls may load again.
+    pub fn shutdown(&self) {
+        let entries: Vec<_> = lock(&self.plugins).drain().collect();
+        for (_, entry) in &entries {
+            lock(entry).disable();
+        }
+        drop(entries);
     }
 
     fn entries(&self) -> Vec<(String, Arc<Mutex<LoadedPlugin>>)> {
@@ -439,6 +594,16 @@ fn parse_manifest(dir: &Path) -> Result<Manifest, PluginError> {
         capabilities,
         dir,
         entry,
+    })
+}
+
+/// Reads a declaration without spawning the plugin; used by the permission gate.
+pub(crate) fn declared_plugin(dir: &Path) -> Result<PluginDeclaration, PluginError> {
+    let manifest = parse_manifest(dir)?;
+    Ok(PluginDeclaration {
+        name: manifest.name,
+        dir: manifest.dir,
+        capabilities: manifest.capabilities,
     })
 }
 
