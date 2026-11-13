@@ -324,7 +324,20 @@ fn parse_node(
     }
     let when = match object.get("when") {
         None => None,
-        Some(Json::String(value)) => Some(value.clone()),
+        Some(Json::String(value)) => match types.get(value) {
+            Some(Value::Bool(_)) => Some(value.clone()),
+            Some(declared) => {
+                return Err(invalid(format!(
+                    "{at}.when {value:?} must name a bool state, found {}",
+                    declared.type_name()
+                )))
+            }
+            None => {
+                return Err(invalid(format!(
+                    "{at}.when {value:?} is not declared in state"
+                )))
+            }
+        },
         Some(_) => return Err(invalid(format!("{at}.when must be a string"))),
     };
     let events_json = field(object, "events", at)?

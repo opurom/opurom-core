@@ -61,14 +61,28 @@ pub struct Runtime {
     values: Vec<(String, Value)>,
     index: HashMap<String, usize>,
     actions: HashMap<u32, HashMap<String, Vec<Action>>>,
+    guards: HashMap<u32, Vec<String>>,
     resources: ResourceManager<String, Json>,
     version: u64,
 }
 
-fn collect_actions(node: &Node, out: &mut HashMap<u32, HashMap<String, Vec<Action>>>) {
-    out.insert(node.id, node.events.clone());
+fn collect_tree(
+    node: &Node,
+    inherited: &[String],
+    actions: &mut HashMap<u32, HashMap<String, Vec<Action>>>,
+    guards: &mut HashMap<u32, Vec<String>>,
+) {
+    actions.insert(node.id, node.events.clone());
+    let mut chain = inherited.to_vec();
+    if let Some(when) = &node.when {
+        chain.push(when.clone());
+    }
+    // An ancestor's condition also hides the whole subtree.
+    if !chain.is_empty() {
+        guards.insert(node.id, chain.clone());
+    }
     for child in &node.children {
-        collect_actions(child, out);
+        collect_tree(child, &chain, actions, guards);
     }
 }
 
@@ -205,7 +219,8 @@ impl Runtime {
     pub fn from_ir_json_with_budget(json: &str, budget: usize) -> Result<Runtime, CoreError> {
         let ir = Ir::parse(json)?;
         let mut actions = HashMap::new();
-        collect_actions(&ir.tree, &mut actions);
+        let mut guards = HashMap::new();
+        collect_tree(&ir.tree, &[], &mut actions, &mut guards);
         let values: Vec<(String, Value)> = ir
             .state
             .into_iter()
@@ -221,6 +236,7 @@ impl Runtime {
             values,
             index,
             actions,
+            guards,
             resources: ResourceManager::new(budget),
             version: 0,
         })
@@ -262,6 +278,16 @@ impl Runtime {
                 node_id,
                 event: event_name.to_owned(),
             })?;
+        // A hidden node is inert: a bound event must not mutate state behind
+        // a false condition.
+        if let Some(conditions) = self.guards.get(&node_id) {
+            if conditions
+                .iter()
+                .any(|name| self.state(name) != Some(&Value::Bool(true)))
+            {
+                return Ok(Vec::new());
+            }
+        }
         if actions.is_empty() {
             return Ok(Vec::new());
         }
