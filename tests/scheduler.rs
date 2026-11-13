@@ -1,4 +1,4 @@
-use opurom_core::{AsyncScheduler, TaskId};
+use opurom_core::{AsyncScheduler, SchedulingHook, SchedulingTask, TaskId};
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -251,4 +251,147 @@ fn drain_does_not_run_children_spawned_during_the_drain() {
     assert_eq!(sched.pending(), 1);
     assert_eq!(sched.drain(), vec![parent + 1]);
     assert_eq!(sched.pending(), 0);
+}
+
+// Scheduling-hook fixtures: every verdict is a pure function of the task
+// data, so the hook results stay deterministic.
+
+struct SeniorityHook;
+
+impl SchedulingHook for SeniorityHook {
+    fn prioritize(&self, task: &SchedulingTask) -> i64 {
+        i64::from(task.priority) + task.id as i64
+    }
+}
+
+struct NoBackgroundHook;
+
+impl SchedulingHook for NoBackgroundHook {
+    fn admit(&self, task: &SchedulingTask) -> bool {
+        task.priority > 0
+    }
+}
+
+struct PassthroughHook;
+
+impl SchedulingHook for PassthroughHook {}
+
+struct ObservationHook {
+    seen: Arc<Mutex<Vec<(TaskId, u8)>>>,
+}
+
+impl SchedulingHook for ObservationHook {
+    fn prioritize(&self, task: &SchedulingTask) -> i64 {
+        self.seen.lock().unwrap().push((task.id, task.priority));
+        i64::from(task.priority)
+    }
+}
+
+struct GateHook;
+
+impl SchedulingHook for GateHook {
+    fn prioritize(&self, task: &SchedulingTask) -> i64 {
+        i64::from(task.priority) - task.id as i64
+    }
+
+    fn admit(&self, task: &SchedulingTask) -> bool {
+        task.id != 4
+    }
+}
+
+#[test]
+fn hook_reorders_ready_tasks_deterministically() {
+    let mut sched = AsyncScheduler::new().with_hook(Arc::new(SeniorityHook));
+    let a = sched.spawn(5, || {});
+    let b = sched.spawn(5, || {});
+    let c = sched.spawn(5, || {});
+    // Without the hook the tie would keep spawn order; the hook flips it.
+    assert_eq!(sched.tick(0), vec![c, b, a]);
+    let low = sched.spawn(0, || {});
+    let high = sched.spawn(9, || {});
+    assert_eq!(sched.tick(0), vec![high, low]);
+    assert_eq!(sched.executed(), 5);
+}
+
+#[test]
+fn hook_can_reject_a_task_at_spawn() {
+    let mut sched = AsyncScheduler::new().with_hook(Arc::new(NoBackgroundHook));
+    let rejected = sched.spawn(0, || {});
+    let kept = sched.spawn(1, || {});
+    assert_eq!(sched.tick(0), vec![kept]);
+    assert_eq!(sched.pending(), 0);
+    assert!(!sched.cancel(rejected));
+    assert_eq!(sched.admitted(), 1);
+    assert_eq!(sched.rejected(), 1);
+    assert_eq!(sched.executed(), 1);
+}
+
+#[test]
+fn scheduler_without_hook_keeps_the_builtin_order() {
+    let mut sched = AsyncScheduler::new();
+    let background_a = sched.spawn(0, || {});
+    let high = sched.spawn(7, || {});
+    let background_b = sched.spawn(0, || {});
+    assert_eq!(sched.tick(0), vec![high, background_a, background_b]);
+    assert_eq!(sched.admitted(), 3);
+    assert_eq!(sched.rejected(), 0);
+    assert_eq!(sched.executed(), 3);
+}
+
+#[test]
+fn hook_with_default_methods_matches_the_builtin_order() {
+    let mut sched = AsyncScheduler::new().with_hook(Arc::new(PassthroughHook));
+    let background_a = sched.spawn(0, || {});
+    let high = sched.spawn(7, || {});
+    let background_b = sched.spawn(0, || {});
+    assert_eq!(sched.tick(0), vec![high, background_a, background_b]);
+    assert_eq!(sched.admitted(), 3);
+    assert_eq!(sched.rejected(), 0);
+    assert_eq!(sched.executed(), 3);
+}
+
+#[test]
+fn hook_observes_each_ready_task_once_per_batch() {
+    let seen: Arc<Mutex<Vec<(TaskId, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook: Arc<dyn SchedulingHook> = Arc::new(ObservationHook {
+        seen: Arc::clone(&seen),
+    });
+    let mut sched = AsyncScheduler::new().with_hook(hook);
+    let a = sched.spawn(2, || {});
+    let b = sched.spawn(9, || {});
+    assert_eq!(sched.tick(0), vec![b, a]);
+    assert_eq!(seen.lock().unwrap().clone(), vec![(a, 2), (b, 9)]);
+    assert!(sched.tick(0).is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn same_spawn_sequence_and_hook_produce_the_same_order_twice() {
+    fn scripted() -> (Vec<Vec<TaskId>>, (u64, u64, u64)) {
+        let mut sched = AsyncScheduler::new().with_hook(Arc::new(GateHook));
+        let _one = sched.spawn(3, || {});
+        let _two = sched.spawn(3, || {});
+        let _three = sched.spawn(2, || {});
+        let four = sched.spawn(1, || {});
+        let _five = sched.spawn(4, || {});
+        assert!(!sched.cancel(four)); // id 4 was rejected, so it is unknown
+        let first = sched.tick(0);
+        let _six = sched.spawn(3, || {});
+        let _seven = sched.spawn(3, || {});
+        let second = sched.drain();
+        let sleepy = sched.spawn(5, || {});
+        assert!(sched.sleep_until(sleepy, 10));
+        let third = sched.tick(10);
+        (
+            vec![first, second, third],
+            (sched.admitted(), sched.rejected(), sched.executed()),
+        )
+    }
+
+    let (ticks_a, counters_a) = scripted();
+    let (ticks_b, counters_b) = scripted();
+    assert_eq!(ticks_a, ticks_b);
+    assert_eq!(counters_a, counters_b);
+    assert_eq!(ticks_a, vec![vec![1, 2, 3, 5], vec![6, 7], vec![8]]);
+    assert_eq!(counters_a, (7, 1, 7));
 }

@@ -15,7 +15,7 @@ pub mod resource;
 pub mod scheduler;
 pub mod state;
 
-pub use async_sched::{AsyncScheduler, TaskContext, TaskId};
+pub use async_sched::{AsyncScheduler, SchedulingHook, SchedulingTask, TaskContext, TaskId};
 pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use host::{AdapterFault, Host};

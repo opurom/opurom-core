@@ -9,11 +9,46 @@
 //! This is a schedulable **coroutine queue**, NOT OS async I/O: no reactor,
 //! no epoll/kqueue, no sockets, no OS timers, and no claim about network
 //! concurrency. Real async I/O is not implemented here.
+//!
+//! A registered [`SchedulingHook`] is the scheduler's extension point: it may
+//! reorder ready tasks and veto admission. Without a hook, or with a hook
+//! that keeps the default methods, the queue keeps its built-in order.
 
 use std::cmp::Reverse;
+use std::sync::Arc;
 
 /// Spawn-order identity of a task; the first spawned task gets id 1.
 pub type TaskId = u64;
+
+/// The task data a [`SchedulingHook`] sees: plain values with no borrow ties
+/// to the scheduler.
+#[derive(Clone, Copy, Debug)]
+pub struct SchedulingTask {
+    /// Spawn-order id assigned by the scheduler.
+    pub id: TaskId,
+    /// Priority passed to [`AsyncScheduler::spawn`].
+    pub priority: u8,
+}
+
+/// Scheduling extension point for [`AsyncScheduler`].
+///
+/// Both methods are pure functions of the task data, so the same spawn
+/// sequence produces the same order no matter how often the scheduler runs.
+/// The defaults leave the built-in behavior untouched, so a hook implements
+/// only the influence it needs.
+pub trait SchedulingHook: Send + Sync {
+    /// Effective priority of one ready task: higher values run first and ties
+    /// keep spawn order. The default returns the spawned priority unchanged.
+    fn prioritize(&self, task: &SchedulingTask) -> i64 {
+        i64::from(task.priority)
+    }
+
+    /// Whether a task may be queued at all; `false` drops the task at spawn
+    /// time and counts one rejection. The default admits every task.
+    fn admit(&self, _task: &SchedulingTask) -> bool {
+        true
+    }
+}
 
 type Task = Box<dyn for<'a> FnOnce(TaskContext<'a>) + 'static>;
 
@@ -35,6 +70,10 @@ pub struct AsyncScheduler {
     entries: Vec<Entry>,
     next_id: TaskId,
     now: u64,
+    hook: Option<Arc<dyn SchedulingHook>>,
+    admitted: u64,
+    rejected: u64,
+    executed: u64,
 }
 
 /// Scheduler handle passed to tasks started with `spawn_with_context`.
@@ -57,7 +96,19 @@ impl AsyncScheduler {
             entries: Vec::new(),
             next_id: 1,
             now: 0,
+            hook: None,
+            admitted: 0,
+            rejected: 0,
+            executed: 0,
         }
+    }
+
+    /// Registers the scheduling extension. `admit` is consulted once per
+    /// spawn and `prioritize` once per ready batch; register before the first
+    /// spawn so admission covers every task.
+    pub fn with_hook(mut self, hook: Arc<dyn SchedulingHook>) -> Self {
+        self.hook = Some(hook);
+        self
     }
 
     /// Queues a plain one-shot task to run at the next `tick`/`drain`. Higher
@@ -132,12 +183,37 @@ impl AsyncScheduler {
         self.now
     }
 
+    /// Spawn attempts the scheduler accepted: total spawns minus rejections,
+    /// and exactly total spawns when no hook is registered.
+    pub fn admitted(&self) -> u64 {
+        self.admitted
+    }
+
+    /// Spawn attempts the registered hook rejected; always 0 without a hook.
+    pub fn rejected(&self) -> u64 {
+        self.rejected
+    }
+
+    /// Tasks started by `tick` and `drain` so far.
+    pub fn executed(&self) -> u64 {
+        self.executed
+    }
+
     fn spawn_entry<F>(&mut self, priority: u8, task: F) -> TaskId
     where
         F: for<'a> FnOnce(TaskContext<'a>) + 'static,
     {
         let id = self.next_id;
         self.next_id += 1;
+        let candidate = SchedulingTask { id, priority };
+        if let Some(hook) = &self.hook {
+            if !hook.admit(&candidate) {
+                self.rejected += 1;
+                // The id is still consumed so ids stay unique in spawn order.
+                return id;
+            }
+        }
+        self.admitted += 1;
         self.entries.push(Entry {
             id,
             priority,
@@ -158,17 +234,21 @@ impl AsyncScheduler {
     }
 
     fn run_ready(&mut self) -> Vec<TaskId> {
-        let mut batch: Vec<usize> = (0..self.entries.len())
+        // The hook verdict is fetched once per task before sorting, so the
+        // comparator never calls back into user code.
+        let mut batch: Vec<(usize, i64)> = (0..self.entries.len())
             .filter(|&i| self.entries[i].wake.is_none())
+            .map(|i| (i, self.effective_priority(i)))
             .collect();
-        // (priority desc, spawn order asc) is a total order, so the result
-        // never depends on the Vec's internal layout.
-        batch.sort_by_key(|&i| (Reverse(self.entries[i].priority), self.entries[i].id));
+        // (effective priority desc, spawn order asc) is a total order, so the
+        // result never depends on the Vec's internal layout.
+        batch.sort_by_key(|&(i, key)| (Reverse(key), self.entries[i].id));
         let mut ids = Vec::with_capacity(batch.len());
-        for i in batch {
+        for (i, _) in batch {
             let id = self.entries[i].id;
             let task = self.entries[i].task.take();
             ids.push(id);
+            self.executed += 1;
             if let Some(task) = task {
                 task(TaskContext {
                     scheduler: self,
@@ -178,6 +258,19 @@ impl AsyncScheduler {
         }
         self.entries.retain(|entry| entry.task.is_some());
         ids
+    }
+
+    /// Ordering key for one entry: the hook's verdict when one is registered,
+    /// otherwise the spawned priority. Both rank equal priorities the same
+    /// way, so a hook that keeps its default leaves the order unchanged.
+    fn effective_priority(&self, index: usize) -> i64 {
+        match &self.hook {
+            Some(hook) => hook.prioritize(&SchedulingTask {
+                id: self.entries[index].id,
+                priority: self.entries[index].priority,
+            }),
+            None => i64::from(self.entries[index].priority),
+        }
     }
 }
 
