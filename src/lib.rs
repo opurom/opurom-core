@@ -1,5 +1,5 @@
-//! Opurom kernel: IR 0.1.0 / capability extensions, a bounded priority scheduler, an
-//! capability deterministic cooperative scheduler, the capability multi-threaded
+//! Opurom kernel: IR 0.1.0 and its interactive UI extensions, a bounded priority
+//! scheduler, a deterministic cooperative scheduler, a multi-threaded
 //! work-stealing scheduler, a fault-isolating plugin bus, a process-isolated
 //! plugin host, and a bounded resource cache.
 
