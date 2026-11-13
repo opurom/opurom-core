@@ -50,12 +50,11 @@ fn run_cli(ir_path: &str, commands: &str) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(commands.as_bytes())
-        .unwrap();
+    // A malformed IR can make the child exit before reading stdin; that exit is
+    // the assertion's subject, so a broken pipe must not turn into a test panic.
+    if let Err(err) = child.stdin.as_mut().unwrap().write_all(commands.as_bytes()) {
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+    }
     let output = child.wait_with_output().unwrap();
     (
         output.status.code().unwrap_or(-1),
