@@ -5,7 +5,8 @@ independent local git repo; it does not import or link any other OPUROM project.
 the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the interactive UI additions from
 [IR_ADDITIONS.md](../opurom-spec/IR_ADDITIONS.md), the process-isolated plugin host
 from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the deterministic
-cooperative scheduler from [COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md) section 4,
+cooperative scheduler from [COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md) section 4
+extended by the `SchedulingHook` scheduling-extension trait,
 the multi-threaded work-stealing scheduler from
 [PRODUCTION_BREADTH.md](../opurom-spec/PRODUCTION_BREADTH.md) section 5,
 and the explicit native-capability permission gate from
@@ -26,11 +27,13 @@ cargo run --offline --example parallel_speedup
 `cargo test --offline -- --nocapture` also prints the work-stealing scheduler test's measured
 `Instant` timings.
 Integration tests cover IR validation, interactive UI actions, conditional event dispatch, the
-deterministic cooperative scheduler, the work-stealing scheduler and native capability permissions.
-The Rust suite contains 101 integration tests and no unit or doc tests. Dependencies are
-`serde_json` and `serde_core`; the work-stealing scheduler and the capability gate use pure `std`
-and add no crate. The capability tests drive a real shell plugin process through JSON lines,
-including crashes, malformed frames, cooldown recovery and PID reaping.
+deterministic cooperative scheduler and its scheduling hook, the work-stealing scheduler and
+native capability permissions.
+The Rust suite contains 110 integration tests and no unit or doc tests. Dependencies are
+`serde_json` and `serde_core`; the work-stealing scheduler, the capability gate and the
+scheduling hook use pure `std` and add no crate. The capability tests drive a real shell plugin
+process through JSON lines, including crashes, malformed frames, cooldown recovery and PID
+reaping.
 
 ## API
 
@@ -61,7 +64,7 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | `Patch`, `Value` | `Patch { name, value }`; `Value::Int(i64) \| Bool(bool) \| Str(String)`. Both serialize with `serde_json::to_string` as `{"name":"count","value":1}`. |
 | `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | Legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
 | `Scheduler::with_workers(n)` -> `WorkStealingScheduler` | Builder for N OS worker threads and a bounded total task queue. `spawn(task)` returns a `WorkStealingTaskHandle<T>` with `join() -> Result<T, SchedulerError>`; `spawn_on(worker, task)` pins a task to one worker's deque and gives its closure the executing worker id. Builder methods: `with_queue_capacity`, `with_failure_threshold`, `with_cooldown`, `with_clock`. One worker is deterministic FIFO; more workers use round-robin injection, per-worker deques and stealing. `shutdown()` drains work and joins every thread; `Drop` does the same. |
-| `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()` | Deterministic cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. See [the scheduler section](#deterministic-async-scheduler); it is **not** async I/O. |
+| `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()`, `with_hook(hook)`, `admitted()`, `rejected()`, `executed()` | Deterministic cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. `with_hook` registers a `SchedulingHook` reordering/admission extension and the three counters observe it; see [the scheduling extension section](#scheduling-extension-hook). It is **not** async I/O. |
 | `PluginBus::new(failure_threshold)` (default 3), `register`, `call`, `is_disabled` | Handler signature `Fn(&str) -> Result<String, String> + Send + Sync`. Every call runs inside `catch_unwind(AssertUnwindSafe(..))`. Handler `Err` and panics increment a consecutive-failure counter; a success resets it; at the threshold the plugin is disabled and later calls return the distinct `PluginError::Disabled`. Other plugins and the runtime keep working. |
 | `Host::new()` / `with_threshold(n)`, `run(primary, fallback)`, `record_error`, `record_success`, `degraded()` | Standalone degradation policy, no adapter crate dependency. Three consecutive primary `Err`s flip `degraded()` to true and `active_adapter()` to `"headless"`; once degraded, `run` calls only the fallback. A success resets the consecutive count. |
 | `NATIVE_CAPABILITIES`, `CapabilityHost::new(grants)` | Explicit grants for exactly `camera.takePhoto`, `geolocation.getCurrentPosition`, `bluetooth.scan`, `notification.show`, `payment.request` and `share.send`. `register(dir)` validates the manifest without spawning; `invoke(capability, params)` checks catalog, grant and declaration before lazy-loading the plugin. Denial returns `PluginError::NotAllowed`; an undeclared capability returns `PluginError::UnknownCapability`; neither starts a process. |
@@ -161,6 +164,44 @@ Rules, all deterministic:
   sequence: sorting is a total order of `(priority, spawn order)`, and no
   `HashMap`, clock, thread or random source influences it. A panicking task
   unwinds into the caller of `tick`/`drain`.
+
+### Scheduling extension hook
+
+`SchedulingHook` is the scheduler's extension point for registered hooks: a hook may reorder
+ready tasks and veto their admission, and both methods are pure functions of the task data, so
+the same spawn sequence always produces the same order. `SchedulingTask` carries the task's `id`
+and `priority`.
+
+| Method | Contract |
+| --- | --- |
+| `prioritize(&SchedulingTask) -> i64` | Effective priority of one ready task; higher values run first and ties keep spawn order. Consulted once per ready task per batch, before sorting. The default returns the spawned priority unchanged. |
+| `admit(&SchedulingTask) -> bool` | Whether the task may be queued; `false` drops it at spawn time and counts one rejection. The returned id is consumed, but the task never enters the queue, `pending()` excludes it and `cancel(id)` reports it unknown. Consulted once per spawn, including children and continuations. The default admits every task. |
+
+`with_hook(Arc<dyn SchedulingHook>)` registers the hook; without a hook, or with a hook that
+keeps both default methods, the order is exactly the built-in higher-priority-first,
+spawn-order-tie break. `admitted()`, `rejected()` and `executed()` report the deterministic
+counters: every spawn lands in exactly one of admitted or rejected, and `executed()` counts the
+tasks `tick`/`drain` started.
+
+```rust
+use opurom_core::{AsyncScheduler, SchedulingHook, SchedulingTask};
+use std::sync::Arc;
+
+struct LatestFirst;
+
+impl SchedulingHook for LatestFirst {
+    fn prioritize(&self, task: &SchedulingTask) -> i64 {
+        i64::from(task.priority) + task.id as i64
+    }
+}
+
+let mut sched = AsyncScheduler::new().with_hook(Arc::new(LatestFirst));
+let first = sched.spawn(2, || {});
+let second = sched.spawn(2, || {});
+assert_eq!(sched.tick(0), vec![second, first]);
+assert_eq!(sched.admitted(), 2);
+assert_eq!(sched.executed(), 2);
+```
 
 ## Parallel work-stealing scheduler
 
@@ -372,7 +413,7 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Interactive UI IR extensions | Multi-action events with ordered, atomic patches; `valueFrom` reads at execution time with same-type and `int` validation; `when` conditions gate event dispatch on hidden nodes and their subtrees; empty action lists. Prop values, theme tokens and node kinds are preserved for the renderer and compiler |
 | Reactive state | `int`/`bool`/`string`, `set`/`add`/`toggle`, patches, version counter, overflow and error atomicity |
 | Priority pool and work-stealing scheduler | Bounded priority pool unchanged (3 tests); N-thread work stealing with a bounded queue, FIFO one-worker mode, `catch_unwind` typed panic errors, circuit breaker with injected-clock cooldown, panic isolation, graceful drain/join and measured 1-worker vs N-worker `Instant` timings (10 tests) |
-| Async scheduler | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism; 17 tests. No wall clock, threads or randomness |
+| Async scheduler | Deterministic cooperative tick queue: priority with spawn-order tie-break, logical-time sleep/wake boundaries, cancel, drain, `TaskContext` children/continuations, determinism, `SchedulingHook` reordering and admission with admitted/rejected/executed counters; 23 tests. No wall clock, threads or randomness |
 | Plugin bus (in-process) | `catch_unwind` isolation, consecutive-failure circuit breaker, `PluginError::Disabled`, default threshold 3; 2 tests |
 | Plugin host (process) | Manifest validation with traversal guard, spawn, `hello` handshake, capability-subset check, app allowlist, 500 ms timeout, protocol validation, legacy 3-strike `Disabled` breaker, configurable breaker with cooldown/half-open recovery, typed `CircuitOpen` errors, crash/malformed-frame isolation, `list()` and `shutdown()`; 18 existing tests plus 7 native-capability process tests. No OS-level sandboxing (no seatbelt/landlock/seccomp, no filesystem or network namespace restriction, no resource limits for the child), no plugin signing or signature verification, no trust chain and no version pinning. The local `opurom-plugins/registry.json` index and `opurom plugin verify` live in `opurom-plugins` |
 | Native capability permissions | Exact six-capability catalog, explicit grants, lazy manifest registration, typed `NotAllowed`/`UnknownCapability` denial before spawn, deterministic mock replies, permission matrix and no-child-process checks in `tests/capabilities.rs` |
@@ -381,7 +422,7 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests. The real `PlatformAdapter` trait, the actual adapter swap and frame presentation live in `opurom-platform`; this `Host` is a small standalone policy with no cross-repo dependency |
 | CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings. `opurom build/dev/test`, hot reload and watch mode live in `opurom-cli` |
 | Renderer / pipeline | Nothing: RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
-| Quality evidence | 101 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Quality evidence | 110 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 Process isolation of plugins is real and verified. The permission gate and the deterministic mock
 devices are application-level, and the cooperative scheduler is a deterministic queue only: it
