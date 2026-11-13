@@ -21,8 +21,8 @@ pub use error::{CoreError, PluginError, SchedulerError};
 pub use host::{AdapterFault, Host};
 pub use ir::{Action, Ir, Node, Op, StateDecl, IR_VERSION};
 pub use parallel_sched::{
-    cpu_bound_workload, measure_speedup, Clock, CounterClock, SpeedupMeasurement, SystemClock,
-    WorkStealingScheduler, WorkStealingTaskHandle,
+    cpu_bound_workload, measure_speedup, Clock, CounterClock, SchedulerMetrics, SpeedupMeasurement,
+    SystemClock, WorkStealingScheduler, WorkStealingTaskHandle,
 };
 pub use plugin::{PluginBus, PluginMetrics};
 pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAULT_PLUGIN_TIMEOUT};

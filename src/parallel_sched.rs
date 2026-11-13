@@ -87,6 +87,9 @@ struct State {
     cooldown: u64,
     failures: u32,
     opened_at: Option<u64>,
+    spawned: usize,
+    completed: usize,
+    panicked: usize,
 }
 
 struct Shared {
@@ -95,6 +98,21 @@ struct Shared {
     clock: Mutex<Arc<dyn Clock>>,
     workers: usize,
     steals: AtomicUsize,
+}
+
+/// One read of the scheduler's introspection counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerMetrics {
+    /// Accepted spawns; rejected spawns never count.
+    pub spawned: usize,
+    /// Tasks whose closure ran to completion or unwound, counted once each.
+    pub completed: usize,
+    /// Completed tasks that unwound with a panic.
+    pub panicked: usize,
+    /// Accepted tasks still sitting in a worker deque.
+    pub pending: usize,
+    /// Jobs a worker took from another worker's deque.
+    pub steals: usize,
 }
 
 /// A bounded, multi-threaded work-stealing scheduler.
@@ -152,6 +170,9 @@ impl WorkStealingScheduler {
                 cooldown: DEFAULT_COOLDOWN,
                 failures: 0,
                 opened_at: None,
+                spawned: 0,
+                completed: 0,
+                panicked: 0,
             }),
             ready: Condvar::new(),
             clock: Mutex::new(clock),
@@ -215,6 +236,18 @@ impl WorkStealingScheduler {
 
     pub fn steals(&self) -> usize {
         self.shared.steals.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Every introspection counter in one snapshot, read under the state lock.
+    pub fn metrics(&self) -> SchedulerMetrics {
+        let state = lock(&self.shared.state);
+        SchedulerMetrics {
+            spawned: state.spawned,
+            completed: state.completed,
+            panicked: state.panicked,
+            pending: state.pending,
+            steals: self.shared.steals.load(AtomicOrdering::SeqCst),
+        }
     }
 
     /// Queues a task round robin and returns its result handle.
@@ -303,6 +336,7 @@ impl WorkStealingScheduler {
         };
         state.queues[worker].push_back(job);
         state.pending += 1;
+        state.spawned += 1;
         drop(state);
         self.shared.ready.notify_all();
         Ok(WorkStealingTaskHandle { receiver })
@@ -318,10 +352,12 @@ impl Drop for WorkStealingScheduler {
 impl Shared {
     fn record(&self, succeeded: bool) {
         let mut state = lock(&self.state);
+        state.completed += 1;
         if succeeded {
             state.failures = 0;
             return;
         }
+        state.panicked += 1;
         if state.opened_at.is_some() {
             return;
         }
