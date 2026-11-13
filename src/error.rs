@@ -60,6 +60,7 @@ pub enum PluginError {
     NotAllowed(String),
     UnknownCapability(String),
     AmbiguousCapability(String),
+    CircuitOpen { retry_after: u64 },
 }
 
 impl fmt::Display for PluginError {
@@ -80,6 +81,10 @@ impl fmt::Display for PluginError {
             Self::AmbiguousCapability(name) => {
                 write!(f, "more than one active plugin declares {name}")
             }
+            Self::CircuitOpen { retry_after } => write!(
+                f,
+                "plugin circuit is open; retry after {retry_after} clock ticks"
+            ),
         }
     }
 }
