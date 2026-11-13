@@ -2,16 +2,16 @@
 
 **Kernel slice** of the OPUROM kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other OPUROM project. It implements
-the state/event part of [IR v0.1](../opurom-spec/IR_SCHEMA.md) plus the interactive UI additions from
-[IR_ADDITIONS.md](../opurom-spec/IR_ADDITIONS.md), the process-isolated plugin host
-from [PLUGIN_PROTOCOL.md](../opurom-spec/PLUGIN_PROTOCOL.md), the deterministic
-cooperative scheduler from [COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md) section 4
+the state/event part of [IR v0.1](https://github.com/opurom/opurom-spec/blob/main/IR_SCHEMA.md) plus the interactive UI additions from
+[IR_ADDITIONS.md](https://github.com/opurom/opurom-spec/blob/main/IR_ADDITIONS.md), the process-isolated plugin host
+from [PLUGIN_PROTOCOL.md](https://github.com/opurom/opurom-spec/blob/main/PLUGIN_PROTOCOL.md), the deterministic
+cooperative scheduler from [COMPONENTS_AND_A11Y.md](https://github.com/opurom/opurom-spec/blob/main/COMPONENTS_AND_A11Y.md) section 4
 extended by the `SchedulingHook` scheduling-extension trait and a kernel
 `RenderingHook` rendering-extension seam,
 the multi-threaded work-stealing scheduler from
-[PRODUCTION_BREADTH.md](../opurom-spec/PRODUCTION_BREADTH.md) section 5,
+[PRODUCTION_BREADTH.md](https://github.com/opurom/opurom-spec/blob/main/PRODUCTION_BREADTH.md) section 5,
 and the explicit native-capability permission gate from
-[COMPONENT_LIBRARY_HARDENING.md](../opurom-spec/COMPONENT_LIBRARY_HARDENING.md) section 4.
+[COMPONENT_LIBRARY_HARDENING.md](https://github.com/opurom/opurom-spec/blob/main/COMPONENT_LIBRARY_HARDENING.md) section 4.
 It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
 GUI or build pipeline live here.
 
@@ -164,7 +164,7 @@ driven by a logical tick counter: a schedulable coroutine queue. It is **NOT
 OS async I/O**, **NOT reactor/epoll**, and **NOT a claim about network
 concurrency**: there is no reactor, no epoll/kqueue, no thread pool, no
 sockets, no randomness and no wall clock. It implements
-[section 4 of COMPONENTS_AND_A11Y.md](../opurom-spec/COMPONENTS_AND_A11Y.md).
+[section 4 of COMPONENTS_AND_A11Y.md](https://github.com/opurom/opurom-spec/blob/main/COMPONENTS_AND_A11Y.md).
 
 ```rust
 use opurom_core::{AsyncScheduler, TaskId};
