@@ -744,4 +744,10 @@ fn closed_theme_and_state_value_sets_are_enforced() {
                             "theme": {"mode": "dark", "accent": "#097FEB", "radius": 12}})
     .to_string();
     assert!(Runtime::from_ir_json(&good_theme).is_ok());
+    // `radius` is a logical-pixel number, not an integer: the responsive DOM
+    // consumer accepts fractional values, so the kernel must not reject them.
+    let fractional = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                            "theme": {"radius": 8.5}})
+    .to_string();
+    assert!(Runtime::from_ir_json(&fractional).is_ok());
 }

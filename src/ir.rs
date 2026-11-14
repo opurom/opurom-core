@@ -479,9 +479,9 @@ impl Ir {
                     }
                 }
                 if let Some(radius) = json.get("radius") {
-                    if radius.as_i64().is_none_or(|n| n < 0) {
+                    if radius.as_f64().is_none_or(|n| !n.is_finite() || n < 0.0) {
                         return Err(invalid(
-                            "root.theme.radius must be a non-negative integer".to_string(),
+                            "root.theme.radius must be a non-negative number".to_string(),
                         ));
                     }
                 }
