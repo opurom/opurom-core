@@ -12,6 +12,7 @@ pub enum Op {
     Sub,
     Toggle,
     Push,
+    Validate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +182,19 @@ fn parse_action(
         }
         return Ok(Action {
             op: Op::Push,
+            target,
+            value: None,
+            value_from: None,
+        });
+    }
+    // Form validation is a built-in signal: the target names the form scope
+    // and the action carries no value, mirroring the compiled targets.
+    if op == "validate" {
+        if object.contains_key("value") || object.contains_key("valueFrom") {
+            return Err(invalid(format!("{at}: validate must not have a value")));
+        }
+        return Ok(Action {
+            op: Op::Validate,
             target,
             value: None,
             value_from: None,

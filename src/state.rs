@@ -136,6 +136,14 @@ fn apply_action(
             value: Value::Str(action.target.clone()),
         });
     }
+    // A form validation is likewise a reserved signal: the target names the
+    // form scope, and the consumer decides what to validate.
+    if action.op == Op::Validate {
+        return Ok(Patch {
+            name: "@validate".to_string(),
+            value: Value::Str(action.target.clone()),
+        });
+    }
     let position = *index
         .get(&action.target)
         .ok_or_else(|| CoreError::UnknownState(action.target.clone()))?;
@@ -226,8 +234,8 @@ fn apply_action(
                 }
             }
         }
-        // Navigation returns before the state lookup above.
-        Op::Push => unreachable!("push is handled before state lookup"),
+        // Signals return before the state lookup above.
+        Op::Push | Op::Validate => unreachable!("signals are handled before state lookup"),
     };
     if !same_type(&current, &next) {
         return Err(CoreError::TypeMismatch {
