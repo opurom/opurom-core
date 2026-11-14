@@ -85,6 +85,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
         match line {
             "quit" => break,
             "state" => print_state(&runtime),
+            "resource" => print_resource(&runtime),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
                     Ok(patches) => match serde_json::to_string(&patches) {
@@ -103,6 +104,19 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
 fn print_state(runtime: &Runtime) {
     match serde_json::to_string(&runtime.snapshot()) {
         Ok(json) => println!("state {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
+fn print_resource(runtime: &Runtime) {
+    let cache = runtime.resource_cache();
+    let payload = serde_json::json!({
+        "budget": cache.budget(),
+        "usedBytes": cache.used_bytes(),
+        "entries": cache.len(),
+    });
+    match serde_json::to_string(&payload) {
+        Ok(json) => println!("resource {json} version {}", runtime.version()),
         Err(error) => println!("error: {error}"),
     }
 }
@@ -134,7 +148,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, input, state or quit"
+            "unknown command {command:?}; expected tap, input, state, resource or quit"
         )),
     }
 }
