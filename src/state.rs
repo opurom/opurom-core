@@ -54,6 +54,9 @@ impl Serialize for Patch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Tap { node_id: u32 },
+    DoubleTap { node_id: u32 },
+    LongPress { node_id: u32 },
+    Drag { node_id: u32 },
     Input { node_id: u32, text: String },
 }
 
@@ -304,6 +307,9 @@ impl Runtime {
     pub fn dispatch(&mut self, event: Event) -> Result<Vec<Patch>, CoreError> {
         let (node_id, event_name, text) = match event {
             Event::Tap { node_id } => (node_id, "tap", None),
+            Event::DoubleTap { node_id } => (node_id, "doubleTap", None),
+            Event::LongPress { node_id } => (node_id, "longPress", None),
+            Event::Drag { node_id } => (node_id, "drag", None),
             Event::Input { node_id, text } => (node_id, "input", Some(text)),
         };
         let actions = self

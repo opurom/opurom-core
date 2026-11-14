@@ -140,6 +140,16 @@ fn parse_command(line: &str) -> Result<Event, String> {
                 .map_err(|error| format!("tap expects `tap <id>`: {error}"))?;
             Ok(Event::Tap { node_id })
         }
+        "doubleTap" | "longPress" | "drag" => {
+            let node_id = rest
+                .parse::<u32>()
+                .map_err(|error| format!("{command} expects `{command} <id>`: {error}"))?;
+            Ok(match command {
+                "doubleTap" => Event::DoubleTap { node_id },
+                "longPress" => Event::LongPress { node_id },
+                _ => Event::Drag { node_id },
+            })
+        }
         "input" => {
             let mut parts = rest.splitn(2, ' ');
             let node_id = parts
@@ -156,7 +166,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, input, state, layers, resource or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, resource or quit"
         )),
     }
 }

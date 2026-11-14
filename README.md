@@ -433,7 +433,7 @@ patches [{"name":"count","value":1}] version 1
 state [{"name":"count","value":1}] version 1
 ```
 
-Commands: `tap <id>`, `input <id> <text>` (text may contain spaces), `state`, `quit`.
+Commands: `tap <id>`, `doubleTap <id>`, `longPress <id>`, `drag <id>`, `input <id> <text>` (text may contain spaces), `state`, `layers`, `resource`, `quit`.
 Bad commands and dispatch errors print `error: <diagnostic>` and the loop continues. Exit codes:
 0 on `quit`/EOF, 1 for unreadable or invalid IR, 2 when the file argument is missing. Note that
 input lines are whitespace-trimmed, so leading/trailing spaces in input text are not preserved.
