@@ -268,6 +268,17 @@ impl Runtime {
         }
     }
 
+    /// The live display list as deterministic layer records for inspection: one
+    /// `{id, kind, effects}` entry per node, in tree order. Effects are derived
+    /// from the node props (shadow, glass, gradient, opacity and declared
+    /// effects), matching the CLI inspect layer view.
+    pub fn layer_records(&self) -> Json {
+        let list = self.display_list();
+        let mut records = Vec::new();
+        collect_layers(&list, &mut records);
+        Json::Array(records)
+    }
+
     pub fn app(&self) -> &str {
         &self.app
     }
@@ -367,5 +378,88 @@ impl Runtime {
 
     pub fn resource_cache(&self) -> &ResourceManager<String, Json> {
         &self.resources
+    }
+}
+
+/// Effect layers declared by a node, in a stable order: the built-in visual
+/// effects derived from props, then any custom declared effect kinds. Numeric
+/// props are read as floats so integer and fractional encodings match the CLI
+/// inspect layer view exactly.
+fn effect_layers(node: &Node) -> Json {
+    let mut kinds: Vec<String> = Vec::new();
+    if let Some(shadow) = node.props.get("shadow").and_then(Json::as_f64) {
+        if shadow > 0.0 {
+            kinds.push("shadow".to_owned());
+        }
+    }
+    if node.props.get("glass").and_then(Json::as_bool) == Some(true) {
+        kinds.push("glass".to_owned());
+    }
+    if let Some(gradient) = node.props.get("gradient").and_then(Json::as_str) {
+        if gradient.contains(',') {
+            kinds.push("gradient".to_owned());
+        }
+    }
+    if let Some(opacity) = node.props.get("opacity").and_then(Json::as_f64) {
+        if opacity < 1.0 {
+            kinds.push("opacity".to_owned());
+        }
+    }
+    if let Some(effects) = node.props.get("effects").and_then(Json::as_array) {
+        for effect in effects {
+            if let Some(kind) = effect.get("kind").and_then(Json::as_str) {
+                if !kinds.iter().any(|existing| existing == kind) {
+                    kinds.push(kind.to_owned());
+                }
+            }
+        }
+    }
+    Json::Array(kinds.into_iter().map(Json::String).collect())
+}
+
+fn collect_layers(node: &Node, out: &mut Vec<Json>) {
+    out.push(serde_json::json!({
+        "id": node.id,
+        "kind": node.kind,
+        "effects": effect_layers(node),
+    }));
+    for child in &node.children {
+        collect_layers(child, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_records_derives_effect_layers_from_props() {
+        let ir = r##"{
+            "ir": "0.1", "app": "T",
+            "state": [{"name": "n", "type": "int", "init": 0}],
+            "theme": {"mode": "system", "accent": "#097FEB", "radius": 12},
+            "tree": {
+                "id": 0, "kind": "Column", "props": {}, "children": [
+                    {"id": 1, "kind": "Container", "props": {"shadow": 3, "glass": true, "gradient": "#AA,#BB", "opacity": 0.0}, "children": [], "events": {}},
+                    {"id": 2, "kind": "Text", "props": {"value": "x"}, "children": [], "events": {}}
+                ], "events": {}
+            }
+        }"##;
+        let runtime = Runtime::from_ir_json(ir).expect("IR parses");
+        let records = runtime
+            .layer_records()
+            .as_array()
+            .expect("layer records are an array")
+            .clone();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["kind"].as_str(), Some("Column"));
+        assert_eq!(records[0]["effects"], Json::Array(vec![]));
+        assert_eq!(records[1]["id"], 1);
+        assert_eq!(
+            records[1]["effects"],
+            serde_json::json!(["shadow", "glass", "gradient", "opacity"])
+        );
+        assert_eq!(records[2]["kind"].as_str(), Some("Text"));
+        assert_eq!(records[2]["effects"], Json::Array(vec![]));
     }
 }

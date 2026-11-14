@@ -85,6 +85,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
         match line {
             "quit" => break,
             "state" => print_state(&runtime),
+            "layers" => print_layers(&runtime),
             "resource" => print_resource(&runtime),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
@@ -121,6 +122,13 @@ fn print_resource(runtime: &Runtime) {
     }
 }
 
+fn print_layers(runtime: &Runtime) {
+    match serde_json::to_string(&runtime.layer_records()) {
+        Ok(json) => println!("layers {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
 fn parse_command(line: &str) -> Result<Event, String> {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
@@ -148,7 +156,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, input, state, resource or quit"
+            "unknown command {command:?}; expected tap, input, state, layers, resource or quit"
         )),
     }
 }
