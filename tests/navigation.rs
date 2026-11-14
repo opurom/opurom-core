@@ -193,7 +193,10 @@ fn the_cli_exposes_declared_pages_over_the_line_protocol() {
         json!(["Home", "Settings"]),
         json!({"op": "push", "target": "Settings"}),
     );
-    let path = std::env::temp_dir().join("opurom-core-nav-cli.opuir.json");
+    let path = std::env::temp_dir().join(format!(
+        "opurom-core-nav-cli-{}.opuir.json",
+        std::process::id()
+    ));
     std::fs::write(&path, &ir).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_opurom-core"))
         .arg(&path)
