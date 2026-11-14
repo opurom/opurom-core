@@ -132,6 +132,22 @@ fn routes_with_a_top_level_tree_is_rejected() {
 }
 
 #[test]
+fn routes_with_a_legacy_pages_array_is_rejected() {
+    let ir = json!({
+        "ir": "0.1.0",
+        "app": "T",
+        "state": [],
+        "initialRoute": "Home",
+        "pages": ["Home"],
+        "routes": {"Home": {"tree": node(0, "Column", json!({}))}},
+        "theme": {}
+    })
+    .to_string();
+    let err = Ir::parse(&ir).unwrap_err();
+    assert!(err.to_string().contains("supersedes"), "{err}");
+}
+
+#[test]
 fn node_ids_are_unique_across_routes() {
     let ir = json!({
         "ir": "0.1.0",

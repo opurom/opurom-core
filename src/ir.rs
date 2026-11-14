@@ -505,6 +505,11 @@ impl Ir {
                     "root.tree is illegal alongside root.routes in a multi-page program",
                 ));
             }
+            if object.contains_key("pages") {
+                return Err(invalid(
+                    "root.pages is illegal alongside root.routes; routes supersedes it",
+                ));
+            }
             let mut ids = HashSet::new();
             let mut route_names = Vec::with_capacity(map.len());
             let mut routes = Vec::with_capacity(map.len());
