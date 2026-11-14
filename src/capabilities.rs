@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The six native capabilities. Grants are exact strings from this list.
-pub const NATIVE_CAPABILITIES: [&str; 6] = [
+/// The seven native capabilities. Grants are exact strings from this list.
+pub const NATIVE_CAPABILITIES: [&str; 7] = [
     "camera.takePhoto",
     "geolocation.getCurrentPosition",
     "bluetooth.scan",
     "notification.show",
     "payment.request",
     "share.send",
+    "network.request",
 ];
 
 #[derive(Clone)]

@@ -56,6 +56,7 @@ fn expected(capability: &str) -> Json {
             json!({"approved":true,"transaction":"mock-payment-1","mock":true})
         }
         "share.send" => json!({"shared":true,"target":"mock-share-sheet","mock":true}),
+        "network.request" => json!({"status":200,"body":{"ok":true},"mock":true}),
         other => panic!("unexpected capability {other}"),
     }
 }
@@ -77,7 +78,7 @@ fn pid_is_alive(pid: &str) -> bool {
 }
 
 #[test]
-fn capability_catalog_and_manifest_declare_all_six_mock_devices() {
+fn capability_catalog_and_manifest_declare_all_seven_mock_devices() {
     assert_eq!(
         NATIVE_CAPABILITIES,
         [
@@ -87,6 +88,7 @@ fn capability_catalog_and_manifest_declare_all_six_mock_devices() {
             "notification.show",
             "payment.request",
             "share.send",
+            "network.request",
         ]
     );
     let dir = native_plugin("catalog", "ok");

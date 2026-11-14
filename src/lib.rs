@@ -30,4 +30,4 @@ pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAUL
 pub use render::RenderingHook;
 pub use resource::{ResourceError, ResourceManager};
 pub use scheduler::{Scheduler, TaskHandle};
-pub use state::{Event, Patch, Runtime, Value, DEFAULT_RESOURCE_BUDGET};
+pub use state::{Event, NetworkRecord, Patch, Runtime, Value, DEFAULT_RESOURCE_BUDGET};
