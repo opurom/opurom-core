@@ -485,6 +485,48 @@ impl Ir {
                         ));
                     }
                 }
+                if let Some(font_scale) = json.get("fontScale") {
+                    let valid = font_scale
+                        .as_f64()
+                        .is_some_and(|n| n.is_finite() && (0.5..=3.0).contains(&n));
+                    if !valid {
+                        return Err(invalid(
+                            "root.theme.fontScale must be a number in 0.5..3.0".to_string(),
+                        ));
+                    }
+                }
+                if let Some(tokens) = json.get("tokens") {
+                    let Some(tokens) = tokens.as_object() else {
+                        return Err(invalid("root.theme.tokens must be an object".to_string()));
+                    };
+                    for key in ["surface", "onSurface", "stage"] {
+                        if let Some(value) = tokens.get(key) {
+                            let text = value.as_str().unwrap_or("");
+                            let valid = text.len() == 7
+                                && text.starts_with('#')
+                                && text[1..].bytes().all(|b| b.is_ascii_hexdigit());
+                            if !valid {
+                                return Err(invalid(format!(
+                                    "root.theme.tokens.{key} must be #RRGGBB, got {value}"
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(font) = tokens.get("font") {
+                        if font.as_str().is_none() {
+                            return Err(invalid(
+                                "root.theme.tokens.font must be a string".to_string(),
+                            ));
+                        }
+                    }
+                    if let Some(contrast) = tokens.get("contrast") {
+                        if !matches!(contrast.as_str(), None | Some("normal") | Some("high")) {
+                            return Err(invalid(
+                                "root.theme.tokens.contrast must be normal or high".to_string(),
+                            ));
+                        }
+                    }
+                }
                 json.clone()
             }
             Some(_) => return Err(invalid("root.theme must be an object")),

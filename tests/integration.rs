@@ -750,4 +750,29 @@ fn closed_theme_and_state_value_sets_are_enforced() {
                             "theme": {"radius": 8.5}})
     .to_string();
     assert!(Runtime::from_ir_json(&fractional).is_ok());
+
+    let good_scale = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                            "theme": {"fontScale": 1.25}})
+    .to_string();
+    assert!(Runtime::from_ir_json(&good_scale).is_ok());
+    let bad_scale = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                           "theme": {"fontScale": 9}})
+    .to_string();
+    let error = Runtime::from_ir_json(&bad_scale).unwrap_err().to_string();
+    assert!(
+        error.contains("fontScale must be a number in 0.5..3.0"),
+        "{error}"
+    );
+
+    let good_tokens = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                             "theme": {"tokens": {"surface": "#FFFFFF", "onSurface": "#132C5A",
+                                                  "stage": "#F4F6F9", "font": "Menlo",
+                                                  "contrast": "high"}}})
+    .to_string();
+    assert!(Runtime::from_ir_json(&good_tokens).is_ok());
+    let bad_token = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                           "theme": {"tokens": {"surface": "red"}}})
+    .to_string();
+    let error = Runtime::from_ir_json(&bad_token).unwrap_err().to_string();
+    assert!(error.contains("tokens.surface must be #RRGGBB"), "{error}");
 }
