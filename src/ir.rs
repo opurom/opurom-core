@@ -11,6 +11,7 @@ pub enum Op {
     Add,
     Sub,
     Toggle,
+    Push,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub struct Ir {
     pub version: String,
     pub app: String,
     pub state: Vec<StateDecl>,
+    pub pages: Vec<String>,
     pub tree: Node,
     pub theme: Json,
 }
@@ -158,6 +160,7 @@ fn parse_action(
     json: &Json,
     event: &str,
     types: &HashMap<String, Value>,
+    pages: &[String],
     at: &str,
 ) -> Result<Action, CoreError> {
     let object = json
@@ -165,6 +168,24 @@ fn parse_action(
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
     let op = string_field(object, "op", at)?;
     let target = string_field(object, "target", at)?;
+    // Navigation is a signal, not a state mutation: its target is a declared
+    // page, and it carries no value.
+    if op == "push" {
+        if !pages.iter().any(|page| page == &target) {
+            return Err(invalid(format!(
+                "{at}.target {target:?} is not a declared page"
+            )));
+        }
+        if object.contains_key("value") || object.contains_key("valueFrom") {
+            return Err(invalid(format!("{at}: push must not have a value")));
+        }
+        return Ok(Action {
+            op: Op::Push,
+            target,
+            value: None,
+            value_from: None,
+        });
+    }
     let declared = types
         .get(&target)
         .ok_or_else(|| invalid(format!("{at}.target {target:?} is not declared in state")))?;
@@ -266,13 +287,14 @@ fn parse_actions(
     json: &Json,
     event: &str,
     types: &HashMap<String, Value>,
+    pages: &[String],
     at: &str,
 ) -> Result<Vec<Action>, CoreError> {
     let object = json
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
     let Some(raw_actions) = object.get("actions") else {
-        return Ok(vec![parse_action(json, event, types, at)?]);
+        return Ok(vec![parse_action(json, event, types, pages, at)?]);
     };
     if object.contains_key("op") {
         return Err(invalid(format!(
@@ -285,13 +307,14 @@ fn parse_actions(
     actions
         .iter()
         .enumerate()
-        .map(|(i, action)| parse_action(action, event, types, &format!("{at}.actions[{i}]")))
+        .map(|(i, action)| parse_action(action, event, types, pages, &format!("{at}.actions[{i}]")))
         .collect()
 }
 
 fn parse_node(
     json: &Json,
     types: &HashMap<String, Value>,
+    pages: &[String],
     ids: &mut HashSet<u32>,
     at: &str,
 ) -> Result<Node, CoreError> {
@@ -318,6 +341,7 @@ fn parse_node(
         children.push(parse_node(
             child,
             types,
+            pages,
             ids,
             &format!("{at}.children[{i}]"),
         )?);
@@ -347,7 +371,7 @@ fn parse_node(
     for (event, action) in events_json {
         events.insert(
             event.clone(),
-            parse_actions(action, event, types, &format!("{at}.events.{event}"))?,
+            parse_actions(action, event, types, pages, &format!("{at}.events.{event}"))?,
         );
     }
     Ok(Node {
@@ -385,9 +409,28 @@ impl Ir {
             .as_array()
             .ok_or_else(|| invalid("root.state must be an array"))?;
         let (state, types) = parse_state(state_json)?;
+        // `pages` is optional; IR without declared pages stays unchanged.
+        let pages = match object.get("pages") {
+            None => Vec::new(),
+            Some(Json::Array(list)) => {
+                let mut names = Vec::with_capacity(list.len());
+                for (i, entry) in list.iter().enumerate() {
+                    let name = entry
+                        .as_str()
+                        .ok_or_else(|| invalid(format!("root.pages[{i}] must be a string")))?;
+                    if names.iter().any(|existing| existing == name) {
+                        return Err(invalid(format!("root.pages[{i}] duplicates {name:?}")));
+                    }
+                    names.push(name.to_string());
+                }
+                names
+            }
+            Some(_) => return Err(invalid("root.pages must be an array of strings")),
+        };
         let tree = parse_node(
             field(object, "tree", "root")?,
             &types,
+            &pages,
             &mut HashSet::new(),
             "root.tree",
         )?;
@@ -400,6 +443,7 @@ impl Ir {
             version,
             app,
             state,
+            pages,
             tree,
             theme,
         })

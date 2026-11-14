@@ -127,6 +127,14 @@ fn apply_action(
     index: &HashMap<String, usize>,
     text: Option<&str>,
 ) -> Result<Patch, CoreError> {
+    // A push is a navigation signal, not a state mutation: the renderer owns
+    // the stack, so the kernel emits a reserved patch and leaves state intact.
+    if action.op == Op::Push {
+        return Ok(Patch {
+            name: "@nav".to_string(),
+            value: Value::Str(action.target.clone()),
+        });
+    }
     let position = *index
         .get(&action.target)
         .ok_or_else(|| CoreError::UnknownState(action.target.clone()))?;
@@ -217,6 +225,8 @@ fn apply_action(
                 }
             }
         }
+        // Navigation returns before the state lookup above.
+        Op::Push => unreachable!("push is handled before state lookup"),
     };
     if !same_type(&current, &next) {
         return Err(CoreError::TypeMismatch {
