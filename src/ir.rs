@@ -263,11 +263,9 @@ fn parse_action(
                         "{at}: set without value is only legal for input events"
                     )));
                 }
-                if !matches!(declared, Value::Str(_)) {
-                    return Err(invalid(format!(
-                        "{at}: input set without value requires a string target"
-                    )));
-                }
+                // The input text is parsed by the target's declared type at
+                // dispatch, so int and bool controls bind the same way as
+                // string inputs.
                 value = None;
                 value_from = None;
             }

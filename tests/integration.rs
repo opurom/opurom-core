@@ -202,11 +202,6 @@ fn rejects_illegal_event_actions() {
         ),
         (
             int_state.clone(),
-            json!({"input": {"op": "set", "target": "count"}}),
-            "string target",
-        ),
-        (
-            int_state.clone(),
             json!({"tap": {"op": "mul", "target": "count", "value": 2}}),
             "not set, add, sub or toggle",
         ),
@@ -621,4 +616,52 @@ fn cli_rejects_bad_ir_and_missing_arg() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn input_sets_without_value_parse_by_target_type() {
+    // Slider/Switch/Input bindings all lower to a value-less `set`; the input
+    // text is parsed by the declared state type, matching the compiled native
+    // target. Previously the kernel rejected non-string targets at parse time.
+    let ir = ir_with_tree(
+        json!([
+            {"name": "s", "type": "string", "init": ""},
+            {"name": "n", "type": "int", "init": 0},
+            {"name": "b", "type": "bool", "init": false}
+        ]),
+        json!({
+            "id": 0,
+            "kind": "Column",
+            "props": {},
+            "children": [
+                {"id": 1, "kind": "Input", "props": {}, "children": [],
+                 "events": {"input": {"op": "set", "target": "s"}}},
+                {"id": 2, "kind": "Slider", "props": {}, "children": [],
+                 "events": {"input": {"op": "set", "target": "n"}}},
+                {"id": 3, "kind": "Switch", "props": {}, "children": [],
+                 "events": {"input": {"op": "set", "target": "b"}}}
+            ],
+            "events": {}
+        }),
+    );
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let cases: &[(u32, &str, Value)] = &[
+        (1, "Ada", Value::Str("Ada".to_string())),
+        (2, "42", Value::Int(42)),
+        (2, "nope", Value::Int(0)),
+        (3, "true", Value::Bool(true)),
+        (3, "false", Value::Bool(false)),
+    ];
+    for &(id, text, ref expected) in cases {
+        let patches = runtime
+            .dispatch(Event::Input {
+                node_id: id,
+                text: text.to_string(),
+            })
+            .unwrap();
+        assert_eq!(patches[0].value, *expected, "{text} -> {expected:?}");
+    }
+    assert_eq!(runtime.state("s"), Some(&Value::Str("Ada".to_string())));
+    assert_eq!(runtime.state("n"), Some(&Value::Int(0)));
+    assert_eq!(runtime.state("b"), Some(&Value::Bool(false)));
 }
