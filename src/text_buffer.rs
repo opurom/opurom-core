@@ -235,16 +235,16 @@ mod tests {
 
     #[test]
     fn unicode_scalar_indices_are_not_byte_indices() {
-        let mut buffer = TextBuffer::with_text("a😀中", 4).unwrap();
+        let mut buffer = TextBuffer::with_text("a😀\u{4E2D}", 4).unwrap();
         assert_eq!(buffer.len(), 3);
         buffer.move_cursor(2).unwrap();
         buffer.insert("é").unwrap();
-        assert_eq!(buffer.content(), "a😀é中");
+        assert_eq!(buffer.content(), "a😀é\u{4E2D}");
         assert_eq!(buffer.cursor(), 3);
 
         buffer.move_cursor(1).unwrap();
         buffer.delete().unwrap();
-        assert_eq!(buffer.content(), "aé中");
+        assert_eq!(buffer.content(), "aé\u{4E2D}");
         assert_eq!(buffer.cursor(), 1);
 
         buffer.move_cursor(3).unwrap();
@@ -282,28 +282,28 @@ mod tests {
 
     #[test]
     fn selection_replace_and_insert_use_scalar_ranges() {
-        let mut buffer = TextBuffer::with_text("a😀中z", 6).unwrap();
+        let mut buffer = TextBuffer::with_text("a😀\u{4E2D}z", 6).unwrap();
         buffer.select(1, 3).unwrap();
         assert_eq!(buffer.selection(), Some((1, 3)));
         assert_eq!(buffer.cursor(), 3);
-        buffer.replace_selection("✨界").unwrap();
-        assert_eq!(buffer.content(), "a✨界z");
+        buffer.replace_selection("✨\u{754C}").unwrap();
+        assert_eq!(buffer.content(), "a✨\u{754C}z");
         assert_eq!(buffer.cursor(), 3);
         assert_eq!(buffer.selection(), None);
 
         buffer.select(0, 1).unwrap();
         buffer.insert("X").unwrap();
-        assert_eq!(buffer.content(), "X✨界z");
+        assert_eq!(buffer.content(), "X✨\u{754C}z");
         assert_eq!(buffer.cursor(), 1);
     }
 
     #[test]
     fn secure_masking_does_not_mutate_content() {
-        let mut buffer = TextBuffer::with_text("a😀中", 3).unwrap();
+        let mut buffer = TextBuffer::with_text("a😀\u{4E2D}", 3).unwrap();
         buffer.set_secure(true);
         assert!(buffer.secure());
         assert_eq!(buffer.display(), "•••");
-        assert_eq!(buffer.content(), "a😀中");
+        assert_eq!(buffer.content(), "a😀\u{4E2D}");
 
         buffer.move_cursor(3).unwrap();
         buffer.backspace().unwrap();
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn malformed_ranges_are_rejected_with_typed_errors() {
-        let mut buffer = TextBuffer::with_text("a😀中", 3).unwrap();
+        let mut buffer = TextBuffer::with_text("a😀\u{4E2D}", 3).unwrap();
         assert_eq!(
             buffer.select(2, 1),
             Err(TextBufferError::InvalidRange { start: 2, end: 1 })
@@ -341,7 +341,7 @@ mod tests {
             buffer.replace_selection("x"),
             Err(TextBufferError::NoSelection)
         );
-        assert_eq!(buffer.content(), "a😀中");
+        assert_eq!(buffer.content(), "a😀\u{4E2D}");
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn same_operation_sequence_is_deterministic() {
         fn sequence() -> TextBuffer {
-            let mut buffer = TextBuffer::with_text("中😀", 8).unwrap();
+            let mut buffer = TextBuffer::with_text("\u{4E2D}😀", 8).unwrap();
             buffer.select(0, 2).unwrap();
             buffer.insert("A✨é").unwrap();
             buffer.move_cursor(2).unwrap();
