@@ -168,15 +168,18 @@ fn apply_action(
             } else if let Some(value) = &action.value {
                 value.clone()
             } else {
-                Value::Str(
-                    text.ok_or_else(|| {
-                        CoreError::InvalidIr(format!(
-                            "set on {} has no value to apply",
-                            action.target
-                        ))
-                    })?
-                    .to_owned(),
-                )
+                // An input event with no explicit value injects its text,
+                // parsed by the target state's type exactly like the compiled
+                // native target: int parses (0 on failure), bool is "true",
+                // string is taken as-is.
+                let raw = text.ok_or_else(|| {
+                    CoreError::InvalidIr(format!("set on {} has no value to apply", action.target))
+                })?;
+                match &current {
+                    Value::Int(_) => Value::Int(raw.parse::<i64>().unwrap_or(0)),
+                    Value::Bool(_) => Value::Bool(raw == "true"),
+                    Value::Str(_) => Value::Str(raw.to_owned()),
+                }
             }
         }
         Op::Add | Op::Sub => {
