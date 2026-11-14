@@ -207,6 +207,11 @@ fn rejects_illegal_event_actions() {
         ),
         (
             int_state.clone(),
+            json!({"hover": {"op": "add", "target": "count", "value": 1}}),
+            "unknown event name",
+        ),
+        (
+            int_state.clone(),
             json!({"tap": {"op": "set", "target": "missing", "value": 1}}),
             "not declared in state",
         ),
@@ -664,4 +669,31 @@ fn input_sets_without_value_parse_by_target_type() {
     assert_eq!(runtime.state("s"), Some(&Value::Str("Ada".to_string())));
     assert_eq!(runtime.state("n"), Some(&Value::Int(0)));
     assert_eq!(runtime.state("b"), Some(&Value::Bool(false)));
+}
+
+#[test]
+fn every_declared_event_name_loads() {
+    // The closed IR event set mirrors the language emitters and the responsive
+    // DOM consumer; runtime aliases dragEnd/nav are not author-declarable here.
+    let state = json!([{"name": "count", "type": "int", "init": 0}]);
+    for event in ["tap", "input", "doubleTap", "longPress", "drag"] {
+        let ir = ir_document(
+            state.clone(),
+            json!({event: {"op": "add", "target": "count", "value": 1}}),
+        );
+        assert!(
+            Runtime::from_ir_json(&ir).is_ok(),
+            "{event} must be a declarable IR event"
+        );
+    }
+    for alias in ["dragEnd", "nav", "hover"] {
+        let ir = ir_document(
+            state.clone(),
+            json!({alias: {"op": "add", "target": "count", "value": 1}}),
+        );
+        assert!(
+            Runtime::from_ir_json(&ir).is_err(),
+            "{alias} must not be a declarable IR event"
+        );
+    }
 }

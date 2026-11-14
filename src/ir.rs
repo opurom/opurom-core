@@ -5,6 +5,10 @@ use std::collections::{HashMap, HashSet};
 
 pub const IR_VERSION: &str = "0.1.0";
 
+/// Author-declarable IR event names. The set is closed: `dragEnd` and `nav`
+/// are runtime gesture-binding aliases, not node events.
+pub const EVENT_NAMES: &[&str] = &["tap", "input", "doubleTap", "longPress", "drag"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Set,
@@ -381,6 +385,12 @@ fn parse_node(
         .ok_or_else(|| invalid(format!("{at}.events must be an object")))?;
     let mut events = HashMap::new();
     for (event, action) in events_json {
+        if !EVENT_NAMES.contains(&event.as_str()) {
+            return Err(invalid(format!(
+                "{at}.events.{event}: unknown event name (expected {})",
+                EVENT_NAMES.join("|")
+            )));
+        }
         events.insert(
             event.clone(),
             parse_actions(action, event, types, pages, &format!("{at}.events.{event}"))?,

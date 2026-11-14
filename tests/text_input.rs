@@ -46,29 +46,29 @@ fn every_edit_op_travels_through_the_plugin_bus() {
     let patches = state
         .dispatch(Event::Input {
             node_id: 1,
-            text: event_json(json!({"op": "set_text", "text": "a😀中z"})),
+            text: event_json(json!({"op": "set_text", "text": "a😀\u{4E2D}z"})),
         })
         .unwrap();
-    assert_eq!(patches, expected_patches("a😀中z", 4, -1, -1));
+    assert_eq!(patches, expected_patches("a😀\u{4E2D}z", 4, -1, -1));
     assert_eq!(
         dispatch(&state, json!({"op": "move_cursor", "index": 2})),
-        expected_patches("a😀中z", 2, -1, -1)
+        expected_patches("a😀\u{4E2D}z", 2, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "insert", "text": "é"})),
-        expected_patches("a😀é中z", 3, -1, -1)
+        expected_patches("a😀é\u{4E2D}z", 3, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "select", "start": 1, "end": 3})),
-        expected_patches("a😀é中z", 3, 1, 3)
+        expected_patches("a😀é\u{4E2D}z", 3, 1, 3)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "replace_selection", "text": "✨"})),
-        expected_patches("a✨中z", 2, -1, -1)
+        expected_patches("a✨\u{4E2D}z", 2, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "backspace"})),
-        expected_patches("a中z", 1, -1, -1)
+        expected_patches("a\u{4E2D}z", 1, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "delete"})),
@@ -87,7 +87,7 @@ fn every_edit_op_travels_through_the_plugin_bus() {
 #[test]
 fn secure_patches_and_errors_never_contain_raw_text() {
     let state = TextInputState::with_secure(16, true);
-    let secret = "p@ss😀中";
+    let secret = "p@ss😀\u{4E2D}";
     let patches = dispatch(&state, json!({"op": "set_text", "text": secret}));
     assert_eq!(patches, expected_patches("••••••", 6, -1, -1));
 
@@ -95,7 +95,7 @@ fn secure_patches_and_errors_never_contain_raw_text() {
     assert!(!text.contains(secret));
     assert!(!text.contains("p@ss"));
     assert!(!text.contains("😀"));
-    assert!(!text.contains("中"));
+    assert!(!text.contains("\u{4E2D}"));
 
     let oversized = json!({"op": "insert", "text": "EXTRA-SECRET"});
     let response = state
@@ -179,9 +179,9 @@ fn same_event_sequence_produces_identical_patch_bytes() {
     fn sequence() -> Vec<Vec<u8>> {
         let state = TextInputState::with_secure(8, true);
         [
-            json!({"op": "set_text", "text": "A😀中"}),
+            json!({"op": "set_text", "text": "A😀\u{4E2D}"}),
             json!({"op": "select", "start": 1, "end": 3}),
-            json!({"op": "replace_selection", "text": "✨界"}),
+            json!({"op": "replace_selection", "text": "✨\u{754C}"}),
             json!({"op": "move_cursor", "index": 2}),
             json!({"op": "backspace"}),
             json!({"op": "delete"}),
@@ -198,8 +198,8 @@ fn same_event_sequence_produces_identical_patch_bytes() {
         .iter()
         .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
         .collect::<String>();
-    assert!(!joined.contains("A😀中"));
-    assert!(!joined.contains("✨界"));
+    assert!(!joined.contains("A😀\u{4E2D}"));
+    assert!(!joined.contains("✨\u{754C}"));
     assert_eq!(
         String::from_utf8(first.last().unwrap().clone()).unwrap(),
         r#"[{"name":"@textInput.display","value":"•"},{"name":"@textInput.cursor","value":1},{"name":"@textInput.selectionStart","value":-1},{"name":"@textInput.selectionEnd","value":-1}]"#
@@ -210,11 +210,11 @@ fn same_event_sequence_produces_identical_patch_bytes() {
 fn unicode_scalar_indices_are_integer_positions() {
     let state = TextInputState::new(6);
     assert_eq!(
-        dispatch(&state, json!({"op": "set_text", "text": "a😀中"})),
-        expected_patches("a😀中", 3, -1, -1)
+        dispatch(&state, json!({"op": "set_text", "text": "a😀\u{4E2D}"})),
+        expected_patches("a😀\u{4E2D}", 3, -1, -1)
     );
     let selected = dispatch(&state, json!({"op": "select", "start": 1, "end": 3}));
-    assert_eq!(selected, expected_patches("a😀中", 3, 1, 3));
+    assert_eq!(selected, expected_patches("a😀\u{4E2D}", 3, 1, 3));
     assert!(matches!(selected[1].value, Value::Int(3)));
     assert!(matches!(selected[2].value, Value::Int(1)));
     assert!(matches!(selected[3].value, Value::Int(3)));
@@ -223,16 +223,16 @@ fn unicode_scalar_indices_are_integer_positions() {
         expected_patches("a", 1, -1, -1)
     );
     assert_eq!(
-        dispatch(&state, json!({"op": "insert", "text": "é✨界"})),
-        expected_patches("aé✨界", 4, -1, -1)
+        dispatch(&state, json!({"op": "insert", "text": "é✨\u{754C}"})),
+        expected_patches("aé✨\u{754C}", 4, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "move_cursor", "index": 2})),
-        expected_patches("aé✨界", 2, -1, -1)
+        expected_patches("aé✨\u{754C}", 2, -1, -1)
     );
     assert_eq!(
         dispatch(&state, json!({"op": "delete"})),
-        expected_patches("aé界", 2, -1, -1)
+        expected_patches("aé\u{754C}", 2, -1, -1)
     );
 }
 
