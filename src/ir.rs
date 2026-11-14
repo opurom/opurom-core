@@ -467,6 +467,24 @@ impl Ir {
                         ));
                     }
                 }
+                if let Some(accent) = json.get("accent") {
+                    let text = accent.as_str().unwrap_or("");
+                    let valid = text.len() == 7
+                        && text.starts_with('#')
+                        && text[1..].bytes().all(|b| b.is_ascii_hexdigit());
+                    if !valid {
+                        return Err(invalid(format!(
+                            "root.theme.accent must be #RRGGBB, got {accent}"
+                        )));
+                    }
+                }
+                if let Some(radius) = json.get("radius") {
+                    if radius.as_i64().is_none_or(|n| n < 0) {
+                        return Err(invalid(
+                            "root.theme.radius must be a non-negative integer".to_string(),
+                        ));
+                    }
+                }
                 json.clone()
             }
             Some(_) => return Err(invalid("root.theme must be an object")),

@@ -699,7 +699,7 @@ fn every_declared_event_name_loads() {
 }
 
 #[test]
-fn closed_theme_mode_and_state_type_sets_are_enforced() {
+fn closed_theme_and_state_value_sets_are_enforced() {
     // The renderer and the responsive DOM consumer reject these values; the
     // kernel must not accept an IR they refuse.
     let tree = json!({"id": 0, "kind": "Column", "props": {},
@@ -727,4 +727,21 @@ fn closed_theme_mode_and_state_type_sets_are_enforced() {
         Runtime::from_ir_json(&bad_type).is_err(),
         "float state must be rejected"
     );
+
+    let bad_accent = json!({"ir": "0.1.0", "app": "T", "state": [],
+                            "tree": tree, "theme": {"accent": "red"}})
+    .to_string();
+    let error = Runtime::from_ir_json(&bad_accent).unwrap_err().to_string();
+    assert!(error.contains("theme.accent must be #RRGGBB"), "{error}");
+
+    let bad_radius = json!({"ir": "0.1.0", "app": "T", "state": [],
+                            "tree": tree, "theme": {"radius": -5}})
+    .to_string();
+    let error = Runtime::from_ir_json(&bad_radius).unwrap_err().to_string();
+    assert!(error.contains("theme.radius"), "{error}");
+
+    let good_theme = json!({"ir": "0.1.0", "app": "T", "state": [], "tree": tree,
+                            "theme": {"mode": "dark", "accent": "#097FEB", "radius": 12}})
+    .to_string();
+    assert!(Runtime::from_ir_json(&good_theme).is_ok());
 }
