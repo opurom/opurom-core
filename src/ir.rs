@@ -16,6 +16,7 @@ pub enum Op {
     Sub,
     Toggle,
     Push,
+    Pop,
     Validate,
 }
 
@@ -38,6 +39,21 @@ pub struct Node {
     pub events: HashMap<String, Vec<Action>>,
 }
 
+impl Node {
+    /// A placeholder tree for a multi-page program, whose content lives in `routes`
+    /// rather than a single top-level `tree`.
+    fn empty() -> Node {
+        Node {
+            id: 0,
+            kind: String::new(),
+            props: Map::new(),
+            children: Vec::new(),
+            when: None,
+            events: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDecl {
     pub name: String,
@@ -45,12 +61,31 @@ pub struct StateDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+    pub name: String,
+    /// The page's content tree. Each route carries its own tree so the IR can
+    /// describe a real multi-page app, not a single hero screen.
+    pub tree: Node,
+    /// Optional page title, exposed to the renderer.
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ir {
     pub version: String,
     pub app: String,
     pub state: Vec<StateDecl>,
+    /// Declared page names in declaration order. For a multi-page program this
+    /// is the routes; for a single-page program it is the legacy flat
+    /// `pages` list.
     pub pages: Vec<String>,
+    /// Only present for a single-page program; empty for a multi-page
+    /// program, whose content lives in `routes`.
     pub tree: Node,
+    /// Routes in declaration order (empty for a single-page program).
+    pub routes: Vec<Route>,
+    /// Initial route name (None for a single-page program).
+    pub initial_route: Option<String>,
     pub theme: Json,
 }
 
@@ -165,21 +200,41 @@ fn parse_action(
     json: &Json,
     event: &str,
     types: &HashMap<String, Value>,
-    pages: &[String],
+    routes: Option<(&[String], &str)>,
     at: &str,
 ) -> Result<Action, CoreError> {
     let object = json
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
     let op = string_field(object, "op", at)?;
+    // pop unwinds the navigation stack to the previous page: it names no page
+    // and carries no value.
+    if op == "pop" {
+        if object.contains_key("target") || object.contains_key("value") {
+            return Err(invalid(format!(
+                "{at}: pop must not have a target or value"
+            )));
+        }
+        if object.contains_key("valueFrom") {
+            return Err(invalid(format!("{at}: pop must not have a value")));
+        }
+        return Ok(Action {
+            op: Op::Pop,
+            target: String::new(),
+            value: None,
+            value_from: None,
+        });
+    }
     let target = string_field(object, "target", at)?;
     // Navigation is a signal, not a state mutation: its target is a declared
     // page, and it carries no value.
     if op == "push" {
-        if !pages.iter().any(|page| page == &target) {
-            return Err(invalid(format!(
-                "{at}.target {target:?} is not a declared page"
-            )));
+        if let Some((names, noun)) = routes {
+            if !names.iter().any(|name| name == &target) {
+                return Err(invalid(format!(
+                    "{at}.target {target:?} is not a declared {noun}"
+                )));
+            }
         }
         if object.contains_key("value") || object.contains_key("valueFrom") {
             return Err(invalid(format!("{at}: push must not have a value")));
@@ -303,14 +358,14 @@ fn parse_actions(
     json: &Json,
     event: &str,
     types: &HashMap<String, Value>,
-    pages: &[String],
+    routes: Option<(&[String], &str)>,
     at: &str,
 ) -> Result<Vec<Action>, CoreError> {
     let object = json
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
     let Some(raw_actions) = object.get("actions") else {
-        return Ok(vec![parse_action(json, event, types, pages, at)?]);
+        return Ok(vec![parse_action(json, event, types, routes, at)?]);
     };
     if object.contains_key("op") {
         return Err(invalid(format!(
@@ -323,14 +378,16 @@ fn parse_actions(
     actions
         .iter()
         .enumerate()
-        .map(|(i, action)| parse_action(action, event, types, pages, &format!("{at}.actions[{i}]")))
+        .map(|(i, action)| {
+            parse_action(action, event, types, routes, &format!("{at}.actions[{i}]"))
+        })
         .collect()
 }
 
 fn parse_node(
     json: &Json,
     types: &HashMap<String, Value>,
-    pages: &[String],
+    routes: Option<(&[String], &str)>,
     ids: &mut HashSet<u32>,
     at: &str,
 ) -> Result<Node, CoreError> {
@@ -357,7 +414,7 @@ fn parse_node(
         children.push(parse_node(
             child,
             types,
-            pages,
+            routes,
             ids,
             &format!("{at}.children[{i}]"),
         )?);
@@ -393,7 +450,13 @@ fn parse_node(
         }
         events.insert(
             event.clone(),
-            parse_actions(action, event, types, pages, &format!("{at}.events.{event}"))?,
+            parse_actions(
+                action,
+                event,
+                types,
+                routes,
+                &format!("{at}.events.{event}"),
+            )?,
         );
     }
     Ok(Node {
@@ -431,31 +494,94 @@ impl Ir {
             .as_array()
             .ok_or_else(|| invalid("root.state must be an array"))?;
         let (state, types) = parse_state(state_json)?;
-        // `pages` is optional; IR without declared pages stays unchanged.
-        let pages = match object.get("pages") {
-            None => Vec::new(),
-            Some(Json::Array(list)) => {
-                let mut names = Vec::with_capacity(list.len());
-                for (i, entry) in list.iter().enumerate() {
-                    let name = entry
-                        .as_str()
-                        .ok_or_else(|| invalid(format!("root.pages[{i}] must be a string")))?;
-                    if names.iter().any(|existing| existing == name) {
-                        return Err(invalid(format!("root.pages[{i}] duplicates {name:?}")));
-                    }
-                    names.push(name.to_string());
-                }
-                names
+        // A multi-page program carries `routes`; a single-page program carries
+        // one `tree`.
+        // `pages` on a `0.1` program is the legacy flat route-name list.
+        let (pages, tree, routes, initial_route) = if let Some(Json::Object(map)) =
+            object.get("routes")
+        {
+            if object.contains_key("tree") {
+                return Err(invalid(
+                    "root.tree is illegal alongside root.routes in a multi-page program",
+                ));
             }
-            Some(_) => return Err(invalid("root.pages must be an array of strings")),
+            let mut ids = HashSet::new();
+            let mut route_names = Vec::with_capacity(map.len());
+            let mut routes = Vec::with_capacity(map.len());
+            for (name, entry) in map {
+                if name.is_empty() {
+                    return Err(invalid("root.routes keys must not be empty"));
+                }
+                let at = format!("root.routes.{name}");
+                let route_obj = entry
+                    .as_object()
+                    .ok_or_else(|| invalid(format!("{at} must be an object")))?;
+                let title = match route_obj.get("title") {
+                    None => None,
+                    Some(Json::String(title)) => Some(title.clone()),
+                    Some(_) => return Err(invalid(format!("{at}.title must be a string"))),
+                };
+                let tree = parse_node(
+                    field(route_obj, "tree", &at)?,
+                    &types,
+                    Some((route_names.as_slice(), "route")),
+                    &mut ids,
+                    &format!("{at}.tree"),
+                )?;
+                route_names.push(name.clone());
+                routes.push(Route {
+                    name: name.clone(),
+                    tree,
+                    title,
+                });
+            }
+            let initial_route = match object.get("initialRoute") {
+                None => {
+                    return Err(invalid(
+                        "root.initialRoute is required when root.routes is present",
+                    ))
+                }
+                Some(Json::String(name)) => name.clone(),
+                Some(_) => return Err(invalid("root.initialRoute must be a string")),
+            };
+            if !route_names.iter().any(|name| name == &initial_route) {
+                return Err(invalid(format!(
+                    "root.initialRoute {initial_route:?} is not a declared route"
+                )));
+            }
+            (route_names, Node::empty(), routes, Some(initial_route))
+        } else {
+            if object.contains_key("initialRoute") {
+                return Err(invalid(
+                    "root.initialRoute requires root.routes (multi-page program)",
+                ));
+            }
+            let pages = match object.get("pages") {
+                None => Vec::new(),
+                Some(Json::Array(list)) => {
+                    let mut names = Vec::with_capacity(list.len());
+                    for (i, entry) in list.iter().enumerate() {
+                        let name = entry
+                            .as_str()
+                            .ok_or_else(|| invalid(format!("root.pages[{i}] must be a string")))?;
+                        if names.iter().any(|existing| existing == name) {
+                            return Err(invalid(format!("root.pages[{i}] duplicates {name:?}")));
+                        }
+                        names.push(name.to_string());
+                    }
+                    names
+                }
+                Some(_) => return Err(invalid("root.pages must be an array of strings")),
+            };
+            let tree = parse_node(
+                field(object, "tree", "root")?,
+                &types,
+                Some((pages.as_slice(), "page")),
+                &mut HashSet::new(),
+                "root.tree",
+            )?;
+            (pages, tree, Vec::new(), None)
         };
-        let tree = parse_node(
-            field(object, "tree", "root")?,
-            &types,
-            &pages,
-            &mut HashSet::new(),
-            "root.tree",
-        )?;
         let theme = match object.get("theme") {
             None => Json::Null,
             Some(json @ Json::Object(_)) => {
@@ -537,6 +663,8 @@ impl Ir {
             state,
             pages,
             tree,
+            routes,
+            initial_route,
             theme,
         })
     }

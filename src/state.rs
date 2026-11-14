@@ -1,5 +1,5 @@
 use crate::error::{CoreError, PluginError};
-use crate::ir::{Action, Ir, Node, Op};
+use crate::ir::{Action, Ir, Node, Op, Route};
 use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
 use crate::text_input::{TextInputState, DEFAULT_TEXT_INPUT_CAPACITY};
@@ -73,6 +73,8 @@ pub struct Runtime {
     version: u64,
     tree: Node,
     pages: Vec<String>,
+    routes: Vec<Route>,
+    initial_route: Option<String>,
     text_inputs: HashMap<u32, TextInputState>,
     hook: Option<Arc<dyn RenderingHook>>,
 }
@@ -199,6 +201,14 @@ fn apply_action(
             value: Value::Str(action.target.clone()),
         });
     }
+    // A pop unwinds the navigation stack; like push, it is a reserved signal
+    // the renderer acts on, not a state mutation.
+    if action.op == Op::Pop {
+        return Ok(Patch {
+            name: "@nav".to_string(),
+            value: Value::Str("..".to_string()),
+        });
+    }
     let position = *index
         .get(&action.target)
         .ok_or_else(|| CoreError::UnknownState(action.target.clone()))?;
@@ -293,7 +303,9 @@ fn apply_action(
             }
         }
         // Signals return before the state lookup above.
-        Op::Push | Op::Validate => unreachable!("signals are handled before state lookup"),
+        Op::Push | Op::Pop | Op::Validate => {
+            unreachable!("signals are handled before state lookup")
+        }
     };
     if !same_type(&current, &next) {
         return Err(CoreError::TypeMismatch {
@@ -317,9 +329,18 @@ impl Runtime {
         let ir = Ir::parse(json)?;
         let mut actions = HashMap::new();
         let mut guards = HashMap::new();
+        // A multi-page program binds events per route tree; a single-page program binds
+        // them on its single top-level tree. Node ids are unique across the
+        // whole program, so one action map serves both.
         collect_tree(&ir.tree, &[], &mut actions, &mut guards);
+        for route in &ir.routes {
+            collect_tree(&route.tree, &[], &mut actions, &mut guards);
+        }
         let mut text_inputs = HashMap::new();
         collect_text_inputs(&ir.tree, &mut text_inputs)?;
+        for route in &ir.routes {
+            collect_text_inputs(&route.tree, &mut text_inputs)?;
+        }
         let values: Vec<(String, Value)> = ir
             .state
             .into_iter()
@@ -343,6 +364,8 @@ impl Runtime {
             version: 0,
             tree,
             pages,
+            routes: ir.routes,
+            initial_route: ir.initial_route,
             text_inputs,
             hook: None,
         })
@@ -546,12 +569,48 @@ impl Runtime {
     /// The declared page names in declaration order. The runtime consumer
     /// supplies each page's UI, so the kernel only exposes the route list.
     pub fn page_records(&self) -> Json {
+        // Multi-page programs expose each route with its title; a single-page
+        // program exposes its flat page-name list.
+        if !self.routes.is_empty() {
+            return Json::Array(
+                self.routes
+                    .iter()
+                    .map(|route| {
+                        serde_json::json!({
+                            "name": route.name,
+                            "title": route.title,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         Json::Array(
             self.pages
                 .iter()
                 .map(|name| Json::String(name.clone()))
                 .collect(),
         )
+    }
+
+    /// The initial route of a multi-page program, or `None` for a single-page
+    /// program. The renderer seeds its navigation stack with this page.
+    pub fn initial_route(&self) -> Option<&str> {
+        self.initial_route.as_deref()
+    }
+
+    /// The content tree of a declared route, after the rendering hook has
+    /// observed and decorated it. Returns `None` for an unknown route or a
+    /// single-page program, whose content is `display_list()`.
+    pub fn route_tree(&self, name: &str) -> Option<Node> {
+        let route = self.routes.iter().find(|route| route.name == name)?;
+        let tree = route.tree.clone();
+        Some(match &self.hook {
+            Some(hook) => {
+                hook.observe(&tree);
+                hook.decorate(&tree)
+            }
+            None => tree,
+        })
     }
 
     /// The network requests captured through the `network.request` capability,

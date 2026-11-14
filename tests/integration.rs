@@ -65,7 +65,7 @@ fn run_cli(ir_path: &str, commands: &str) -> (i32, String, String) {
 
 #[test]
 fn rejects_bad_ir_version() {
-    let bad = GOLDEN.replace("\"ir\": \"0.1.0\"", "\"ir\": \"0.2\"");
+    let bad = GOLDEN.replace("\"ir\": \"0.1.0\"", "\"ir\": \"9.9\"");
     assert_ne!(bad, GOLDEN);
     let error = Runtime::from_ir_json(&bad).unwrap_err();
     assert!(

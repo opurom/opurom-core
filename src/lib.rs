@@ -23,7 +23,7 @@ pub use async_sched::{AsyncScheduler, SchedulingHook, SchedulingTask, TaskContex
 pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use host::{AdapterFault, Host};
-pub use ir::{Action, Ir, Node, Op, StateDecl, IR_VERSION};
+pub use ir::{Action, Ir, Node, Op, Route, StateDecl, IR_VERSION};
 pub use parallel_sched::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, SchedulerMetrics, SpeedupMeasurement,
     SystemClock, WorkStealingScheduler, WorkStealingTaskHandle,
