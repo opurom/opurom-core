@@ -2,6 +2,7 @@ use crate::error::{CoreError, PluginError};
 use crate::ir::{Action, Ir, Node, Op};
 use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
+use crate::text_input::{TextInputState, DEFAULT_TEXT_INPUT_CAPACITY};
 use serde_core::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -72,6 +73,7 @@ pub struct Runtime {
     version: u64,
     tree: Node,
     pages: Vec<String>,
+    text_inputs: HashMap<u32, TextInputState>,
     hook: Option<Arc<dyn RenderingHook>>,
 }
 
@@ -105,6 +107,59 @@ fn collect_tree(
     for child in &node.children {
         collect_tree(child, &chain, actions, guards);
     }
+}
+
+fn text_input_from_props(
+    props: &serde_json::Map<String, Json>,
+) -> Result<Option<TextInputState>, CoreError> {
+    match props.get("textBuffer") {
+        None => return Ok(None),
+        Some(value) => match value.as_bool() {
+            Some(true) => {}
+            Some(false) => return Ok(None),
+            None => {
+                return Err(CoreError::InvalidIr(
+                    "node.props.textBuffer must be a bool".to_owned(),
+                ))
+            }
+        },
+    }
+    let capacity = match props.get("capacity").or_else(|| props.get("maxLength")) {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            CoreError::InvalidIr("text input capacity must be an unsigned integer".to_owned())
+        })?,
+        None => DEFAULT_TEXT_INPUT_CAPACITY as u64,
+    };
+    let capacity = usize::try_from(capacity)
+        .map_err(|_| CoreError::InvalidIr("text input capacity does not fit usize".to_owned()))?;
+    let secure = match props.get("secure") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| CoreError::InvalidIr("text input secure must be a bool".to_owned()))?,
+        None => false,
+    };
+    let initial = match props.get("value").or_else(|| props.get("initialValue")) {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| CoreError::InvalidIr("text input value must be a string".to_owned()))?,
+        None => "",
+    };
+    TextInputState::with_text(initial, capacity, secure)
+        .map(Some)
+        .map_err(|error| CoreError::InvalidIr(format!("invalid text input: {error}")))
+}
+
+fn collect_text_inputs(
+    node: &Node,
+    inputs: &mut HashMap<u32, TextInputState>,
+) -> Result<(), CoreError> {
+    if let Some(state) = text_input_from_props(&node.props)? {
+        inputs.insert(node.id, state);
+    }
+    for child in &node.children {
+        collect_text_inputs(child, inputs)?;
+    }
+    Ok(())
 }
 
 fn same_type(left: &Value, right: &Value) -> bool {
@@ -263,6 +318,8 @@ impl Runtime {
         let mut actions = HashMap::new();
         let mut guards = HashMap::new();
         collect_tree(&ir.tree, &[], &mut actions, &mut guards);
+        let mut text_inputs = HashMap::new();
+        collect_text_inputs(&ir.tree, &mut text_inputs)?;
         let values: Vec<(String, Value)> = ir
             .state
             .into_iter()
@@ -286,6 +343,7 @@ impl Runtime {
             version: 0,
             tree,
             pages,
+            text_inputs,
             hook: None,
         })
     }
@@ -293,6 +351,12 @@ impl Runtime {
     /// Registers the rendering extension before the display list is produced.
     pub fn with_rendering_hook(mut self, hook: Arc<dyn RenderingHook>) -> Self {
         self.hook = Some(hook);
+        self
+    }
+
+    /// Registers kernel-owned input editing state for a node.
+    pub fn with_text_input(mut self, node_id: u32, state: TextInputState) -> Self {
+        self.text_inputs.insert(node_id, state);
         self
     }
 
@@ -342,7 +406,41 @@ impl Runtime {
             .collect()
     }
 
+    fn hidden(&self, node_id: u32) -> bool {
+        self.guards.get(&node_id).is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|name| self.state(name) != Some(&Value::Bool(true)))
+        })
+    }
+
+    fn next_version(&self) -> Result<u64, CoreError> {
+        self.version
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Overflow {
+                name: "version".to_owned(),
+            })
+    }
+
     pub fn dispatch(&mut self, event: Event) -> Result<Vec<Patch>, CoreError> {
+        if let Event::Input { node_id, text } = &event {
+            if self.text_inputs.contains_key(node_id) {
+                if self.hidden(*node_id) {
+                    return Ok(Vec::new());
+                }
+                let version = self.next_version()?;
+                let patches = self
+                    .text_inputs
+                    .get(node_id)
+                    .ok_or_else(|| {
+                        CoreError::InvalidIr("text input registration changed".to_owned())
+                    })?
+                    .dispatch_json(text)
+                    .map_err(CoreError::TextInput)?;
+                self.version = version;
+                return Ok(patches);
+            }
+        }
         let (node_id, event_name, text) = match event {
             Event::Tap { node_id } => (node_id, "tap", None),
             Event::DoubleTap { node_id } => (node_id, "doubleTap", None),
@@ -361,13 +459,8 @@ impl Runtime {
             })?;
         // A hidden node is inert: a bound event must not mutate state behind
         // a false condition.
-        if let Some(conditions) = self.guards.get(&node_id) {
-            if conditions
-                .iter()
-                .any(|name| self.state(name) != Some(&Value::Bool(true)))
-            {
-                return Ok(Vec::new());
-            }
+        if self.hidden(node_id) {
+            return Ok(Vec::new());
         }
         if actions.is_empty() {
             return Ok(Vec::new());
@@ -382,12 +475,7 @@ impl Runtime {
                 text.as_deref(),
             )?);
         }
-        let version = self
-            .version
-            .checked_add(1)
-            .ok_or_else(|| CoreError::Overflow {
-                name: "version".to_owned(),
-            })?;
+        let version = self.next_version()?;
         self.values = working;
         self.version = version;
         Ok(patches)
