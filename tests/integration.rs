@@ -697,3 +697,34 @@ fn every_declared_event_name_loads() {
         );
     }
 }
+
+#[test]
+fn closed_theme_mode_and_state_type_sets_are_enforced() {
+    // The renderer and the responsive DOM consumer reject these values; the
+    // kernel must not accept an IR they refuse.
+    let tree = json!({"id": 0, "kind": "Column", "props": {},
+                     "children": [], "events": {}});
+    for mode in ["light", "dark", "system"] {
+        let ir = json!({"ir": "0.1.0", "app": "T", "state": [],
+                        "tree": tree, "theme": {"mode": mode}})
+        .to_string();
+        assert!(
+            Runtime::from_ir_json(&ir).is_ok(),
+            "{mode} must be accepted"
+        );
+    }
+    let bad_mode = json!({"ir": "0.1.0", "app": "T", "state": [],
+                          "tree": tree, "theme": {"mode": "neon"}})
+    .to_string();
+    let error = Runtime::from_ir_json(&bad_mode).unwrap_err().to_string();
+    assert!(error.contains("theme.mode must be light"), "{error}");
+
+    let bad_type = json!({"ir": "0.1.0", "app": "T",
+                          "state": [{"name": "n", "type": "float", "init": 0}],
+                          "tree": tree, "theme": {}})
+    .to_string();
+    assert!(
+        Runtime::from_ir_json(&bad_type).is_err(),
+        "float state must be rejected"
+    );
+}

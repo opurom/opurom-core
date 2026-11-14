@@ -458,7 +458,17 @@ impl Ir {
         )?;
         let theme = match object.get("theme") {
             None => Json::Null,
-            Some(json @ Json::Object(_)) => json.clone(),
+            Some(json @ Json::Object(_)) => {
+                if let Some(mode) = json.get("mode") {
+                    let valid = matches!(mode.as_str(), Some("light" | "dark" | "system"));
+                    if !valid {
+                        return Err(invalid(
+                            "root.theme.mode must be light, dark or system".to_string(),
+                        ));
+                    }
+                }
+                json.clone()
+            }
             Some(_) => return Err(invalid("root.theme must be an object")),
         };
         Ok(Ir {
