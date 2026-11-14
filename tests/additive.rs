@@ -70,6 +70,12 @@ fn additive_ir() -> Json {
                         {"op": "push", "target": "Settings"},
                         {"op": "validate", "target": "form"}
                     ]}}
+                },
+                {
+                    "id": 8,
+                    "kind": "Grid",
+                    "props": {"columns": 3, "compactColumns": 2},
+                    "children": [], "events": {}
                 }
             ],
             "events": {}
