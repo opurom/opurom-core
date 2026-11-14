@@ -71,6 +71,7 @@ pub struct Runtime {
     network_log: Vec<NetworkRecord>,
     version: u64,
     tree: Node,
+    pages: Vec<String>,
     hook: Option<Arc<dyn RenderingHook>>,
 }
 
@@ -262,6 +263,7 @@ impl Runtime {
             .map(|(i, (name, _))| (name.clone(), i))
             .collect();
         let tree = ir.tree;
+        let pages = ir.pages;
         Ok(Runtime {
             app: ir.app,
             values,
@@ -272,6 +274,7 @@ impl Runtime {
             network_log: Vec::new(),
             version: 0,
             tree,
+            pages,
             hook: None,
         })
     }
@@ -439,6 +442,17 @@ impl Runtime {
 
     pub fn resource_cache(&self) -> &ResourceManager<String, Json> {
         &self.resources
+    }
+
+    /// The declared page names in declaration order. The runtime consumer
+    /// supplies each page's UI, so the kernel only exposes the route list.
+    pub fn page_records(&self) -> Json {
+        Json::Array(
+            self.pages
+                .iter()
+                .map(|name| Json::String(name.clone()))
+                .collect(),
+        )
     }
 
     /// The network requests captured through the `network.request` capability,

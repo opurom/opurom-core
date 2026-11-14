@@ -429,7 +429,9 @@ restriction, or rlimits are applied.
 ## CLI
 
 `opurom-core <app.opuir.json>` reads one IR file, prints the initial state, then reads commands
-from stdin and prints the resulting patches:
+from stdin and prints the resulting patches. `state`, `pages`, `layers`, `network`, `resource`
+and `quit` are inspection commands; `pages` prints the declared route names in order (an empty
+array when the IR declares none), read live by the debugger's `opurom/navigation` request:
 
 ```sh
 printf 'tap 4\nstate\nquit\n' | cargo run -- tests/fixtures/counter.opuir.json

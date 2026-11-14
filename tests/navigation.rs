@@ -156,3 +156,76 @@ fn a_push_without_any_declared_pages_is_rejected() {
     .to_string();
     assert!(Ir::parse(&ir).is_err());
 }
+
+#[test]
+fn a_runtime_exposes_its_declared_pages_in_order() {
+    let ir = nav_ir(
+        json!(["Home", "Settings", "Profile"]),
+        json!({"op": "push", "target": "Settings"}),
+    );
+    let runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert_eq!(
+        runtime.page_records(),
+        Json::Array(vec![
+            Json::String("Home".to_string()),
+            Json::String("Settings".to_string()),
+            Json::String("Profile".to_string()),
+        ])
+    );
+    // A program without pages exposes an empty list, not an absent field.
+    let plain = json!({
+        "ir": "0.1",
+        "app": "Plain",
+        "state": [],
+        "tree": {"id": 0, "kind": "Column", "props": {}, "children": [], "events": {}},
+        "theme": {}
+    })
+    .to_string();
+    let runtime = Runtime::from_ir_json(&plain).unwrap();
+    assert_eq!(runtime.page_records(), Json::Array(Vec::new()));
+}
+
+#[test]
+fn the_cli_exposes_declared_pages_over_the_line_protocol() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let ir = nav_ir(
+        json!(["Home", "Settings"]),
+        json!({"op": "push", "target": "Settings"}),
+    );
+    let path = std::env::temp_dir().join("opurom-core-nav-cli.opuir.json");
+    std::fs::write(&path, &ir).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_opurom-core"))
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"pages\ntap 0\npages\nquit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(r#"pages ["Home","Settings"] version 0"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"pages ["Home","Settings"] version 1"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"patches [{"name":"@nav","value":"Settings"}] version 1"#),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_file(&path);
+}

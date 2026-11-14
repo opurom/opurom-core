@@ -88,6 +88,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
             "layers" => print_layers(&runtime),
             "network" => print_network(&runtime),
             "resource" => print_resource(&runtime),
+            "pages" => print_pages(&runtime),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
                     Ok(patches) => match serde_json::to_string(&patches) {
@@ -126,6 +127,13 @@ fn print_resource(runtime: &Runtime) {
 fn print_layers(runtime: &Runtime) {
     match serde_json::to_string(&runtime.layer_records()) {
         Ok(json) => println!("layers {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
+fn print_pages(runtime: &Runtime) {
+    match serde_json::to_string(&runtime.page_records()) {
+        Ok(json) => println!("pages {json} version {}", runtime.version()),
         Err(error) => println!("error: {error}"),
     }
 }
@@ -174,7 +182,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages or quit"
         )),
     }
 }
