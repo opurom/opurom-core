@@ -121,11 +121,21 @@ impl TextInputState {
             .bus
             .call(TEXT_INPUT_BUS, event)
             .map_err(|error| TextInputError::Bus(error.to_string()))?;
-        Self::patches_from_response(&response)
+        parse_response(&response, None)
+    }
+
+    /// Edits this buffer and emits patches named for `node_id`, so a UI can bind
+    /// each field of a multi-input form independently.
+    pub fn dispatch_for(&self, node_id: u32, event: &str) -> Result<Vec<Patch>, TextInputError> {
+        let response = self
+            .bus
+            .call(TEXT_INPUT_BUS, event)
+            .map_err(|error| TextInputError::Bus(error.to_string()))?;
+        parse_response(&response, Some(node_id))
     }
 
     pub fn patches_from_response(response: &str) -> Result<Vec<Patch>, TextInputError> {
-        parse_response(response)
+        parse_response(response, None)
     }
 
     fn from_buffer(mut buffer: TextBuffer, secure: bool) -> Self {
@@ -253,22 +263,28 @@ fn snapshot_json(snapshot: &Snapshot) -> Json {
     })
 }
 
-fn build_patches(snapshot: &Snapshot) -> Vec<Patch> {
+fn build_patches(node_id: Option<u32>, snapshot: &Snapshot) -> Vec<Patch> {
+    // The per-node prefix lets a multi-input form bind each field by node id;
+    // the single-buffer path keeps the bare `@textInput.*` names it always had.
+    let prefix = match node_id {
+        Some(id) => format!("@textInput.{id}"),
+        None => "@textInput".to_owned(),
+    };
     vec![
         Patch {
-            name: "@textInput.display".to_owned(),
+            name: format!("{prefix}.display"),
             value: Value::Str(snapshot.display.clone()),
         },
         Patch {
-            name: "@textInput.cursor".to_owned(),
+            name: format!("{prefix}.cursor"),
             value: Value::Int(snapshot.cursor),
         },
         Patch {
-            name: "@textInput.selectionStart".to_owned(),
+            name: format!("{prefix}.selectionStart"),
             value: Value::Int(snapshot.selection_start),
         },
         Patch {
-            name: "@textInput.selectionEnd".to_owned(),
+            name: format!("{prefix}.selectionEnd"),
             value: Value::Int(snapshot.selection_end),
         },
     ]
@@ -337,7 +353,7 @@ fn buffer_error_to_json(error: &TextBufferError) -> Json {
     }
 }
 
-fn parse_response(response: &str) -> Result<Vec<Patch>, TextInputError> {
+fn parse_response(response: &str, node_id: Option<u32>) -> Result<Vec<Patch>, TextInputError> {
     let value: Json = serde_json::from_str(response)
         .map_err(|_| bus_error("malformed text input bus response"))?;
     if let Some(error) = value.get("error") {
@@ -356,12 +372,15 @@ fn parse_response(response: &str) -> Result<Vec<Patch>, TextInputError> {
     if cursor < 0 || selection_start < NO_SELECTION || selection_end < NO_SELECTION {
         return Err(bus_error("text input indices must not be negative"));
     }
-    Ok(build_patches(&Snapshot {
-        display: display.to_owned(),
-        cursor,
-        selection_start,
-        selection_end,
-    }))
+    Ok(build_patches(
+        node_id,
+        &Snapshot {
+            display: display.to_owned(),
+            cursor,
+            selection_start,
+            selection_end,
+        },
+    ))
 }
 
 fn i64_field(value: &Json, key: &str) -> Result<i64, TextInputError> {

@@ -445,6 +445,25 @@ impl Runtime {
             })
     }
 
+    /// Routes an input event to the text buffer owned by `node_id`. The event is
+    /// left untouched for any other node: an unregistered node reports
+    /// `UnknownNode`, and a registered node that owns no buffer reports
+    /// `NoTextBufferInput`, without disturbing any buffer or the version.
+    pub fn dispatch_to(&mut self, node_id: u32, event: Event) -> Result<Vec<Patch>, CoreError> {
+        if !matches!(event, Event::Input { .. }) {
+            return Err(CoreError::InvalidIr(
+                "dispatch_to expects an input event".to_owned(),
+            ));
+        }
+        if !self.actions.contains_key(&node_id) {
+            return Err(CoreError::UnknownNode(node_id));
+        }
+        if !self.text_inputs.contains_key(&node_id) {
+            return Err(CoreError::NoTextBufferInput(node_id));
+        }
+        self.dispatch(event)
+    }
+
     pub fn dispatch(&mut self, event: Event) -> Result<Vec<Patch>, CoreError> {
         if let Event::Input { node_id, text } = &event {
             if self.text_inputs.contains_key(node_id) {
@@ -458,7 +477,8 @@ impl Runtime {
                     .ok_or_else(|| {
                         CoreError::InvalidIr("text input registration changed".to_owned())
                     })?
-                    .dispatch_json(text)
+                    // Patches are named for this node so a UI binds each field.
+                    .dispatch_for(*node_id, text)
                     .map_err(CoreError::TextInput)?;
                 self.version = version;
                 return Ok(patches);

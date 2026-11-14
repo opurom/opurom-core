@@ -2,16 +2,14 @@
 
 **Kernel slice** of the Opurom kernel. This is one independent Rust crate and one
 independent local git repo; it does not import or link any other Opurom project. It implements
-the state/event part of [IR 0.1.0](the IR format) plus the interactive UI additions from
-[the IR format](the IR format), the process-isolated plugin host
-from [the plugin protocol](the plugin protocol), the deterministic
-cooperative scheduler from [the framework rules](the framework rules) framework rules
+the state/event part of IR 0.1.0 plus the interactive UI additions, the process-isolated plugin host,
+the deterministic cooperative scheduler from the framework rules framework rules
 extended by the `SchedulingHook` scheduling-extension trait and a kernel
 `RenderingHook` rendering-extension seam,
 the multi-threaded work-stealing scheduler from
-[the framework rules](the framework rules) framework rules,
+the framework rules framework rules,
 and the explicit native-capability permission gate from
-[the component catalog rules](the component catalog rules) framework rules.
+the framework rules framework rules.
 It is **not** the whole framework: no renderer, compiler, target emitters, platform adapters,
 GUI or build pipeline live here.
 
@@ -30,7 +28,7 @@ cargo run --offline --example parallel_speedup
 Integration tests cover IR validation, interactive UI actions, conditional event dispatch, the
 deterministic cooperative scheduler and its scheduling hook, the work-stealing scheduler, native
 capability permissions and the kernel rendering extension.
-The Rust suite contains 136 integration tests, 8 unit tests and no doc tests. Dependencies are
+The Rust suite contains 167 integration tests, 8 unit tests and no doc tests. Dependencies are
 `serde_json` and `serde_core`; the work-stealing scheduler, the capability gate, the scheduling
 hook and the rendering hook use pure `std` and add no crate. The capability tests drive a real
 shell plugin process through JSON lines, including crashes, malformed frames, cooldown recovery and PID
@@ -66,6 +64,7 @@ let _ = runtime.snapshot();                          // source-ordered Vec<Patch
 | `Runtime::dispatch(Event)` | `Event::Tap { node_id }` / `Event::Input { node_id, text }` (and the gesture variants). Applies every action of the bound event **in order and atomically**: the actions run against a working copy, and the copy is committed only when all of them succeed. Patches are emitted in action order, one per resulting state change. `add` uses `checked_add`, so overflow is an error with no state change. A `push` is a navigation signal: it emits the reserved patch `{"name":"@nav","value":"Page"}` and leaves state unchanged, since the renderer owns the navigation stack; it still advances the version. A `validate` likewise emits `{"name":"@validate","value":"Form"}` and leaves state unchanged. Errors (unknown node, unbound event, bad type) leave state and version untouched. A bound event on a hidden node returns an empty patch list without changing state or version. |
 | `Patch`, `Value` | `Patch { name, value }`; `Value::Int(i64) \| Bool(bool) \| Str(String)`. Both serialize with `serde_json::to_string` as `{"name":"count","value":1}`. |
 | `TextBuffer`, `TextBufferError` | Deterministic, bounded editor over Unicode scalar values. `new(capacity)` and `with_text(text, capacity)` create buffers; `insert`, `backspace`, `delete`, `move_cursor`, `select(start, end)` and `replace_selection(text)` use `usize` scalar positions, not byte offsets. Out-of-range cursors, malformed ranges, absent selections and capacity failures return typed errors without mutation. `secure` masks `display()` with one bullet per scalar while `content()` keeps the stored text. |
+| `TextInputState`, `TextInputError`, `Runtime::with_text_input`, `Runtime::dispatch_to` | Kernel-owned text editing. Every node whose props carry `"textBuffer": true` gets its own `TextInputState` at `from_ir_json`, keyed by the node's IR `id` — the same id the renderer/layout uses — so one screen may hold several inputs (a form). `dispatch_to(node_id, Event::Input { .. })` routes an edit to that node alone: an unregistered id returns `CoreError::UnknownNode`, a registered node without a buffer returns the new `CoreError::NoTextBufferInput`, and neither disturbs any buffer or the version. `Runtime::dispatch(Event::Input)` routes by the event's `node_id` (hidden buffers are inert). Editing one buffer never touches another's content, cursor or selection, and `secure` masking is per node. The resulting patches name the node so each field binds independently: `@textInput.<id>.display`, `.cursor`, `.selectionStart`, `.selectionEnd`. A standalone `TextInputState::dispatch_for(id, event)` emits the same node-named patches, while `dispatch`/`dispatch_json` keep the legacy `@textInput.*` names for the single-buffer path. All of it is integer-only and deterministic: the same event sequence yields identical patch bytes. |
 | `Scheduler::new(workers)`, `spawn(priority, task)`, `shutdown()` | Legacy bounded std-thread pool, `BinaryHeap` priority (higher `u8` first, FIFO within a priority), `TaskHandle::join() -> Result<T, SchedulerError>`. `shutdown` stops new submissions, drains queued work, joins workers; `Drop` does the same. Task panics are caught, so a worker survives. This API is unchanged. |
 | `Scheduler::with_workers(n)` -> `WorkStealingScheduler` | Builder for N OS worker threads and a bounded total task queue. `spawn(task)` returns a `WorkStealingTaskHandle<T>` with `join() -> Result<T, SchedulerError>`; `spawn_on(worker, task)` pins a task to one worker's deque and gives its closure the executing worker id. Builder methods: `with_queue_capacity`, `with_failure_threshold`, `with_cooldown`, `with_clock`. One worker is deterministic FIFO; more workers use round-robin injection, per-worker deques and stealing. `shutdown()` drains work and joins every thread; `Drop` does the same. |
 | `AsyncScheduler::new()`, `spawn(priority, task) -> TaskId`, `spawn_with_context(priority, task) -> TaskId`, `sleep_until(id, tick)` / `wake_at(id, tick)`, `tick(delta_ms) -> Vec<TaskId>`, `cancel(id) -> bool`, `pending()`, `drain()`, `now()`, `with_hook(hook)`, `admitted()`, `rejected()`, `executed()` | Deterministic cooperative scheduler: logical ticks, higher priority first then spawn order, sleeping tasks, cancellation and draining. `spawn` takes a plain `FnOnce()`; `spawn_with_context` passes a `TaskContext` for children/continuations. `with_hook` registers a `SchedulingHook` reordering/admission extension and the three counters observe it; see [the scheduling extension section](#scheduling-extension-hook). It is **not** async I/O. |
@@ -166,7 +165,7 @@ driven by a logical tick counter: a schedulable coroutine queue. It is **NOT
 OS async I/O**, **NOT reactor/epoll**, and **NOT a claim about network
 concurrency**: there is no reactor, no epoll/kqueue, no thread pool, no
 sockets, no randomness and no wall clock. It implements
-[framework rules of the framework rules](the framework rules).
+framework rules of the framework rules.
 
 ```rust
 use opurom_core::{AsyncScheduler, TaskId};
@@ -458,7 +457,7 @@ opurom-core plugins /path/to/plugin camera.takePhoto
 {"path":"/tmp/photo.png"}
 ```
 
-Fixtures in `tests/fixtures/`: `counter.opuir.json` is a copy of the framework rules's golden IR,
+Fixtures in `tests/fixtures/`: `counter.opuir.json` is a copy of the reference golden IR,
 `form.opuir.json` exercises string input, bool toggle and typed set, `bad-version.opuir.json`
 is a negative case. `tests/fixtures/plugins/stub/` is a self-contained stub plugin (a POSIX
 shell script) used by the interactive UI tests; its behaviour is driven by a `schedule` file, so one
@@ -481,7 +480,7 @@ fixture covers handshake, success, unknown capability, timeout, crash and protoc
 | Adapter degradation | Consecutive-error counting, threshold 3, fallback-only `run`, `degraded()`; 2 tests. The real `PlatformAdapter` trait, the actual adapter swap and frame presentation live in `opurom-platform`; this `Host` is a small standalone policy with no cross-repo dependency |
 | CLI | IR file + stdin command loop, patch output, error diagnostics; 3 end-to-end binary tests; `plugins <dir> <capability>` subcommand; `parallel_speedup` example prints real measured scheduler timings. `opurom build/dev/test`, hot reload and watch mode live in `opurom-cli` |
 | Rendering extension | Kernel rendering seam: a registered `RenderingHook` observes and decorates the display list before the renderer, and `display_list()` is byte-identical to the parsed tree without a hook. RGBA output, layout, dirty rects, deterministic pixel hash, target emitters, GPU backend, LSP and debugger belong to other repositories |
-| Quality evidence | 116 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
+| Quality evidence | 167 integration tests, 0 failed, 0 ignored; formatting, warning and documentation checks cover the Rust crate and published Markdown; `parallel_speedup` prints measured one-worker and N-worker timings. Pixel-consistency and golden-hash checks belong to `opurom-render`/`opurom-examples` |
 
 Process isolation of plugins is real and verified. The permission gate and the deterministic mock
 devices are application-level, and the cooperative scheduler is a deterministic queue only: it

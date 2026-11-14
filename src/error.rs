@@ -9,6 +9,7 @@ pub enum CoreError {
     InvalidIr(String),
     UnknownState(String),
     UnknownNode(u32),
+    NoTextBufferInput(u32),
     UnboundEvent {
         node_id: u32,
         event: String,
@@ -32,6 +33,7 @@ impl fmt::Display for CoreError {
             Self::InvalidIr(m) => write!(f, "invalid IR: {m}"),
             Self::UnknownState(name) => write!(f, "unknown state name: {name}"),
             Self::UnknownNode(id) => write!(f, "unknown node id: {id}"),
+            Self::NoTextBufferInput(id) => write!(f, "node {id} has no text buffer input"),
             Self::UnboundEvent { node_id, event } => {
                 write!(f, "node {node_id} has no {event} event binding")
             }

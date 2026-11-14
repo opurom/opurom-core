@@ -496,7 +496,7 @@ impl Ir {
         let (state, types) = parse_state(state_json)?;
         // A multi-page program carries `routes`; a single-page program carries
         // one `tree`.
-        // `pages` on a `0.1` program is the legacy flat route-name list.
+        // `pages` on a `0.1.0` program is the legacy flat route-name list.
         let (pages, tree, routes, initial_route) = if let Some(Json::Object(map)) =
             object.get("routes")
         {
