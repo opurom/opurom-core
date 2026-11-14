@@ -16,7 +16,7 @@ schedule=ok
 if [ -f "$dir/schedule" ]; then
     IFS= read -r schedule < "$dir/schedule"
 fi
-caps="camera.takePhoto,geolocation.getCurrentPosition,bluetooth.scan,notification.show,payment.request,share.send"
+caps="camera.takePhoto,geolocation.getCurrentPosition,bluetooth.scan,notification.show,payment.request,share.send,network.request"
 if [ -f "$dir/caps" ]; then
     IFS= read -r caps < "$dir/caps"
 fi
@@ -114,6 +114,9 @@ while IFS= read -r line; do
             ;;
         share.send)
             result='{"shared":true,"target":"mock-share-sheet","mock":true}'
+            ;;
+        network.request)
+            result='{"status":200,"body":{"ok":true},"mock":true}'
             ;;
         *)
             printf '{"id":%s,"ok":false,"error":"unknown capability: %s"}\n' "$id" "$cap"

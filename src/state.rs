@@ -68,9 +68,22 @@ pub struct Runtime {
     actions: HashMap<u32, HashMap<String, Vec<Action>>>,
     guards: HashMap<u32, Vec<String>>,
     resources: ResourceManager<String, Json>,
+    network_log: Vec<NetworkRecord>,
     version: u64,
     tree: Node,
     hook: Option<Arc<dyn RenderingHook>>,
+}
+
+/// One captured network request: the method and URL the plugin was invoked with,
+/// the HTTP status the plugin reported, and the request/response byte counts.
+/// Recorded deterministically from the capability call, with no wall clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRecord {
+    pub method: String,
+    pub url: String,
+    pub status: i64,
+    pub request_bytes: usize,
+    pub response_bytes: usize,
 }
 
 fn collect_tree(
@@ -246,6 +259,7 @@ impl Runtime {
             actions,
             guards,
             resources: ResourceManager::new(budget),
+            network_log: Vec::new(),
             version: 0,
             tree,
             hook: None,
@@ -370,7 +384,38 @@ impl Runtime {
         if let Some(cached) = self.resources.get(&key) {
             return Ok(cached);
         }
+        // Capture the network request shape before the params are consumed. A
+        // `network.request` records its method and URL from the params and its
+        // status plus byte counts from the result; nothing else is logged.
+        let network = if capability == "network.request" {
+            Some((
+                params
+                    .get("method")
+                    .and_then(Json::as_str)
+                    .unwrap_or("GET")
+                    .to_owned(),
+                params
+                    .get("url")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                serde_json::to_vec(&params).map(|b| b.len()).unwrap_or(0),
+            ))
+        } else {
+            None
+        };
         let result = invoke(capability, params).map_err(CoreError::Plugin)?;
+        if let Some((method, url, request_bytes)) = network {
+            let status = result.get("status").and_then(Json::as_i64).unwrap_or(0);
+            let response_bytes = serde_json::to_vec(&result).map(|b| b.len()).unwrap_or(0);
+            self.network_log.push(NetworkRecord {
+                method,
+                url,
+                status,
+                request_bytes,
+                response_bytes,
+            });
+        }
         let bytes = serde_json::to_vec(&result)
             .map_err(|error| CoreError::Resource(ResourceError::InvalidValue(error.to_string())))?;
         // A result larger than the whole budget is not cached, but the call still
@@ -384,6 +429,25 @@ impl Runtime {
 
     pub fn resource_cache(&self) -> &ResourceManager<String, Json> {
         &self.resources
+    }
+
+    /// The network requests captured through the `network.request` capability,
+    /// in invocation order, as deterministic JSON records.
+    pub fn network_records(&self) -> Json {
+        Json::Array(
+            self.network_log
+                .iter()
+                .map(|record| {
+                    serde_json::json!({
+                        "method": record.method,
+                        "url": record.url,
+                        "status": record.status,
+                        "requestBytes": record.request_bytes,
+                        "responseBytes": record.response_bytes,
+                    })
+                })
+                .collect(),
+        )
     }
 }
 

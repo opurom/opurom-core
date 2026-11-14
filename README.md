@@ -369,7 +369,7 @@ and symlinks pointing outside are rejected).
 ### Native capability permissions
 
 `CapabilityHost` is a lazy, application-level permission gate in front of `PluginHost`.
-`NATIVE_CAPABILITIES` contains exactly six capabilities:
+`NATIVE_CAPABILITIES` contains exactly seven capabilities:
 
 | Capability | Deterministic mock reply |
 | --- | --- |
@@ -379,6 +379,7 @@ and symlinks pointing outside are rejected).
 | `notification.show` | fixed delivery record |
 | `payment.request` | fixed approved transaction |
 | `share.send` | fixed share-sheet target |
+| `network.request` | fixed HTTP status and body |
 
 `CapabilityHost::new(grants)` receives an explicit set; there is no implicit grant.
 `register(dir)` reads and validates the manifest but does not spawn. `invoke` checks the catalog,
@@ -386,6 +387,12 @@ then the grant, then the registered declaration, and only then calls `PluginHost
 capability returns `PluginError::NotAllowed`; an undeclared capability returns
 `PluginError::UnknownCapability`; neither executes the plugin. The inner host repeats the
 allowlist check before writing a request.
+
+When a `network.request` capability runs through `Runtime::invoke_plugin`, the runtime appends a
+deterministic record of that request to its network log: the `method` and `url` read from the
+params, the `status` the plugin reported, and the request/response byte counts. The log keeps
+invocation order, uses no wall clock, and is read live over the kernel `network` command (and the
+debugger `opurom/networkStats` request), so network capture reflects the running session.
 
 ```rust
 use opurom_core::CapabilityHost;
@@ -433,7 +440,7 @@ patches [{"name":"count","value":1}] version 1
 state [{"name":"count","value":1}] version 1
 ```
 
-Commands: `tap <id>`, `doubleTap <id>`, `longPress <id>`, `drag <id>`, `input <id> <text>` (text may contain spaces), `state`, `layers`, `resource`, `quit`.
+Commands: `tap <id>`, `doubleTap <id>`, `longPress <id>`, `drag <id>`, `input <id> <text>` (text may contain spaces), `state`, `layers`, `network`, `resource`, `quit`.
 Bad commands and dispatch errors print `error: <diagnostic>` and the loop continues. Exit codes:
 0 on `quit`/EOF, 1 for unreadable or invalid IR, 2 when the file argument is missing. Note that
 input lines are whitespace-trimmed, so leading/trailing spaces in input text are not preserved.

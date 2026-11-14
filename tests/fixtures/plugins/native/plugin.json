@@ -8,7 +8,8 @@
     "bluetooth.scan",
     "notification.show",
     "payment.request",
-    "share.send"
+    "share.send",
+    "network.request"
   ],
   "entry": "./native.sh",
   "description": "Deterministic mock native devices for the core tests"

@@ -86,6 +86,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
             "quit" => break,
             "state" => print_state(&runtime),
             "layers" => print_layers(&runtime),
+            "network" => print_network(&runtime),
             "resource" => print_resource(&runtime),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
@@ -129,6 +130,13 @@ fn print_layers(runtime: &Runtime) {
     }
 }
 
+fn print_network(runtime: &Runtime) {
+    match serde_json::to_string(&runtime.network_records()) {
+        Ok(json) => println!("network {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
 fn parse_command(line: &str) -> Result<Event, String> {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
@@ -166,7 +174,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, resource or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource or quit"
         )),
     }
 }

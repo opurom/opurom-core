@@ -1008,6 +1008,35 @@ fn runtime_plugin_hook_reports_plugin_errors() {
 }
 
 #[test]
+fn runtime_records_network_requests_through_the_network_capability() {
+    let mut runtime = Runtime::from_ir_json(&ir_document(json!([]), json!({}))).unwrap();
+    assert_eq!(runtime.network_records(), json!([]));
+
+    // A network.request is captured with its method, URL and reported status.
+    runtime
+        .invoke_plugin(
+            "network.request",
+            json!({"method": "GET", "url": "https://api.example.com/items"}),
+            |_, _| Ok(json!({"status": 200, "body": {"items": []}})),
+        )
+        .unwrap();
+    let records = runtime.network_records();
+    let arr = records.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["method"], "GET");
+    assert_eq!(arr[0]["url"], "https://api.example.com/items");
+    assert_eq!(arr[0]["status"], 200);
+    assert!(arr[0]["requestBytes"].as_u64().unwrap() > 0);
+    assert!(arr[0]["responseBytes"].as_u64().unwrap() > 0);
+
+    // A non-network capability is not captured.
+    runtime
+        .invoke_plugin("stub.echo", json!({"a": 1}), |_, _| Ok(json!({"ok": true})))
+        .unwrap();
+    assert_eq!(runtime.network_records().as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn runtime_plugin_hook_uses_a_real_plugin() {
     let dir = stub_plugin("runtime-hook", "ok");
     let host = host_with(&["stub.echo"]);
