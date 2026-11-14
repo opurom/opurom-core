@@ -65,7 +65,8 @@ fn additive_ir() -> Json {
                 {
                     "id": 7,
                     "kind": "Button",
-                    "props": {"label": "Go"}, "children": [],
+                    "props": {"label": "Go", "variant": "primary", "tone": "info", "duration": 240},
+                    "children": [],
                     "events": {"tap": {"actions": [
                         {"op": "push", "target": "Settings"},
                         {"op": "validate", "target": "form"}
