@@ -311,6 +311,43 @@ fn input_toggle_and_set_apply_typed_patches() {
 }
 
 #[test]
+fn double_tap_long_press_and_drag_dispatch_to_their_bound_actions() {
+    let state = json!([{ "name": "count", "type": "int", "init": 0 }]);
+    let tree = json!({
+        "id": 0, "kind": "Column", "props": {}, "events": {},
+        "children": [
+            { "id": 1, "kind": "Button", "props": {}, "children": [],
+              "events": { "doubleTap": { "op": "add", "target": "count", "value": 1 } } },
+            { "id": 2, "kind": "Button", "props": {}, "children": [],
+              "events": { "longPress": { "op": "add", "target": "count", "value": 2 } } },
+            { "id": 3, "kind": "Button", "props": {}, "children": [],
+              "events": { "drag": { "op": "add", "target": "count", "value": 3 } } }
+        ]
+    });
+    let mut runtime = Runtime::from_ir_json(&ir_with_tree(state, tree)).unwrap();
+
+    assert_eq!(
+        runtime.dispatch(Event::DoubleTap { node_id: 1 }).unwrap(),
+        vec![patch("count", Value::Int(1))]
+    );
+    assert_eq!(
+        runtime.dispatch(Event::LongPress { node_id: 2 }).unwrap(),
+        vec![patch("count", Value::Int(3))]
+    );
+    assert_eq!(
+        runtime.dispatch(Event::Drag { node_id: 3 }).unwrap(),
+        vec![patch("count", Value::Int(6))]
+    );
+    assert_eq!(runtime.version(), 3);
+
+    // A gesture bound to a node without that handler is an unbound-event error.
+    assert!(matches!(
+        runtime.dispatch(Event::Drag { node_id: 1 }),
+        Err(CoreError::UnboundEvent { .. })
+    ));
+}
+
+#[test]
 fn patches_serialize_as_json() {
     assert_eq!(
         serde_json::to_string(&patch("n", Value::Int(-3))).unwrap(),
