@@ -267,3 +267,79 @@ fn a_locale_switch_never_changes_the_kernel_render_bytes() {
     assert_eq!(layers_of(&plain), layers_of(&switched));
     let _ = fs::remove_file(&path);
 }
+
+/// The compiler emits `set locale: "fr"` as an event action targeting the
+/// reserved `@locale` patch; the loader must admit it without treating it as
+/// a state name (`IR_ADDITIONS.md` §15.4).
+fn ir_with_locale_event(action: Json) -> String {
+    json!({
+        "ir": "0.1.0", "app": "I18nEvent",
+        "state": [{"name": "count", "type": "int", "init": 0}],
+        "locale": {"active": "en", "supported": ["en", "fr", "fr-CH"]},
+        "pages": ["Home"],
+        "tree": {"id": 0, "kind": "Column", "props": {}, "events": {}, "children": [
+            {"id": 1, "kind": "Button", "props": {"label": "switch"}, "children": [],
+             "events": {"tap": action}}
+        ]}
+    })
+    .to_string()
+}
+
+#[test]
+fn a_compiled_set_locale_event_loads_without_entering_the_state_mirror() {
+    let ir = ir_with_locale_event(json!({"op": "set", "target": "@locale", "value": "fr"}));
+    let runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert_eq!(runtime.locale().unwrap().active, "en");
+    assert_eq!(runtime.state("@locale"), None);
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].name, "count");
+}
+
+#[test]
+fn a_set_locale_event_inside_an_action_list_loads_too() {
+    let ir = ir_with_locale_event(json!({"actions": [
+        {"op": "set", "target": "@locale", "value": "fr-CH"},
+        {"op": "add", "target": "count", "value": 1}
+    ]}));
+    let runtime = Runtime::from_ir_json(&ir).unwrap();
+    assert_eq!(runtime.locale().unwrap().active, "en");
+    assert_eq!(runtime.snapshot().len(), 1);
+}
+
+#[test]
+fn a_set_locale_event_with_a_bad_tag_is_rejected_at_load() {
+    let ir = ir_with_locale_event(json!({"op": "set", "target": "@locale", "value": "not a tag!"}));
+    let error = Runtime::from_ir_json(&ir).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidLocale { message } if message.contains("BCP-47")),
+        "{error:?}"
+    );
+    assert!(error.to_string().starts_with("@locale "), "{error}");
+
+    let from =
+        ir_with_locale_event(json!({"op": "set", "target": "@locale", "valueFrom": "count"}));
+    let error = Runtime::from_ir_json(&from).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidIr(message) if message.contains("literal tag")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn other_ops_and_state_targets_still_require_declared_state() {
+    let other_op =
+        ir_with_locale_event(json!({"op": "append", "target": "@locale", "value": "fr"}));
+    let error = Runtime::from_ir_json(&other_op).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidIr(message) if message.contains("not declared in state")),
+        "{error:?}"
+    );
+
+    let ghost = ir_with_locale_event(json!({"op": "set", "target": "ghost", "value": "fr"}));
+    let error = Runtime::from_ir_json(&ghost).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidIr(message) if message.contains("not declared in state")),
+        "{error:?}"
+    );
+}

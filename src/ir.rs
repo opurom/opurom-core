@@ -315,6 +315,31 @@ fn parse_action(
             value_from: None,
         });
     }
+    // `set @locale` is the compiler's event spelling of the reserved locale
+    // patch (`IR_ADDITIONS.md` §15.4). @locale is not a state name, so it must
+    // bypass the declared-state lookup; every other op keeps that lookup.
+    if op == "set" && target == "@locale" {
+        if object.contains_key("valueFrom") {
+            return Err(invalid(format!(
+                "{at}: @locale takes a literal tag, not valueFrom"
+            )));
+        }
+        let tag = object
+            .get("value")
+            .and_then(Json::as_str)
+            .ok_or_else(|| invalid(format!("{at}: @locale value must be a string")))?;
+        if !valid_locale_tag(tag) {
+            return Err(CoreError::InvalidLocale {
+                message: format!("{tag:?} is not a BCP-47 tag"),
+            });
+        }
+        return Ok(Action {
+            op: Op::Set,
+            target,
+            value: Some(Value::Str(tag.to_owned())),
+            value_from: None,
+        });
+    }
     let declared = types
         .get(&target)
         .ok_or_else(|| invalid(format!("{at}.target {target:?} is not declared in state")))?;

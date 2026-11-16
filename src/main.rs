@@ -94,8 +94,8 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
             continue;
         }
         // `patch <json>` carries a host-supplied reserved patch such as
-        // `{"name":"@locale","value":"fr"}`.
-        if let Some(rest) = line.strip_prefix("patch") {
+        // `{"name":"@locale","value":"fr"}`; the space keeps `patches` distinct.
+        if let Some(rest) = line.strip_prefix("patch ") {
             apply_patch(&mut runtime, rest.trim());
             continue;
         }
@@ -107,6 +107,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
             "resource" => print_resource(&runtime),
             "pages" => print_pages(&runtime),
             "memory" => print_memory(&runtime),
+            "patch" => apply_patch(&mut runtime, ""),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
                     Ok(patches) => match serde_json::to_string(&patches) {
