@@ -368,6 +368,60 @@ fn inspector_reads_do_not_record_frames() {
     assert_eq!(runtime.frame_records(None).len(), recorded);
 }
 
+fn ir_routes() -> String {
+    json!({
+        "ir": "0.1.0", "app": "InspectorRoutes",
+        "state": [],
+        "initialRoute": "Home",
+        "routes": {
+            "Home": {"tree": {"id": 0, "kind": "Column", "props": {}, "events": {}, "children": [
+                {"id": 1, "kind": "Text", "props": {"value": "hi"}, "children": [], "events": {}}
+            ]}},
+            "Detail": {"tree": {"id": 2, "kind": "Button", "props": {"label": "go"}, "children": [], "events": {}}}
+        },
+        "theme": {}
+    })
+    .to_string()
+}
+
+#[test]
+fn the_route_render_path_records_one_frame_per_page_call() {
+    let mut runtime = Runtime::from_ir_json(&ir_routes()).unwrap();
+    let home = runtime.route_tree("Home").unwrap();
+    let detail = runtime.route_tree("Detail").unwrap();
+    // An unknown page renders nothing and records nothing.
+    assert!(runtime.route_tree("Ghost").is_none());
+
+    let frames = runtime.frame_records(None);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].seq, 0);
+    assert_eq!(frames[0].frame_ms, 1);
+    assert_eq!(frames[0].budget_ms, 16);
+    // The counts cover the rendered page subtree, not the whole program.
+    assert_eq!(frames[0].nodes, 2);
+    assert_eq!(frames[1].nodes, 1);
+    assert_eq!(frames[1].seq, 1);
+    let _ = (home, detail);
+
+    // Same channel rules as the single-page path: measured frames without a
+    // host frame-budget machine stay partial.
+    let channel = runtime.frames_channel(None);
+    assert_eq!(channel["availability"], "partial");
+    assert_eq!(channel["frames"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn route_frames_are_deterministic_and_exclude_failed_lookups() {
+    let mut a = Runtime::from_ir_json(&ir_routes()).unwrap();
+    let mut b = Runtime::from_ir_json(&ir_routes()).unwrap();
+    let _ = a.route_tree("Home");
+    let _ = a.route_tree("Ghost");
+    let _ = b.route_tree("Home");
+    assert_eq!(a.frame_records(None), b.frame_records(None));
+    assert_eq!(a.frames_channel(None), b.frames_channel(None));
+    assert_eq!(a.route_tree("Home"), b.route_tree("Home"));
+}
+
 fn run_cli(input: &str) -> String {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

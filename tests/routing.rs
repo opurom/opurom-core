@@ -314,7 +314,7 @@ fn route_tree_exposes_per_page_content() {
         "theme": {}
     })
     .to_string();
-    let runtime = Runtime::from_ir_json(&ir).unwrap();
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
     assert_eq!(runtime.route_tree("Home").unwrap().id, 0);
     assert_eq!(runtime.route_tree("Detail").unwrap().kind, "Button");
     assert!(runtime.route_tree("Ghost").is_none());

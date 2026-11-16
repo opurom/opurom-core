@@ -859,17 +859,25 @@ impl Runtime {
 
     /// The content tree of a declared route, after the rendering hook has
     /// observed and decorated it. Returns `None` for an unknown route or a
-    /// single-page program, whose content is `display_list()`.
-    pub fn route_tree(&self, name: &str) -> Option<Node> {
+    /// single-page program, whose content is `display_list()`. Every call is
+    /// one render step of that page, so it records one measured frame whose
+    /// node/effect counts cover the page subtree — the symmetric path to
+    /// `display_list`, never both for the same render.
+    pub fn route_tree(&mut self, name: &str) -> Option<Node> {
         let route = self.routes.iter().find(|route| route.name == name)?;
         let tree = route.tree.clone();
-        Some(match &self.hook {
+        let start_ms = self.clock.now() as i64;
+        let tree = match &self.hook {
             Some(hook) => {
                 hook.observe(&tree);
                 hook.decorate(&tree)
             }
             None => tree,
-        })
+        };
+        let (nodes, effects) = count_render_units(&tree);
+        let frame_ms = self.clock.now() as i64 - start_ms;
+        self.record_measured_frame(start_ms, frame_ms, nodes, effects);
+        Some(tree)
     }
 
     /// The network requests captured through the `network.request` capability,
