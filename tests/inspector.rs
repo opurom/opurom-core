@@ -489,3 +489,118 @@ fn the_cli_answers_memory_and_frames_commands() {
         "{out}"
     );
 }
+
+#[test]
+fn the_cli_feeds_frames_and_the_channel_goes_full() {
+    let mut input = String::new();
+    for seq in 0..20u64 {
+        input.push_str(&format!(
+            "record_frame {{\"startMs\":{},\"frameMs\":{},\"budgetMs\":16,\"nodes\":42,\"effects\":3,\
+             \"report\":{{\"p50Ms\":16,\"p95Ms\":17,\"fpsX10\":590,\"tier\":\"full\"}}}}\n",
+            seq * 16,
+            16 + (seq % 3) as i64
+        ));
+    }
+    input.push_str("frames\nmemory\nquit\n");
+    let out = run_cli(&input);
+    let lines: Vec<&str> = out.lines().collect();
+
+    // Every sample is acknowledged with its assigned ring sequence number.
+    let acks: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("recorded "))
+        .map(|line| *line)
+        .collect();
+    assert_eq!(acks.len(), 20);
+    assert_eq!(acks[0], "recorded seq 0 version 0");
+    assert_eq!(acks[19], "recorded seq 19 version 0");
+
+    // The frames channel answers with the fed ring and the fed report.
+    let frames = lines
+        .iter()
+        .find(|line| line.starts_with("frames {"))
+        .expect("frames line");
+    let (frames_json, _) = frames["frames ".len()..]
+        .rsplit_once(" version")
+        .expect("version suffix");
+    let payload: Json = serde_json::from_str(frames_json).expect("frames json");
+    assert_eq!(payload["availability"], "full");
+    assert_eq!(payload["frames"].as_array().unwrap().len(), 20);
+    assert_eq!(payload["frames"][0]["frameMs"], 16);
+    assert_eq!(payload["frames"][19]["frameMs"], 17);
+    assert_eq!(
+        payload["report"],
+        json!({"p50Ms": 16, "p95Ms": 17, "fpsX10": 590, "tier": "full"})
+    );
+}
+
+#[test]
+fn a_bad_record_frame_payload_is_a_typed_error_and_keeps_running() {
+    let out = run_cli(
+        "record_frame\nrecord_frame not-json\nrecord_frame {\"frameMs\":16}\n\
+         record_frame {\"startMs\":0,\"frameMs\":16,\"budgetMs\":16,\"nodes\":42,\"effects\":3}\n\
+         record_frame {\"startMs\":0,\"frameMs\":16,\"budgetMs\":16,\"nodes\":42,\"effects\":3,\
+         \"report\":{\"p50Ms\":16,\"p95Ms\":17,\"fpsX10\":590,\"tier\":\"full\"}}\nframes\nquit\n",
+    );
+    let lines: Vec<&str> = out.lines().collect();
+
+    // Each malformed payload is one typed error line; the kernel stays alive.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("record_frame expects")),
+        "missing payload: {out}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("payload is not valid JSON")),
+        "bad json: {out}"
+    );
+    let field_errors = lines
+        .iter()
+        .filter(|line| line.starts_with("error:") && line.contains("record_frame."))
+        .count();
+    assert_eq!(field_errors, 2, "missing fields and missing report: {out}");
+
+    // The one valid payload still landed, so the channel went full.
+    let frames = lines
+        .iter()
+        .find(|line| line.starts_with("frames {"))
+        .expect("frames line");
+    assert!(frames.contains("\"availability\":\"full\""), "{frames}");
+}
+
+#[test]
+fn feeding_frames_never_changes_the_rendered_bytes() {
+    // Same IR, same command stream except for the fed frame: the state and
+    // layer outputs must be byte-identical.
+    let plain = run_cli("layers\nstate\nquit\n");
+    let fed = run_cli(&format!(
+        "record_frame {{\"startMs\":0,\"frameMs\":16,\"budgetMs\":16,\"nodes\":1,\"effects\":0,\
+         \"report\":{{\"p50Ms\":16,\"p95Ms\":16,\"fpsX10\":600,\"tier\":\"full\"}}}}\nlayers\nstate\nquit\n"
+    ));
+    let line_of = |out: &str, prefix: &str| -> String {
+        out.lines()
+            .find(|line| line.starts_with(prefix))
+            .expect("expected output line")
+            .to_owned()
+    };
+    assert_eq!(line_of(&plain, "layers "), line_of(&fed, "layers "));
+    assert_eq!(line_of(&plain, "state "), line_of(&fed, "state "));
+}
+
+#[test]
+fn the_frames_channel_availability_flips_partial_to_full() {
+    // Kernel-only renders leave the channel partial (no host report).
+    let mut runtime = Runtime::from_ir_json(&ir_document()).unwrap();
+    runtime.display_list();
+    assert_eq!(runtime.frames_channel(None)["availability"], "partial");
+
+    // A host-fed sample with its machine report flips it to full.
+    runtime.record_frame(sample(9, 16));
+    let channel = runtime.frames_channel(None);
+    assert_eq!(channel["availability"], "full");
+    assert_eq!(channel["frames"].as_array().unwrap().len(), 2);
+    assert_eq!(channel["report"]["tier"], "full");
+}

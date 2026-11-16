@@ -1,5 +1,6 @@
-use opurom_core::{Event, PluginHost, Runtime};
+use opurom_core::{Event, FrameReport, FrameSample, PluginHost, Runtime};
 use serde_json::json;
+use serde_json::Value as Json;
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 
@@ -85,6 +86,11 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
         // `frames` takes an optional argument, so it matches by prefix.
         if let Some(rest) = line.strip_prefix("frames") {
             print_frames(&runtime, rest.trim());
+            continue;
+        }
+        // `record_frame` takes a JSON payload, so it matches by prefix too.
+        if let Some(rest) = line.strip_prefix("record_frame") {
+            feed_frame(&mut runtime, rest.trim());
             continue;
         }
         match line {
@@ -179,6 +185,80 @@ fn print_memory(runtime: &Runtime) {
     }
 }
 
+/// `record_frame <json>`: the host frame loop feeds one measured frame plus
+/// its frame-budget machine snapshot, so the frames channel goes `full`.
+/// Malformed payloads are typed errors on one line; the kernel keeps running.
+fn feed_frame(runtime: &mut Runtime, rest: &str) {
+    if rest.is_empty() {
+        println!("error: record_frame expects `record_frame <json>`");
+        return;
+    }
+    let payload: Json = match serde_json::from_str(rest) {
+        Ok(payload) => payload,
+        Err(error) => {
+            println!("error: record_frame payload is not valid JSON: {error}");
+            return;
+        }
+    };
+    let sample = match parse_frame_sample(&payload) {
+        Ok(sample) => sample,
+        Err(message) => {
+            println!("error: {message}");
+            return;
+        }
+    };
+    runtime.record_frame(sample);
+    let seq = runtime
+        .frame_records(None)
+        .last()
+        .map(|record| record.seq)
+        .unwrap_or(0);
+    println!("recorded seq {seq} version {}", runtime.version());
+}
+
+fn parse_frame_sample(payload: &Json) -> Result<FrameSample, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "record_frame payload must be a JSON object".to_owned())?;
+    let int_field = |key: &str| -> Result<i64, String> {
+        object
+            .get(key)
+            .and_then(Json::as_i64)
+            .ok_or_else(|| format!("record_frame.{key} must be an integer"))
+    };
+    let nodes = u32::try_from(int_field("nodes")?)
+        .map_err(|_| "record_frame.nodes must fit u32".to_owned())?;
+    let effects = u32::try_from(int_field("effects")?)
+        .map_err(|_| "record_frame.effects must fit u32".to_owned())?;
+    let report = object
+        .get("report")
+        .and_then(Json::as_object)
+        .ok_or_else(|| "record_frame.report must be an object".to_owned())?;
+    let report_field = |key: &str| -> Result<i64, String> {
+        report
+            .get(key)
+            .and_then(Json::as_i64)
+            .ok_or_else(|| format!("record_frame.report.{key} must be an integer"))
+    };
+    let tier = report
+        .get("tier")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "record_frame.report.tier must be a string".to_owned())?;
+    Ok(FrameSample {
+        start_ms: int_field("startMs")?,
+        frame_ms: int_field("frameMs")?,
+        budget_ms: int_field("budgetMs")?,
+        nodes,
+        effects,
+        report: FrameReport {
+            p50_ms: report_field("p50Ms")?,
+            p95_ms: report_field("p95Ms")?,
+            fps_x10: report_field("fpsX10")?,
+            tier: tier.to_owned(),
+        },
+    })
+}
+
 fn parse_command(line: &str) -> Result<Event, String> {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
@@ -216,7 +296,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages, memory, frames or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages, memory, frames, record_frame or quit"
         )),
     }
 }
