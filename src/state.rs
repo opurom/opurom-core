@@ -1,5 +1,5 @@
 use crate::error::{CoreError, PluginError};
-use crate::ir::{Action, Ir, Locale, Node, Op, Route};
+use crate::ir::{valid_locale_tag, Action, Ir, Locale, Node, Op, Route};
 use crate::parallel_sched::Clock;
 use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
@@ -260,6 +260,23 @@ fn same_type(left: &Value, right: &Value) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
+fn valid_locale_value(value: &Value) -> Result<String, CoreError> {
+    let tag = match value {
+        Value::Str(tag) => tag.clone(),
+        _ => {
+            return Err(CoreError::InvalidLocale {
+                message: "value must be a string".to_owned(),
+            })
+        }
+    };
+    if !valid_locale_tag(&tag) {
+        return Err(CoreError::InvalidLocale {
+            message: format!("{tag:?} is not a BCP-47 tag"),
+        });
+    }
+    Ok(tag)
+}
+
 fn state_value(
     values: &[(String, Value)],
     index: &HashMap<String, usize>,
@@ -299,6 +316,20 @@ fn apply_action(
         return Ok(Patch {
             name: "@nav".to_string(),
             value: Value::Str("..".to_string()),
+        });
+    }
+    // `set @locale` is the compiler's event spelling of the reserved locale
+    // patch (`IR_ADDITIONS.md` §15.4): like `@nav`, it is a signal the kernel
+    // emits, never a state write. The dispatch commit applies the switch to
+    // the held locale without mirroring it as state.
+    if action.op == Op::Set && action.target == "@locale" {
+        return Ok(Patch {
+            name: "@locale".to_string(),
+            value: Value::Str(valid_locale_value(action.value.as_ref().ok_or_else(
+                || CoreError::InvalidLocale {
+                    message: "value must be a string".to_owned(),
+                },
+            )?)?),
         });
     }
     let position = *index
@@ -592,39 +623,35 @@ impl Runtime {
                 patch.name
             )));
         }
-        let tag = match &patch.value {
-            Value::Str(tag) => tag.clone(),
-            _ => {
-                return Err(CoreError::InvalidLocale {
-                    message: "value must be a string".to_owned(),
-                })
-            }
-        };
-        let supported = match &self.locale {
-            Some(locale) => {
-                if !locale.supported.contains(&tag) {
-                    return Err(CoreError::InvalidLocale {
-                        message: format!(
-                            "{tag:?} is not supported; expected {}",
-                            locale.supported.join(", ")
-                        ),
-                    });
-                }
-                locale.supported.clone()
-            }
-            None => {
-                return Err(CoreError::InvalidLocale {
-                    message: format!("{tag:?} requires a declared locale"),
-                })
-            }
-        };
+        let tag = self.validate_locale_switch(&patch.value)?;
         let version = self.next_version()?;
-        self.locale = Some(Locale {
-            active: tag,
-            supported,
-        });
+        self.set_active_locale(tag);
         self.version = version;
         Ok(patch.clone())
+    }
+
+    /// Validates a locale switch against the declared supported set; both the
+    /// host patch command and dispatched events use this one rule.
+    fn validate_locale_switch(&self, value: &Value) -> Result<String, CoreError> {
+        let tag = valid_locale_value(value)?;
+        match &self.locale {
+            Some(locale) if locale.supported.contains(&tag) => Ok(tag),
+            Some(locale) => Err(CoreError::InvalidLocale {
+                message: format!(
+                    "{tag:?} is not supported; expected {}",
+                    locale.supported.join(", ")
+                ),
+            }),
+            None => Err(CoreError::InvalidLocale {
+                message: format!("{tag:?} requires a declared locale"),
+            }),
+        }
+    }
+
+    fn set_active_locale(&mut self, tag: String) {
+        if let Some(locale) = &mut self.locale {
+            locale.active = tag;
+        }
     }
 
     /// Registers kernel-owned input editing state for a node.
@@ -796,8 +823,19 @@ impl Runtime {
                 text.as_deref(),
             )?);
         }
+        // `@locale` is a reserved signal: validate it before the commit, then
+        // switch the held locale atomically with the state/version commit. It
+        // never enters `working`, so it cannot appear in the state mirror.
+        let locale_tags: Vec<String> = patches
+            .iter()
+            .filter(|patch| patch.name == "@locale")
+            .map(|patch| self.validate_locale_switch(&patch.value))
+            .collect::<Result<_, _>>()?;
         let version = self.next_version()?;
         self.values = working;
+        for tag in locale_tags {
+            self.set_active_locale(tag);
+        }
         self.version = version;
         self.record_memory_history();
         Ok(patches)

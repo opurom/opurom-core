@@ -343,3 +343,78 @@ fn other_ops_and_state_targets_still_require_declared_state() {
         "{error:?}"
     );
 }
+
+#[test]
+fn a_dispatched_set_locale_event_emits_the_reserved_patch_and_switches() {
+    // Same event shape the lang compiler emits for `set locale: "fr"`.
+    let ir = ir_with_locale_event(json!({"op": "set", "target": "@locale", "value": "fr"}));
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let patches = runtime.dispatch(Event::Tap { node_id: 1 }).unwrap();
+
+    assert_eq!(
+        patches,
+        vec![Patch {
+            name: "@locale".to_owned(),
+            value: Value::Str("fr".to_owned()),
+        }]
+    );
+    assert_eq!(runtime.version(), 1);
+    assert_eq!(runtime.locale().unwrap().active, "fr");
+    // The reserved patch goes to the consumer, never into the state mirror.
+    assert_eq!(runtime.state("@locale"), None);
+    assert_eq!(runtime.snapshot().len(), 1);
+    assert_eq!(runtime.snapshot()[0].name, "count");
+}
+
+#[test]
+fn a_dispatched_locale_switch_shares_one_action_list_with_state_ops() {
+    let ir = ir_with_locale_event(json!({"actions": [
+        {"op": "set", "target": "@locale", "value": "fr-CH"},
+        {"op": "add", "target": "count", "value": 1}
+    ]}));
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let patches = runtime.dispatch(Event::Tap { node_id: 1 }).unwrap();
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[0].name, "@locale");
+    assert_eq!(patches[1].name, "count");
+    assert_eq!(patches[1].value, Value::Int(1));
+    assert_eq!(runtime.locale().unwrap().active, "fr-CH");
+    assert_eq!(runtime.state("count"), Some(&Value::Int(1)));
+    assert_eq!(runtime.version(), 1);
+    assert_eq!(runtime.snapshot().len(), 1);
+}
+
+#[test]
+fn an_unsupported_tag_at_dispatch_is_a_typed_error_without_mutation() {
+    // `de` is a valid BCP-47 tag but not in this program's supported list.
+    let ir = ir_with_locale_event(json!({"op": "set", "target": "@locale", "value": "de"}));
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let error = runtime.dispatch(Event::Tap { node_id: 1 }).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidLocale { message } if message.contains("not supported") && message.contains("de")),
+        "{error:?}"
+    );
+    assert_eq!(runtime.locale().unwrap().active, "en");
+    assert_eq!(runtime.version(), 0);
+    assert_eq!(runtime.state("count"), Some(&Value::Int(0)));
+}
+
+#[test]
+fn a_locale_event_in_a_program_without_a_locale_errors_at_dispatch() {
+    let ir = json!({
+        "ir": "0.1.0", "app": "NoLocale", "state": [],
+        "pages": ["Home"],
+        "tree": {"id": 0, "kind": "Column", "props": {}, "events": {}, "children": [
+            {"id": 1, "kind": "Button", "props": {}, "children": [],
+             "events": {"tap": {"op": "set", "target": "@locale", "value": "fr"}}}
+        ]}
+    })
+    .to_string();
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let error = runtime.dispatch(Event::Tap { node_id: 1 }).unwrap_err();
+    assert!(
+        matches!(&error, CoreError::InvalidLocale { message } if message.contains("requires a declared locale")),
+        "{error:?}"
+    );
+    assert_eq!(runtime.version(), 0);
+}

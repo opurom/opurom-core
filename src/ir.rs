@@ -641,7 +641,7 @@ fn parse_node(
 
 /// BCP-47 primary subtag plus optional 2–8 char subtags: the shape used by
 /// `locale.active` and `locale.supported` (`IR_ADDITIONS.md` §15.1).
-fn valid_locale_tag(tag: &str) -> bool {
+pub(crate) fn valid_locale_tag(tag: &str) -> bool {
     let mut parts = tag.split('-');
     let Some(primary) = parts.next() else {
         return false;
