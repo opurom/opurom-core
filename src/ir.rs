@@ -63,6 +63,12 @@ pub struct StateDecl {
     pub value: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locale {
+    pub active: String,
+    pub supported: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub name: String,
@@ -90,6 +96,8 @@ pub struct Ir {
     /// Initial route name (None for a single-page program).
     pub initial_route: Option<String>,
     pub theme: Json,
+    /// Optional root locale object (IR_ADDITIONS §15.1); absent in older IR.
+    pub locale: Option<Locale>,
 }
 
 fn invalid(message: impl std::fmt::Display) -> CoreError {
@@ -606,6 +614,52 @@ fn parse_node(
     })
 }
 
+/// BCP-47 primary subtag plus optional 2–8 char subtags: the shape used by
+/// `locale.active` and `locale.supported` (`IR_ADDITIONS.md` §15.1).
+fn valid_locale_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    (2..=3).contains(&primary.len())
+        && primary.bytes().all(|byte| byte.is_ascii_lowercase())
+        && parts.all(|part| {
+            (2..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+fn parse_locale(json: &Json) -> Result<Locale, CoreError> {
+    let object = json
+        .as_object()
+        .ok_or_else(|| invalid("root.locale must be an object"))?;
+    let active = string_field(object, "active", "root.locale")?;
+    let raw = object
+        .get("supported")
+        .and_then(Json::as_array)
+        .ok_or_else(|| invalid("root.locale.supported must be an array"))?;
+    if raw.is_empty() {
+        return Err(invalid("root.locale.supported must not be empty"));
+    }
+    let mut supported = Vec::with_capacity(raw.len());
+    for (i, item) in raw.iter().enumerate() {
+        let tag = item
+            .as_str()
+            .ok_or_else(|| invalid(format!("root.locale.supported[{i}] must be a string")))?;
+        if !valid_locale_tag(tag) {
+            return Err(invalid(format!(
+                "root.locale.supported[{i}] {tag:?} is not a locale tag"
+            )));
+        }
+        supported.push(tag.to_owned());
+    }
+    if !supported.contains(&active) {
+        return Err(invalid(format!(
+            "root.locale.active {active:?} is not in supported"
+        )));
+    }
+    Ok(Locale { active, supported })
+}
+
 impl Ir {
     pub fn parse(json: &str) -> Result<Ir, CoreError> {
         let root: Json =
@@ -799,6 +853,10 @@ impl Ir {
             }
             Some(_) => return Err(invalid("root.theme must be an object")),
         };
+        let locale = match object.get("locale") {
+            None => None,
+            Some(json) => Some(parse_locale(json)?),
+        };
         Ok(Ir {
             version,
             app,
@@ -808,6 +866,7 @@ impl Ir {
             routes,
             initial_route,
             theme,
+            locale,
         })
     }
 }

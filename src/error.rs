@@ -23,6 +23,10 @@ pub enum CoreError {
         index: i64,
         len: usize,
     },
+    /// An `@locale` patch failed validation (`IR_ADDITIONS.md` §15.4).
+    InvalidLocale {
+        message: String,
+    },
     Overflow {
         name: String,
     },
@@ -51,6 +55,7 @@ impl fmt::Display for CoreError {
                     "index {index} is out of bounds for list {name} of length {len}"
                 )
             }
+            Self::InvalidLocale { message } => write!(f, "@locale {message}"),
             Self::Overflow { name } => write!(f, "integer overflow while updating {name}"),
             Self::Plugin(error) => write!(f, "plugin error: {error}"),
             Self::Resource(error) => write!(f, "resource error: {error}"),

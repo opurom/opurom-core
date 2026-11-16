@@ -1,4 +1,4 @@
-use opurom_core::{Event, FrameReport, FrameSample, PluginHost, Runtime};
+use opurom_core::{Event, FrameReport, FrameSample, Patch, PluginHost, Runtime, Value};
 use serde_json::json;
 use serde_json::Value as Json;
 use std::io::{self, BufRead};
@@ -91,6 +91,12 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
         // `record_frame` takes a JSON payload, so it matches by prefix too.
         if let Some(rest) = line.strip_prefix("record_frame") {
             feed_frame(&mut runtime, rest.trim());
+            continue;
+        }
+        // `patch <json>` carries a host-supplied reserved patch such as
+        // `{"name":"@locale","value":"fr"}`.
+        if let Some(rest) = line.strip_prefix("patch") {
+            apply_patch(&mut runtime, rest.trim());
             continue;
         }
         match line {
@@ -216,6 +222,55 @@ fn feed_frame(runtime: &mut Runtime, rest: &str) {
     println!("recorded seq {seq} version {}", runtime.version());
 }
 
+/// `patch <json>`: applies one host-supplied patch. Reserved names such as
+/// `@locale` are validated by the kernel; bad values are one typed error line
+/// and the REPL keeps reading.
+fn apply_patch(runtime: &mut Runtime, rest: &str) {
+    if rest.is_empty() {
+        println!("error: patch expects `patch <json>`");
+        return;
+    }
+    let patch = match parse_patch(rest) {
+        Ok(patch) => patch,
+        Err(message) => {
+            println!("error: {message}");
+            return;
+        }
+    };
+    match runtime.apply_patch(&patch) {
+        Ok(applied) => match serde_json::to_string(&applied) {
+            Ok(json) => println!("patch {json} version {}", runtime.version()),
+            Err(error) => println!("error: {error}"),
+        },
+        Err(error) => println!("error: {error}"),
+    }
+}
+
+fn parse_patch(text: &str) -> Result<Patch, String> {
+    let payload: Json = serde_json::from_str(text)
+        .map_err(|error| format!("patch payload is not valid JSON: {error}"))?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "patch payload must be a JSON object".to_owned())?;
+    let name = object
+        .get("name")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "patch.name must be a string".to_owned())?;
+    let value = match object.get("value") {
+        Some(Json::String(text)) => Value::Str(text.clone()),
+        Some(Json::Number(number)) => number
+            .as_i64()
+            .map(Value::Int)
+            .ok_or_else(|| "patch.value must be an integer".to_owned())?,
+        Some(Json::Bool(flag)) => Value::Bool(*flag),
+        _ => return Err("patch.value must be a string, integer or bool".to_owned()),
+    };
+    Ok(Patch {
+        name: name.to_owned(),
+        value,
+    })
+}
+
 fn parse_frame_sample(payload: &Json) -> Result<FrameSample, String> {
     let object = payload
         .as_object()
@@ -296,7 +351,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages, memory, frames, record_frame or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages, memory, frames, record_frame, patch or quit"
         )),
     }
 }

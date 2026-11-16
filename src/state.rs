@@ -1,5 +1,5 @@
 use crate::error::{CoreError, PluginError};
-use crate::ir::{Action, Ir, Node, Op, Route};
+use crate::ir::{Action, Ir, Locale, Node, Op, Route};
 use crate::parallel_sched::Clock;
 use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
@@ -156,6 +156,7 @@ pub struct Runtime {
     memory_history: VecDeque<(u64, usize)>,
     image_stats: Option<(u64, u64)>,
     clock: ClockBox,
+    locale: Option<Locale>,
     version: u64,
     tree: Node,
     pages: Vec<String>,
@@ -558,6 +559,7 @@ impl Runtime {
             memory_history: VecDeque::new(),
             image_stats: None,
             clock: ClockBox(Arc::new(TickClock::default())),
+            locale: ir.locale,
             version: 0,
             tree,
             pages,
@@ -572,6 +574,57 @@ impl Runtime {
     pub fn with_rendering_hook(mut self, hook: Arc<dyn RenderingHook>) -> Self {
         self.hook = Some(hook);
         self
+    }
+
+    /// The declared locale object, or `None` for an IR without one.
+    pub fn locale(&self) -> Option<&Locale> {
+        self.locale.as_ref()
+    }
+
+    /// Applies one host-supplied patch. `@locale` is a reserved patch like
+    /// `@nav` and `@validate`: it never enters the state mirror, but it does
+    /// advance the version. An unsupported tag is a typed error and leaves
+    /// both the locale and the version untouched.
+    pub fn apply_patch(&mut self, patch: &Patch) -> Result<Patch, CoreError> {
+        if patch.name != "@locale" {
+            return Err(CoreError::InvalidIr(format!(
+                "unsupported reserved patch {:?}",
+                patch.name
+            )));
+        }
+        let tag = match &patch.value {
+            Value::Str(tag) => tag.clone(),
+            _ => {
+                return Err(CoreError::InvalidLocale {
+                    message: "value must be a string".to_owned(),
+                })
+            }
+        };
+        let supported = match &self.locale {
+            Some(locale) => {
+                if !locale.supported.contains(&tag) {
+                    return Err(CoreError::InvalidLocale {
+                        message: format!(
+                            "{tag:?} is not supported; expected {}",
+                            locale.supported.join(", ")
+                        ),
+                    });
+                }
+                locale.supported.clone()
+            }
+            None => {
+                return Err(CoreError::InvalidLocale {
+                    message: format!("{tag:?} requires a declared locale"),
+                })
+            }
+        };
+        let version = self.next_version()?;
+        self.locale = Some(Locale {
+            active: tag,
+            supported,
+        });
+        self.version = version;
+        Ok(patch.clone())
     }
 
     /// Registers kernel-owned input editing state for a node.
