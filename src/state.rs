@@ -6,7 +6,7 @@ use crate::resource::{ResourceError, ResourceManager};
 use crate::text_input::{TextInputState, DEFAULT_TEXT_INPUT_CAPACITY};
 use serde_core::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::Value as Json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -157,6 +157,9 @@ pub struct Runtime {
     image_stats: Option<(u64, u64)>,
     clock: ClockBox,
     locale: Option<Locale>,
+    /// State keys changed by the last committed dispatch/patch: deduplicated,
+    /// lexicographic, empty when only reserved signals were emitted.
+    changed_keys: Vec<String>,
     version: u64,
     tree: Node,
     pages: Vec<String>,
@@ -591,6 +594,7 @@ impl Runtime {
             image_stats: None,
             clock: ClockBox(Arc::new(TickClock::default())),
             locale: ir.locale,
+            changed_keys: Vec::new(),
             version: 0,
             tree,
             pages,
@@ -617,17 +621,52 @@ impl Runtime {
     /// advance the version. An unsupported tag is a typed error and leaves
     /// both the locale and the version untouched.
     pub fn apply_patch(&mut self, patch: &Patch) -> Result<Patch, CoreError> {
-        if patch.name != "@locale" {
+        if patch.name == "@locale" {
+            let tag = self.validate_locale_switch(&patch.value)?;
+            let version = self.next_version()?;
+            self.set_active_locale(tag);
+            self.version = version;
+            // A reserved signal is not a state key.
+            self.commit_changed_keys(Vec::<String>::new());
+            return Ok(patch.clone());
+        }
+        let Some(&position) = self.index.get(&patch.name) else {
             return Err(CoreError::InvalidIr(format!(
                 "unsupported reserved patch {:?}",
                 patch.name
             )));
+        };
+        if !same_type(&self.values[position].1, &patch.value) {
+            return Err(CoreError::TypeMismatch {
+                name: patch.name.clone(),
+                expected: self.values[position].1.type_name(),
+            });
         }
-        let tag = self.validate_locale_switch(&patch.value)?;
         let version = self.next_version()?;
-        self.set_active_locale(tag);
+        self.values[position].1 = patch.value.clone();
         self.version = version;
+        self.record_memory_history();
+        self.commit_changed_keys([patch.name.clone()]);
         Ok(patch.clone())
+    }
+
+    /// The ordered, deduplicated state keys changed by the last committed
+    /// dispatch or host patch. Lexicographic order makes the set stable
+    /// across runs; reserved `@` signals are never state keys. An event with
+    /// no state writes, or a failed/no-op dispatch, leaves an empty set.
+    pub fn last_changed_keys(&self) -> &[String] {
+        &self.changed_keys
+    }
+
+    /// Collects the changed state keys of one commit: only declared state
+    /// names, deduplicated and sorted by name (`INCREMENTAL_RENDER_PIPELINE`
+    /// §3). Reserved patches such as `@locale`/`@nav` are excluded.
+    fn commit_changed_keys(&mut self, names: impl IntoIterator<Item = String>) {
+        let keys: BTreeSet<String> = names
+            .into_iter()
+            .filter(|name| !name.starts_with('@') && self.index.contains_key(name))
+            .collect();
+        self.changed_keys = keys.into_iter().collect();
     }
 
     /// Validates a locale switch against the declared supported set; both the
@@ -772,6 +811,7 @@ impl Runtime {
         if let Event::Input { node_id, text } = &event {
             if self.text_inputs.contains_key(node_id) {
                 if self.hidden(*node_id) {
+                    self.commit_changed_keys(Vec::<String>::new());
                     return Ok(Vec::new());
                 }
                 let version = self.next_version()?;
@@ -786,6 +826,7 @@ impl Runtime {
                     .map_err(CoreError::TextInput)?;
                 self.version = version;
                 self.record_memory_history();
+                self.commit_changed_keys(Vec::<String>::new());
                 return Ok(patches);
             }
         }
@@ -808,9 +849,11 @@ impl Runtime {
         // A hidden node is inert: a bound event must not mutate state behind
         // a false condition.
         if self.hidden(node_id) {
+            self.commit_changed_keys(Vec::<String>::new());
             return Ok(Vec::new());
         }
         if actions.is_empty() {
+            self.commit_changed_keys(Vec::<String>::new());
             return Ok(Vec::new());
         }
         let mut working = self.values.clone();
@@ -838,6 +881,7 @@ impl Runtime {
         }
         self.version = version;
         self.record_memory_history();
+        self.commit_changed_keys(patches.iter().map(|patch| patch.name.clone()));
         Ok(patches)
     }
 
