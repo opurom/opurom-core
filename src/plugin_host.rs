@@ -48,6 +48,9 @@ struct Manifest {
     name: String,
     version: String,
     capabilities: Vec<String>,
+    /// Names of the plugins this one depends on (PLUGIN_PROTOCOL.md); the
+    /// registry pins one version per name, so names carry no ranges.
+    dependencies: Vec<String>,
     dir: PathBuf,
     entry: PathBuf,
 }
@@ -340,17 +343,178 @@ impl PluginHost {
     pub fn load(&self, dir: impl AsRef<Path>) -> Result<PluginInfo, PluginError> {
         guard(|| {
             let manifest = parse_manifest(dir.as_ref())?;
-            let mut loaded = LoadedPlugin::new(manifest.clone(), self.breaker.clone());
-            loaded.restart(self.timeout)?;
-            let info = loaded.info();
-            let entry = Arc::new(Mutex::new(loaded));
-            let mut plugins = lock(&self.plugins);
-            if let Some(previous) = plugins.insert(manifest.name.clone(), entry) {
-                let mut previous = lock(&previous);
-                previous.disable();
-            }
-            Ok(info)
+            // The manifest is this plugin's own starting point: its declared
+            // dependencies must already be present in this host's registry.
+            self.validate_graph(&[(manifest.clone(), true)])?;
+            self.spawn_manifest(manifest)
         })
+    }
+
+    /// Loads a batch of plugins in one call, validating the dependency graph
+    /// across the whole batch first (`PLUGIN_PROTOCOL.md`): every declared
+    /// dependency exists in the batch or is already loaded, cycles are
+    /// rejected with the cycle path, and plugins spawn in dependency order.
+    /// A plugin whose dependency failed to load is not spawned.
+    pub fn load_all<I, P>(&self, dirs: I) -> Result<Vec<PluginInfo>, PluginError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        guard(|| {
+            let mut manifests = Vec::new();
+            for dir in dirs {
+                let manifest = parse_manifest(dir.as_ref())?;
+                if manifests
+                    .iter()
+                    .any(|(existing, _): &(Manifest, bool)| existing.name == manifest.name)
+                {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin {:?} is listed twice in one load batch",
+                        manifest.name
+                    )));
+                }
+                manifests.push((manifest, false));
+            }
+            self.validate_graph(&manifests)?;
+            let order = self.load_order(&manifests)?;
+            let mut loaded_names = Vec::with_capacity(order.len());
+            for position in order {
+                // A dependency can only be missing because an earlier spawn
+                // failed (cycles and absent names were rejected up front), so
+                // this plugin is skipped rather than spawned with a dangling
+                // dependency.
+                if let Err(PluginError::DependencyFailed { .. }) =
+                    self.spawn_manifest(manifests[position].0.clone())
+                {
+                    continue;
+                }
+                loaded_names.push(manifests[position].0.name.clone());
+            }
+            // Report the batch's own load order, not the registry's sort.
+            let all = self.list()?;
+            Ok(loaded_names
+                .iter()
+                .filter_map(|name| all.iter().find(|info| &info.name == name).cloned())
+                .collect())
+        })
+    }
+
+    /// Validates the manifest graph before any spawn: every dependency exists
+    /// (`in_batch` or already loaded), no cycles, and no dependency on a
+    /// plugin already marked failed in this batch.
+    fn validate_graph(&self, manifests: &[(Manifest, bool)]) -> Result<(), PluginError> {
+        let batch: HashSet<&str> = manifests.iter().map(|(m, _)| m.name.as_str()).collect();
+        let loaded: HashSet<String> = lock(&self.plugins).keys().cloned().collect();
+        for (manifest, failed) in manifests {
+            if *failed {
+                continue;
+            }
+            for dependency in &manifest.dependencies {
+                if !batch.contains(dependency.as_str()) && !loaded.contains(dependency) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin {:?} declares dependency {dependency:?}, which is not in the registry",
+                        manifest.name
+                    )));
+                }
+            }
+        }
+        // Cycle detection over the batch, dependency edges only.
+        let mut state: HashMap<&str, Visit> = HashMap::new();
+        for (manifest, _) in manifests {
+            let mut path = Vec::new();
+            self.detect_cycle(manifest, manifests, &mut state, &mut path)?;
+        }
+        Ok(())
+    }
+
+    fn detect_cycle<'a>(
+        &self,
+        manifest: &'a Manifest,
+        manifests: &'a [(Manifest, bool)],
+        state: &mut HashMap<&'a str, Visit>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), PluginError> {
+        match state.get(manifest.name.as_str()) {
+            Some(Visit::Done) => return Ok(()),
+            Some(Visit::OnStack) => {
+                // The cycle is the on-stack tail from the repeated name.
+                let start = path
+                    .iter()
+                    .position(|name| *name == manifest.name.as_str())
+                    .unwrap_or(0);
+                let mut cycle: Vec<&str> = path[start..].to_vec();
+                cycle.push(manifest.name.as_str());
+                return Err(PluginError::InvalidManifest(format!(
+                    "dependency cycle: {}",
+                    cycle.join(" -> ")
+                )));
+            }
+            None => {}
+        }
+        state.insert(manifest.name.as_str(), Visit::OnStack);
+        path.push(manifest.name.as_str());
+        for dependency in &manifest.dependencies {
+            let Some((child, _)) = manifests.iter().find(|(m, _)| &m.name == dependency) else {
+                // Loaded-only dependencies cannot close a cycle in this batch.
+                continue;
+            };
+            self.detect_cycle(child, manifests, state, path)?;
+        }
+        path.pop();
+        state.insert(manifest.name.as_str(), Visit::Done);
+        Ok(())
+    }
+
+    /// Topological order (dependencies first) of the batch indices that are
+    /// still eligible to spawn; batch order breaks ties deterministically.
+    fn load_order(&self, manifests: &[(Manifest, bool)]) -> Result<Vec<usize>, PluginError> {
+        let mut order = Vec::with_capacity(manifests.len());
+        let mut emitted: HashSet<&str> = HashSet::new();
+        let mut pending: Vec<usize> = (0..manifests.len()).filter(|&i| !manifests[i].1).collect();
+        while !pending.is_empty() {
+            let pick = pending.iter().position(|&i| {
+                manifests[i].0.dependencies.iter().all(|dependency| {
+                    // A dependency is ready when it already spawned in this
+                    // pass or was loaded before this batch.
+                    emitted.contains(dependency.as_str())
+                        || !manifests.iter().any(|(m, _)| &m.name == dependency)
+                })
+            });
+            let Some(pick) = pick else {
+                return Err(PluginError::InvalidManifest(
+                    "dependency order is unsatisfiable".to_owned(),
+                ));
+            };
+            let index = pending.remove(pick);
+            emitted.insert(manifests[index].0.name.as_str());
+            order.push(index);
+        }
+        Ok(order)
+    }
+
+    /// Spawns one already-parsed manifest: restart the process, handshake,
+    /// then register it. A declared dependency that is absent from this
+    /// host's registry fails as `DependencyFailed` so a batch can skip its
+    /// dependers without spawning them.
+    fn spawn_manifest(&self, manifest: Manifest) -> Result<PluginInfo, PluginError> {
+        let mut plugins = lock(&self.plugins);
+        for dependency in &manifest.dependencies {
+            if !plugins.contains_key(dependency) {
+                return Err(PluginError::DependencyFailed {
+                    plugin: manifest.name.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
+        }
+        let mut loaded = LoadedPlugin::new(manifest.clone(), self.breaker.clone());
+        loaded.restart(self.timeout)?;
+        let info = loaded.info();
+        let entry = Arc::new(Mutex::new(loaded));
+        if let Some(previous) = plugins.insert(manifest.name.clone(), entry) {
+            let mut previous = lock(&previous);
+            previous.disable();
+        }
+        Ok(info)
     }
 
     /// Routes a capability to the single active plugin that advertised it.
@@ -524,6 +688,11 @@ fn handshake_timeout(timeout: Duration) -> Duration {
     }
 }
 
+enum Visit {
+    OnStack,
+    Done,
+}
+
 fn parse_manifest(dir: &Path) -> Result<Manifest, PluginError> {
     let dir = fs::canonicalize(dir)
         .map_err(|error| PluginError::Io(format!("{}: {error}", dir.display())))?;
@@ -588,10 +757,49 @@ fn parse_manifest(dir: &Path) -> Result<Manifest, PluginError> {
         capabilities.push(capability.to_owned());
     }
     let entry = validate_entry(&dir, &entry)?;
+    let dependencies = match object.get("dependencies") {
+        None => Vec::new(),
+        Some(Json::Array(items)) => {
+            let mut seen = HashSet::new();
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                let dependency = item.as_str().ok_or_else(|| {
+                    PluginError::InvalidManifest(
+                        "each dependency must be a plugin-name string".to_owned(),
+                    )
+                })?;
+                // A dependency is another plugin name, so it obeys the same
+                // [a-z][a-z0-9-]{1,31} grammar the manifest name does.
+                if !valid_name(dependency) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "dependency {dependency:?} is not a valid plugin name"
+                    )));
+                }
+                if dependency == name {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin {name:?} cannot depend on itself"
+                    )));
+                }
+                if !seen.insert(dependency.to_owned()) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "duplicate dependency {dependency:?}"
+                    )));
+                }
+                names.push(dependency.to_owned());
+            }
+            names
+        }
+        Some(_) => {
+            return Err(PluginError::InvalidManifest(
+                "dependencies must be an array of plugin names".to_owned(),
+            ))
+        }
+    };
     Ok(Manifest {
         name,
         version,
         capabilities,
+        dependencies,
         dir,
         entry,
     })
