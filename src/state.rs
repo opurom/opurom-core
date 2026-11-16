@@ -17,6 +17,11 @@ pub const FRAME_RING: usize = 200;
 pub const NETWORK_RING: usize = 200;
 pub const MEMORY_HISTORY_RING: usize = 50;
 
+/// The nominal 60 fps budget the kernel records for its own render calls.
+/// A host that owns a frame-budget machine passes its real target through
+/// `record_frame` instead.
+pub const DEFAULT_FRAME_BUDGET_MS: i64 = 16;
+
 /// One frame record: the host frame loop hands the kernel the measured frame
 /// plus its frame-budget machine snapshot; the kernel assigns `seq` and keeps
 /// the last `FRAME_RING` records.
@@ -590,9 +595,22 @@ impl Runtime {
     }
 
     /// The display list handed to the renderer: the parsed IR tree, after the
-    /// registered rendering hook has observed and decorated it. Without a
-    /// hook this is the parsed tree unchanged.
-    pub fn display_list(&self) -> Node {
+    /// registered rendering hook has observed and decorated it. Every call is
+    /// one render step, so the kernel records one measured frame per call:
+    /// the call duration on the host clock, the nominal budget and the
+    /// rendered node/effect counts. The output itself is unchanged.
+    pub fn display_list(&mut self) -> Node {
+        let start_ms = self.clock.now() as i64;
+        let list = self.decorated_list();
+        let frame_ms = self.clock.now() as i64 - start_ms;
+        let (nodes, effects) = count_render_units(&list);
+        self.record_measured_frame(start_ms, frame_ms, nodes, effects);
+        list
+    }
+
+    /// The decorated tree without the render-step bookkeeping: the pure path
+    /// the inspectors and non-render consumers use.
+    fn decorated_list(&self) -> Node {
         let list = self.tree.clone();
         if let Some(hook) = &self.hook {
             hook.observe(&list);
@@ -607,7 +625,7 @@ impl Runtime {
     /// from the node props (shadow, glass, gradient, opacity and declared
     /// effects), matching the CLI inspect layer view.
     pub fn layer_records(&self) -> Json {
-        let list = self.display_list();
+        let list = self.decorated_list();
         let mut records = Vec::new();
         collect_layers(&list, &mut records);
         Json::Array(records)
@@ -926,6 +944,28 @@ impl Runtime {
         self.frame_report = Some(sample.report);
     }
 
+    /// A kernel-measured render step: the same ring, but no frame-budget
+    /// report — that machine is host-owned, so the channel stays `partial`
+    /// until a host supplies one rather than fabricating a tier.
+    fn record_measured_frame(&mut self, start_ms: i64, frame_ms: i64, nodes: u32, effects: u32) {
+        let seq = self.frame_seq;
+        self.frame_seq += 1;
+        self.frames.push_back(FrameRecord {
+            seq,
+            start_ms,
+            frame_ms,
+            budget_ms: DEFAULT_FRAME_BUDGET_MS,
+            // The tier comes from the host frame-budget machine; a
+            // kernel-measured frame has none yet, so the field stays empty.
+            tier: String::new(),
+            nodes,
+            effects,
+        });
+        if self.frames.len() > FRAME_RING {
+            self.frames.pop_front();
+        }
+    }
+
     /// Frame records after `since_seq` (paging: strictly greater), or every
     /// held record when no sequence number is given.
     pub fn frame_records(&self, since_seq: Option<u64>) -> Vec<FrameRecord> {
@@ -942,12 +982,14 @@ impl Runtime {
     }
 
     /// The frames channel response for the `frames [sinceSeq]` protocol
-    /// command: records, the held report and channel availability. Without a
-    /// recorded frame the channel is `absent`, never a fabricated report.
+    /// command: records, the held report and channel availability. With no
+    /// recorded frame the channel is `absent`; kernel-measured frames without
+    /// a host frame-budget report are `partial` — never a fabricated tier.
     pub fn frames_channel(&self, since_seq: Option<u64>) -> Json {
-        let (availability, reason) = match &self.frame_report {
-            Some(_) => ("full", ""),
-            None => ("absent", "no frame records yet"),
+        let (availability, reason) = match (&self.frame_report, self.frames.is_empty()) {
+            (_, true) => ("absent", "no frame records yet"),
+            (Some(_), false) => ("full", ""),
+            (None, false) => ("partial", "no frame-budget report from the host"),
         };
         serde_json::json!({
             "frames": self
@@ -989,6 +1031,19 @@ impl Runtime {
             .map(|json| json.len())
             .unwrap_or(0)
     }
+}
+
+/// The rendered node count and the total effect-layer count of a display
+/// list, the per-frame units the frame record carries.
+fn count_render_units(node: &Node) -> (u32, u32) {
+    let mut nodes = 1u32;
+    let mut effects = effect_layers(node).as_array().map(Vec::len).unwrap_or(0) as u32;
+    for child in &node.children {
+        let (child_nodes, child_effects) = count_render_units(child);
+        nodes += child_nodes;
+        effects += child_effects;
+    }
+    (nodes, effects)
 }
 
 /// The frame record JSON shape from `INSPECTOR_DATA_PLANE.md`. `phaseMs` is

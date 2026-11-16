@@ -17,7 +17,7 @@ fn ir_document() -> String {
         "ir": "0.1.0", "app": "Inspector",
         "state": [{"name": "count", "type": "int", "init": 0}],
         "pages": ["Home"],
-        "tree": {"id": 0, "kind": "Column", "props": {}, "events": {}, "children": [
+        "tree": {"id": 0, "kind": "Column", "props": {"opacity": 0.9}, "events": {}, "children": [
             {"id": 1, "kind": "Button", "props": {"label": "go"}, "children": [],
              "events": {"tap": {"op": "add", "target": "count", "value": 1}}}
         ]}
@@ -302,6 +302,70 @@ fn the_same_event_and_frame_sequence_is_byte_identical() {
         a.network_records().to_string(),
         b.network_records().to_string()
     );
+}
+
+#[test]
+fn the_kernel_render_path_records_one_frame_per_call() {
+    let mut runtime = Runtime::from_ir_json(&ir_document()).unwrap();
+    for _ in 0..3 {
+        let _ = runtime.display_list();
+    }
+
+    let frames = runtime.frame_records(None);
+    assert_eq!(frames.len(), 3);
+    for (position, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.seq, position as u64);
+        // The logical clock ticks once per read: start and end of the same
+        // measured call are one tick apart, deterministically.
+        assert_eq!(frame.start_ms, (position * 2) as i64);
+        assert_eq!(frame.frame_ms, 1);
+        assert_eq!(frame.budget_ms, 16);
+        assert!(frame.nodes >= 1, "the rendered tree has nodes");
+        assert!(frame.effects >= 1, "the fixture tree declares effects");
+    }
+
+    // The per-frame units agree with the layer records the kernel serves.
+    let records_json = runtime.layer_records();
+    let records = records_json.as_array().unwrap();
+    let effects: usize = records
+        .iter()
+        .map(|record| record["effects"].as_array().map(Vec::len).unwrap_or(0))
+        .sum();
+    assert_eq!(frames[0].nodes as usize, records.len());
+    assert_eq!(frames[0].effects as usize, effects);
+
+    // Kernel-measured frames carry no tier: the channel is partial, not a
+    // fabricated full report.
+    let channel = runtime.frames_channel(None);
+    assert_eq!(channel["availability"], "partial");
+    assert_eq!(channel["reason"], "no frame-budget report from the host");
+    assert_eq!(channel["report"], Json::Null);
+    assert_eq!(channel["frames"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn recording_frames_never_changes_the_rendered_bytes() {
+    let mut plain = Runtime::from_ir_json(&ir_document()).unwrap();
+    let mut noisy = Runtime::from_ir_json(&ir_document()).unwrap();
+    // The noisy runtime renders and dispatches first: rings fill up, yet the
+    // display list is a pure function of the IR and the hook.
+    noisy.display_list();
+    noisy.dispatch(Event::Tap { node_id: 1 }).unwrap();
+    noisy.memory_report();
+    assert_eq!(plain.display_list(), noisy.display_list());
+}
+
+#[test]
+fn inspector_reads_do_not_record_frames() {
+    let mut runtime = Runtime::from_ir_json(&ir_document()).unwrap();
+    runtime.display_list();
+    let recorded = runtime.frame_records(None).len();
+
+    // The memory report and layer records are reads, not render steps.
+    let _ = runtime.memory_report();
+    let _ = runtime.layer_records();
+    let _ = runtime.memory_report()["layersBytes"];
+    assert_eq!(runtime.frame_records(None).len(), recorded);
 }
 
 fn run_cli(input: &str) -> String {

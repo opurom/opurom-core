@@ -19,7 +19,7 @@ fn decoration_node() -> Node {
 
 #[test]
 fn unregistered_hook_keeps_display_list_byte_identical() {
-    let runtime = Runtime::from_ir_json(COUNTER).unwrap();
+    let mut runtime = Runtime::from_ir_json(COUNTER).unwrap();
     let rendered = runtime.display_list();
     let parsed = Ir::parse(COUNTER).unwrap();
     assert_eq!(rendered, parsed.tree);
@@ -40,7 +40,7 @@ fn registered_hook_decorates_the_display_list() {
         }
     }
 
-    let runtime = Runtime::from_ir_json(COUNTER)
+    let mut runtime = Runtime::from_ir_json(COUNTER)
         .unwrap()
         .with_rendering_hook(Arc::new(Append));
     let rendered = runtime.display_list();
@@ -70,7 +70,7 @@ fn observing_hook_keeps_the_display_list_unchanged() {
     }
 
     let seen = Arc::new(AtomicUsize::new(0));
-    let runtime = Runtime::from_ir_json(COUNTER)
+    let mut runtime = Runtime::from_ir_json(COUNTER)
         .unwrap()
         .with_rendering_hook(Arc::new(Observer {
             seen: Arc::clone(&seen),
