@@ -391,9 +391,24 @@ allowlist check before writing a request.
 
 When a `network.request` capability runs through `Runtime::invoke_plugin`, the runtime appends a
 deterministic record of that request to its network log: the `method` and `url` read from the
-params, the `status` the plugin reported, and the request/response byte counts. The log keeps
-invocation order, uses no wall clock, and is read live over the kernel `network` command (and the
-debugger `opurom/networkStats` request), so network capture reflects the running session.
+params, the `status` the plugin reported, and the request/response byte counts, plus the additive
+inspector timing fields `id` (per-record, never restarting), `startMs` and `durationMs` on the
+host-injected monotonic clock. The log is a ring capped at `NETWORK_RING = 200`, keeps invocation
+order, uses no wall clock, and is read live over the kernel `network` command (and the debugger
+`opurom/networkStats` request), so network capture reflects the running session.
+
+### Inspector data plane
+
+The kernel is the collector and holder of the three inspector channels
+([`INSPECTOR_DATA_PLANE.md`](../opurom-spec/INSPECTOR_DATA_PLANE.md)); every timestamp is an
+integer on the host-injected monotonic clock (`Runtime::with_clock`, default a deterministic
+logical counter — no wall clock).
+
+| Item | Notes |
+| --- | --- |
+| `Runtime::record_frame(FrameSample)`, `frame_records(since_seq)`, `frame_report()`, `frames_channel(since_seq)` | The host frame loop pushes one `FrameSample` per rendered frame — the measured `frame_ms`/`budget_ms`, node/effect counts and the render-side frame-budget machine snapshot (`FrameReport { p50_ms, p95_ms, fps_x10, tier }`; the kernel never recomputes the tier algorithm). The kernel assigns `seq`, keeps the last `FRAME_RING = 200` records and answers `frames [sinceSeq]` with `{frames, report, availability, reason}`; records carry the spec shape with `phaseMs: null` in v1. Without a recorded frame the channel is `absent`, never a fabricated report. |
+| `Runtime::memory_report()` | `{cache: {budget, usedBytes, entries}, stateBytes, layersBytes, images, history, availability, reason}`: the resource cache ledger, the JSON sizes of the state snapshot and layer records, the raster host's image stats (`with_image_stats`, `null` where none exists — absent data is never a fabricated `0`) and a `{version, totalBytes}` history entry per dispatch that advanced the version, ring capped at `MEMORY_HISTORY_RING = 50`. |
+| CLI `memory`, `frames [sinceSeq]` | The kernel REPL answers the two new protocol commands alongside the existing `state`/`layers`/`network`/`resource`/`pages` set; `network` keeps its record-array output, with the timing fields additive per record. |
 
 ```rust
 use opurom_core::CapabilityHost;

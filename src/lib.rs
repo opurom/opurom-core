@@ -33,6 +33,9 @@ pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAUL
 pub use render::RenderingHook;
 pub use resource::{ResourceError, ResourceManager};
 pub use scheduler::{Scheduler, TaskHandle};
-pub use state::{Event, NetworkRecord, Patch, Runtime, Value, DEFAULT_RESOURCE_BUDGET};
+pub use state::{
+    Event, FrameRecord, FrameReport, FrameSample, NetworkRecord, Patch, Runtime, Value,
+    DEFAULT_RESOURCE_BUDGET, FRAME_RING, MEMORY_HISTORY_RING, NETWORK_RING,
+};
 pub use text_buffer::{TextBuffer, TextBufferError};
 pub use text_input::{TextInputError, TextInputState, DEFAULT_TEXT_INPUT_CAPACITY, TEXT_INPUT_BUS};

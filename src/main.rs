@@ -82,6 +82,11 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
         if line.is_empty() {
             continue;
         }
+        // `frames` takes an optional argument, so it matches by prefix.
+        if let Some(rest) = line.strip_prefix("frames") {
+            print_frames(&runtime, rest.trim());
+            continue;
+        }
         match line {
             "quit" => break,
             "state" => print_state(&runtime),
@@ -89,6 +94,7 @@ fn run_ir(path: std::ffi::OsString, _rest: impl Iterator<Item = std::ffi::OsStri
             "network" => print_network(&runtime),
             "resource" => print_resource(&runtime),
             "pages" => print_pages(&runtime),
+            "memory" => print_memory(&runtime),
             _ => match parse_command(line) {
                 Ok(event) => match runtime.dispatch(event) {
                     Ok(patches) => match serde_json::to_string(&patches) {
@@ -145,6 +151,34 @@ fn print_network(runtime: &Runtime) {
     }
 }
 
+/// `frames [sinceSeq]`: the inspector frames channel — every held record, or
+/// the records past the given sequence number, plus the report and channel
+/// availability.
+fn print_frames(runtime: &Runtime, rest: &str) {
+    let since_seq = if rest.is_empty() {
+        None
+    } else {
+        match rest.parse::<u64>() {
+            Ok(seq) => Some(seq),
+            Err(error) => {
+                println!("error: frames expects `frames [sinceSeq]`: {error}");
+                return;
+            }
+        }
+    };
+    match serde_json::to_string(&runtime.frames_channel(since_seq)) {
+        Ok(json) => println!("frames {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
+fn print_memory(runtime: &Runtime) {
+    match serde_json::to_string(&runtime.memory_report()) {
+        Ok(json) => println!("memory {json} version {}", runtime.version()),
+        Err(error) => println!("error: {error}"),
+    }
+}
+
 fn parse_command(line: &str) -> Result<Event, String> {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
@@ -182,7 +216,7 @@ fn parse_command(line: &str) -> Result<Event, String> {
             })
         }
         _ => Err(format!(
-            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages or quit"
+            "unknown command {command:?}; expected tap, doubleTap, longPress, drag, input, state, layers, network, resource, pages, memory, frames or quit"
         )),
     }
 }

@@ -1,14 +1,84 @@
 use crate::error::{CoreError, PluginError};
 use crate::ir::{Action, Ir, Node, Op, Route};
+use crate::parallel_sched::Clock;
 use crate::render::RenderingHook;
 use crate::resource::{ResourceError, ResourceManager};
 use crate::text_input::{TextInputState, DEFAULT_TEXT_INPUT_CAPACITY};
 use serde_core::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::Value as Json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const DEFAULT_RESOURCE_BUDGET: usize = 64 * 1024;
+
+/// Ring caps for the inspector channels (`INSPECTOR_DATA_PLANE.md`).
+pub const FRAME_RING: usize = 200;
+pub const NETWORK_RING: usize = 200;
+pub const MEMORY_HISTORY_RING: usize = 50;
+
+/// One frame record: the host frame loop hands the kernel the measured frame
+/// plus its frame-budget machine snapshot; the kernel assigns `seq` and keeps
+/// the last `FRAME_RING` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRecord {
+    pub seq: u64,
+    pub start_ms: i64,
+    pub frame_ms: i64,
+    pub budget_ms: i64,
+    pub tier: String,
+    pub nodes: u32,
+    pub effects: u32,
+}
+
+/// The frame-budget machine output (`WINDOW_FRAMES` p50/p95 nearest-rank,
+/// `fps_x10`, tier), computed by the render side; the kernel only holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameReport {
+    pub p50_ms: i64,
+    pub p95_ms: i64,
+    pub fps_x10: i64,
+    pub tier: String,
+}
+
+/// Host-supplied frame sample: the measured frame and the report snapshot
+/// taken from the frame budget state machine after it consumed the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSample {
+    pub start_ms: i64,
+    pub frame_ms: i64,
+    pub budget_ms: i64,
+    pub nodes: u32,
+    pub effects: u32,
+    pub report: FrameReport,
+}
+
+/// Type-erased host clock with a `Debug` impl so `Runtime` keeps deriving it.
+struct ClockBox(Arc<dyn Clock>);
+
+impl std::fmt::Debug for ClockBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClockBox")
+    }
+}
+
+impl ClockBox {
+    fn now(&self) -> u64 {
+        self.0.now()
+    }
+}
+
+/// Deterministic default monotonic clock: one logical tick per read, so
+/// timings stay reproducible without a wall clock. Hosts inject a real
+/// monotonic clock with `Runtime::with_clock`.
+#[derive(Debug, Default)]
+struct TickClock(Arc<AtomicU64>);
+
+impl Clock for TickClock {
+    fn now(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -74,6 +144,13 @@ pub struct Runtime {
     guards: HashMap<u32, Vec<String>>,
     resources: ResourceManager<String, Json>,
     network_log: Vec<NetworkRecord>,
+    network_next_id: u64,
+    frames: VecDeque<FrameRecord>,
+    frame_report: Option<FrameReport>,
+    frame_seq: u64,
+    memory_history: VecDeque<(u64, usize)>,
+    image_stats: Option<(u64, u64)>,
+    clock: ClockBox,
     version: u64,
     tree: Node,
     pages: Vec<String>,
@@ -93,6 +170,11 @@ pub struct NetworkRecord {
     pub status: i64,
     pub request_bytes: usize,
     pub response_bytes: usize,
+    /// Additive inspector fields: a per-record id and the monotonic-clock
+    /// timing of the capability call. Present on every new record.
+    pub id: u64,
+    pub start_ms: i64,
+    pub duration_ms: i64,
 }
 
 fn collect_tree(
@@ -464,6 +546,13 @@ impl Runtime {
             guards,
             resources: ResourceManager::new(budget),
             network_log: Vec::new(),
+            network_next_id: 0,
+            frames: VecDeque::new(),
+            frame_report: None,
+            frame_seq: 0,
+            memory_history: VecDeque::new(),
+            image_stats: None,
+            clock: ClockBox(Arc::new(TickClock::default())),
             version: 0,
             tree,
             pages,
@@ -483,6 +572,20 @@ impl Runtime {
     /// Registers kernel-owned input editing state for a node.
     pub fn with_text_input(mut self, node_id: u32, state: TextInputState) -> Self {
         self.text_inputs.insert(node_id, state);
+        self
+    }
+
+    /// Injects the host monotonic clock used for inspector timings. Without it
+    /// the kernel ticks a logical counter, which keeps timings deterministic.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = ClockBox(clock);
+        self
+    }
+
+    /// Records the raster host's image cache stats for the memory channel.
+    /// Without a raster host the memory report carries `images: null`.
+    pub fn with_image_stats(mut self, entries: u64, bytes: u64) -> Self {
+        self.image_stats = Some((entries, bytes));
         self
     }
 
@@ -584,6 +687,7 @@ impl Runtime {
                     .dispatch_for(*node_id, text)
                     .map_err(CoreError::TextInput)?;
                 self.version = version;
+                self.record_memory_history();
                 return Ok(patches);
             }
         }
@@ -624,6 +728,7 @@ impl Runtime {
         let version = self.next_version()?;
         self.values = working;
         self.version = version;
+        self.record_memory_history();
         Ok(patches)
     }
 
@@ -662,17 +767,30 @@ impl Runtime {
         } else {
             None
         };
+        // Time the capability call on the host monotonic clock: the start and
+        // duration land in the network record as additive integer fields.
+        let start_ms = self.clock.now() as i64;
         let result = invoke(capability, params).map_err(CoreError::Plugin)?;
+        let duration_ms = self.clock.now() as i64 - start_ms;
         if let Some((method, url, request_bytes)) = network {
             let status = result.get("status").and_then(Json::as_i64).unwrap_or(0);
             let response_bytes = serde_json::to_vec(&result).map(|b| b.len()).unwrap_or(0);
+            let id = self.network_next_id;
+            self.network_next_id += 1;
             self.network_log.push(NetworkRecord {
                 method,
                 url,
                 status,
                 request_bytes,
                 response_bytes,
+                id,
+                start_ms,
+                duration_ms,
             });
+            // The inspector network channel is a ring, not a ledger.
+            if self.network_log.len() > NETWORK_RING {
+                self.network_log.remove(0);
+            }
         }
         let bytes = serde_json::to_vec(&result)
             .map_err(|error| CoreError::Resource(ResourceError::InvalidValue(error.to_string())))?;
@@ -737,7 +855,8 @@ impl Runtime {
     }
 
     /// The network requests captured through the `network.request` capability,
-    /// in invocation order, as deterministic JSON records.
+    /// in invocation order, as deterministic JSON records. The inspector
+    /// timing fields (`id`, `startMs`, `durationMs`) are additive.
     pub fn network_records(&self) -> Json {
         Json::Array(
             self.network_log
@@ -749,11 +868,142 @@ impl Runtime {
                         "status": record.status,
                         "requestBytes": record.request_bytes,
                         "responseBytes": record.response_bytes,
+                        "id": record.id,
+                        "startMs": record.start_ms,
+                        "durationMs": record.duration_ms,
                     })
                 })
                 .collect(),
         )
     }
+
+    /// The memory channel report (`INSPECTOR_DATA_PLANE.md`): the resource
+    /// cache ledger, the JSON sizes of the state snapshot and layer records,
+    /// the raster host's image stats (`null` where none exists — absent data
+    /// is never a fabricated `0`) and the per-dispatch history ring.
+    pub fn memory_report(&self) -> Json {
+        let images = self
+            .image_stats
+            .map(|(entries, bytes)| serde_json::json!({"entries": entries, "bytes": bytes}));
+        serde_json::json!({
+            "cache": {
+                "budget": self.resources.budget(),
+                "usedBytes": self.resources.used_bytes(),
+                "entries": self.resources.len(),
+            },
+            "stateBytes": self.state_bytes(),
+            "layersBytes": self.layers_bytes(),
+            "images": images,
+            "history": self
+                .memory_history
+                .iter()
+                .map(|(version, total_bytes)| {
+                    serde_json::json!({"version": version, "totalBytes": total_bytes})
+                })
+                .collect::<Vec<_>>(),
+            "availability": "full",
+            "reason": "",
+        })
+    }
+
+    /// Accepts one frame from the host frame loop: the kernel assigns `seq`,
+    /// keeps the last `FRAME_RING` records and holds the frame-budget report.
+    pub fn record_frame(&mut self, sample: FrameSample) {
+        let seq = self.frame_seq;
+        self.frame_seq += 1;
+        self.frames.push_back(FrameRecord {
+            seq,
+            start_ms: sample.start_ms,
+            frame_ms: sample.frame_ms,
+            budget_ms: sample.budget_ms,
+            tier: sample.report.tier.clone(),
+            nodes: sample.nodes,
+            effects: sample.effects,
+        });
+        if self.frames.len() > FRAME_RING {
+            self.frames.pop_front();
+        }
+        self.frame_report = Some(sample.report);
+    }
+
+    /// Frame records after `since_seq` (paging: strictly greater), or every
+    /// held record when no sequence number is given.
+    pub fn frame_records(&self, since_seq: Option<u64>) -> Vec<FrameRecord> {
+        self.frames
+            .iter()
+            .filter(|record| since_seq.is_none_or(|since| record.seq > since))
+            .cloned()
+            .collect()
+    }
+
+    /// The latest frame-budget machine snapshot the host passed in.
+    pub fn frame_report(&self) -> Option<&FrameReport> {
+        self.frame_report.as_ref()
+    }
+
+    /// The frames channel response for the `frames [sinceSeq]` protocol
+    /// command: records, the held report and channel availability. Without a
+    /// recorded frame the channel is `absent`, never a fabricated report.
+    pub fn frames_channel(&self, since_seq: Option<u64>) -> Json {
+        let (availability, reason) = match &self.frame_report {
+            Some(_) => ("full", ""),
+            None => ("absent", "no frame records yet"),
+        };
+        serde_json::json!({
+            "frames": self
+                .frame_records(since_seq)
+                .iter()
+                .map(frame_record_json)
+                .collect::<Vec<_>>(),
+            "report": self.frame_report.as_ref().map(|report| {
+                serde_json::json!({
+                    "p50Ms": report.p50_ms,
+                    "p95Ms": report.p95_ms,
+                    "fpsX10": report.fps_x10,
+                    "tier": report.tier,
+                })
+            }),
+            "availability": availability,
+            "reason": reason,
+        })
+    }
+
+    /// One `{version, totalBytes}` memory-history entry per dispatch that
+    /// advanced the version, capped at the ring size.
+    fn record_memory_history(&mut self) {
+        let total = self.state_bytes() + self.layers_bytes();
+        self.memory_history.push_back((self.version, total));
+        if self.memory_history.len() > MEMORY_HISTORY_RING {
+            self.memory_history.pop_front();
+        }
+    }
+
+    fn state_bytes(&self) -> usize {
+        serde_json::to_string(&self.snapshot())
+            .map(|json| json.len())
+            .unwrap_or(0)
+    }
+
+    fn layers_bytes(&self) -> usize {
+        serde_json::to_string(&self.layer_records())
+            .map(|json| json.len())
+            .unwrap_or(0)
+    }
+}
+
+/// The frame record JSON shape from `INSPECTOR_DATA_PLANE.md`. `phaseMs` is
+/// the v1 `null`: the layout/raster split ships in P2.
+fn frame_record_json(record: &FrameRecord) -> Json {
+    serde_json::json!({
+        "seq": record.seq,
+        "startMs": record.start_ms,
+        "frameMs": record.frame_ms,
+        "budgetMs": record.budget_ms,
+        "phaseMs": Json::Null,
+        "tier": record.tier,
+        "nodes": record.nodes,
+        "effects": record.effects,
+    })
 }
 
 /// Effect layers declared by a node, in a stable order: the built-in visual
