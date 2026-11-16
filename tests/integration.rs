@@ -99,7 +99,7 @@ fn rejects_bad_state_types_and_duplicate_names() {
     let cases: Vec<(Json, &str)> = vec![
         (
             json!([{"name": "x", "type": "float", "init": 0}]),
-            "int, bool or string",
+            "is not int, bool, string",
         ),
         (
             json!([{"name": "x", "type": "int", "init": "0"}]),
@@ -203,7 +203,7 @@ fn rejects_illegal_event_actions() {
         (
             int_state.clone(),
             json!({"tap": {"op": "mul", "target": "count", "value": 2}}),
-            "not set, add, sub or toggle",
+            "is not set, add, sub",
         ),
         (
             int_state.clone(),

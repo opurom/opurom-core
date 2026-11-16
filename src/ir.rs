@@ -15,6 +15,9 @@ pub enum Op {
     Add,
     Sub,
     Toggle,
+    Append,
+    RemoveAt,
+    Assign,
     Push,
     Pop,
     Validate,
@@ -111,6 +114,8 @@ fn typed_value(json: &Json, declared: &Value, name: &str) -> Result<Value, CoreE
         Value::Int(_) => json.as_i64().map(Value::Int),
         Value::Bool(_) => json.as_bool().map(Value::Bool),
         Value::Str(_) => json.as_str().map(|s| Value::Str(s.to_owned())),
+        // Unreachable: a list target is rejected before `set` parses a value.
+        Value::List(_) => None,
     };
     parsed.ok_or_else(|| CoreError::TypeMismatch {
         name: name.to_owned(),
@@ -120,6 +125,46 @@ fn typed_value(json: &Json, declared: &Value, name: &str) -> Result<Value, CoreE
 
 fn same_declared_type(left: &Value, right: &Value) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
+/// Parses a Phase A list value: an array of strings, element by element.
+fn string_array(json: &Json, at: &str) -> Result<Vec<String>, CoreError> {
+    let array = json
+        .as_array()
+        .ok_or_else(|| invalid(format!("{at} must be an array")))?;
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid(format!("{at}[{i}] must be a string")))
+        })
+        .collect()
+}
+
+/// The `valueFrom` of an `append`: a declared string state, since list
+/// elements are strings.
+fn validate_string_from(
+    object: &Map<String, Json>,
+    types: &HashMap<String, Value>,
+    at: &str,
+) -> Result<String, CoreError> {
+    let source = object
+        .get("valueFrom")
+        .and_then(Json::as_str)
+        .ok_or_else(|| invalid(format!("{at}.valueFrom must be a string state name")))?
+        .to_owned();
+    match types.get(&source) {
+        Some(Value::Str(_)) => Ok(source),
+        Some(declared) => Err(invalid(format!(
+            "{at}: append valueFrom {source:?} must be a string state, it is {}",
+            declared.type_name()
+        ))),
+        None => Err(invalid(format!(
+            "{at}.valueFrom {source:?} is not declared in state"
+        ))),
+    }
 }
 
 fn parse_state(items: &[Json]) -> Result<(Vec<StateDecl>, HashMap<String, Value>), CoreError> {
@@ -150,9 +195,12 @@ fn parse_state(items: &[Json]) -> Result<(Vec<StateDecl>, HashMap<String, Value>
                     .ok_or_else(|| invalid(format!("{at}.init must be a string for type string")))?
                     .to_owned(),
             ),
+            // A Phase A list is an array of strings; an empty init means a list
+            // that fills in at runtime, so no element is required up front.
+            "list" => Value::List(string_array(init, &format!("{at}.init"))?),
             _ => {
                 return Err(invalid(format!(
-                    "{at}.type {kind:?} is not int, bool or string"
+                    "{at}.type {kind:?} is not int, bool, string or list"
                 )))
             }
         };
@@ -305,38 +353,124 @@ fn parse_action(
             value = None;
             value_from = None;
         }
-        "set" => match (raw_value, raw_from) {
-            (Some(raw), None) => {
-                value = Some(typed_value(raw, declared, &target)?);
-                value_from = None;
-            }
-            (None, Some(_)) => {
-                value = None;
-                value_from = Some(validate_value_from(
-                    object, &target, declared, types, at, false,
-                )?);
-            }
-            (None, None) => {
-                if event != "input" {
-                    return Err(invalid(format!(
-                        "{at}: set without value is only legal for input events"
-                    )));
-                }
-                // The input text is parsed by the target's declared type at
-                // dispatch, so int and bool controls bind the same way as
-                // string inputs.
-                value = None;
-                value_from = None;
-            }
-            (Some(_), Some(_)) => {
+        "append" => {
+            if !matches!(declared, Value::List(_)) {
                 return Err(invalid(format!(
-                    "{at}: value and valueFrom are mutually exclusive"
-                )))
+                    "{at}: append requires a list target, {target:?} is {}",
+                    declared.type_name()
+                )));
             }
-        },
+            match (raw_value, raw_from) {
+                (Some(raw), None) => {
+                    value = Some(Value::Str(
+                        raw.as_str()
+                            .ok_or_else(|| {
+                                invalid(format!("{at}: append requires a string value"))
+                            })?
+                            .to_owned(),
+                    ));
+                    value_from = None;
+                }
+                (None, Some(_)) => {
+                    value = None;
+                    value_from = Some(validate_string_from(object, types, at)?);
+                }
+                (None, None) => return Err(invalid(format!("{at}: append requires a value"))),
+                (Some(_), Some(_)) => {
+                    return Err(invalid(format!(
+                        "{at}: value and valueFrom are mutually exclusive"
+                    )))
+                }
+            }
+        }
+        "removeAt" => {
+            if !matches!(declared, Value::List(_)) {
+                return Err(invalid(format!(
+                    "{at}: removeAt requires a list target, {target:?} is {}",
+                    declared.type_name()
+                )));
+            }
+            if raw_from.is_some() {
+                return Err(invalid(format!("{at}: removeAt must not have a valueFrom")));
+            }
+            let index = raw_value
+                .and_then(Json::as_i64)
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{at}: removeAt requires a non-negative integer value"
+                    ))
+                })?;
+            value = Some(Value::Int(index));
+            value_from = None;
+        }
+        "assign" => {
+            if !matches!(declared, Value::List(_)) {
+                return Err(invalid(format!(
+                    "{at}: assign requires a list target, {target:?} is {}",
+                    declared.type_name()
+                )));
+            }
+            match (raw_value, raw_from) {
+                (Some(raw), None) => {
+                    value = Some(Value::List(string_array(raw, &format!("{at}.value"))?));
+                    value_from = None;
+                }
+                (None, Some(_)) => {
+                    value = None;
+                    value_from = Some(validate_value_from(
+                        object, &target, declared, types, at, false,
+                    )?);
+                }
+                (None, None) => return Err(invalid(format!("{at}: assign requires a value"))),
+                (Some(_), Some(_)) => {
+                    return Err(invalid(format!(
+                        "{at}: value and valueFrom are mutually exclusive"
+                    )))
+                }
+            }
+        }
+        "set" => {
+            // A list is replaced whole by `assign`, so no `set` spelling
+            // (literal, valueFrom or input text) may reach a list target.
+            if matches!(declared, Value::List(_)) {
+                return Err(invalid(format!(
+                    "{at}: set cannot replace the list {target:?}; use assign"
+                )));
+            }
+            match (raw_value, raw_from) {
+                (Some(raw), None) => {
+                    value = Some(typed_value(raw, declared, &target)?);
+                    value_from = None;
+                }
+                (None, Some(_)) => {
+                    value = None;
+                    value_from = Some(validate_value_from(
+                        object, &target, declared, types, at, false,
+                    )?);
+                }
+                (None, None) => {
+                    if event != "input" {
+                        return Err(invalid(format!(
+                            "{at}: set without value is only legal for input events"
+                        )));
+                    }
+                    // The input text is parsed by the target's declared type at
+                    // dispatch, so int and bool controls bind the same way as
+                    // string inputs.
+                    value = None;
+                    value_from = None;
+                }
+                (Some(_), Some(_)) => {
+                    return Err(invalid(format!(
+                        "{at}: value and valueFrom are mutually exclusive"
+                    )))
+                }
+            }
+        }
         _ => {
             return Err(invalid(format!(
-                "{at}.op {op:?} is not set, add, sub or toggle"
+                "{at}.op {op:?} is not set, add, sub, toggle, append, removeAt or assign"
             )))
         }
     };
@@ -344,6 +478,9 @@ fn parse_action(
         "set" => Op::Set,
         "add" => Op::Add,
         "sub" => Op::Sub,
+        "append" => Op::Append,
+        "removeAt" => Op::RemoveAt,
+        "assign" => Op::Assign,
         _ => Op::Toggle,
     };
     Ok(Action {

@@ -614,7 +614,7 @@ fn malformed_ir_is_rejected_with_a_readable_diagnostic() {
                 json!([{"name": "a", "type": "int", "init": 0}]),
                 json!({"tap": {"actions": [{"op": "mul", "target": "a", "value": 1}]}}),
             ),
-            "not set, add, sub or toggle",
+            "is not set, add, sub",
         ),
         (
             ir_document(

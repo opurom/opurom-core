@@ -18,6 +18,11 @@ pub enum CoreError {
         name: String,
         expected: &'static str,
     },
+    IndexOutOfBounds {
+        name: String,
+        index: i64,
+        len: usize,
+    },
     Overflow {
         name: String,
     },
@@ -39,6 +44,12 @@ impl fmt::Display for CoreError {
             }
             Self::TypeMismatch { name, expected } => {
                 write!(f, "state {name} expects {expected}, got incompatible value")
+            }
+            Self::IndexOutOfBounds { name, index, len } => {
+                write!(
+                    f,
+                    "index {index} is out of bounds for list {name} of length {len}"
+                )
             }
             Self::Overflow { name } => write!(f, "integer overflow while updating {name}"),
             Self::Plugin(error) => write!(f, "plugin error: {error}"),

@@ -15,6 +15,8 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(String),
+    /// A list state: Phase A stores string elements only, in array order.
+    List(Vec<String>),
 }
 
 impl Value {
@@ -23,6 +25,7 @@ impl Value {
             Self::Int(_) => "int",
             Self::Bool(_) => "bool",
             Self::Str(_) => "string",
+            Self::List(_) => "list",
         }
     }
 }
@@ -33,6 +36,7 @@ impl Serialize for Value {
             Self::Int(v) => serializer.serialize_i64(*v),
             Self::Bool(v) => serializer.serialize_bool(*v),
             Self::Str(v) => serializer.serialize_str(v),
+            Self::List(items) => serializer.collect_seq(items),
         }
     }
 }
@@ -244,6 +248,14 @@ fn apply_action(
                     Value::Int(_) => Value::Int(raw.parse::<i64>().unwrap_or(0)),
                     Value::Bool(_) => Value::Bool(raw == "true"),
                     Value::Str(_) => Value::Str(raw.to_owned()),
+                    // Parse rejects a `set` on a list target, so no input text
+                    // can arrive here; report it rather than invent a value.
+                    Value::List(_) => {
+                        return Err(CoreError::TypeMismatch {
+                            name: action.target.clone(),
+                            expected: "list",
+                        })
+                    }
                 }
             }
         }
@@ -300,6 +312,97 @@ fn apply_action(
                         expected: "bool",
                     })
                 }
+            }
+        }
+        Op::Append => {
+            let mut items = match &current {
+                Value::List(items) => items.clone(),
+                _ => {
+                    return Err(CoreError::TypeMismatch {
+                        name: action.target.clone(),
+                        expected: "list",
+                    })
+                }
+            };
+            let item = if let Some(source) = &action.value_from {
+                match state_value(values, index, source)? {
+                    Value::Str(text) => text,
+                    _ => {
+                        return Err(CoreError::TypeMismatch {
+                            name: source.clone(),
+                            expected: "string",
+                        })
+                    }
+                }
+            } else if let Some(Value::Str(text)) = &action.value {
+                text.clone()
+            } else {
+                return Err(CoreError::TypeMismatch {
+                    name: action.target.clone(),
+                    expected: "string",
+                });
+            };
+            items.push(item);
+            Value::List(items)
+        }
+        Op::RemoveAt => {
+            let items = match &current {
+                Value::List(items) => items,
+                _ => {
+                    return Err(CoreError::TypeMismatch {
+                        name: action.target.clone(),
+                        expected: "list",
+                    })
+                }
+            };
+            // Parse already rejects a negative or non-integer index; only the
+            // live length can push an otherwise valid index out of range, so
+            // the upper bound is checked here.
+            let index = match action.value {
+                Some(Value::Int(index)) => index,
+                _ => {
+                    return Err(CoreError::InvalidIr(format!(
+                        "removeAt on {} needs an integer index",
+                        action.target
+                    )))
+                }
+            };
+            let position = usize::try_from(index)
+                .ok()
+                .filter(|position| *position < items.len())
+                .ok_or_else(|| CoreError::IndexOutOfBounds {
+                    name: action.target.clone(),
+                    index,
+                    len: items.len(),
+                })?;
+            let mut items = items.clone();
+            items.remove(position);
+            Value::List(items)
+        }
+        Op::Assign => {
+            if !matches!(current, Value::List(_)) {
+                return Err(CoreError::TypeMismatch {
+                    name: action.target.clone(),
+                    expected: "list",
+                });
+            }
+            if let Some(source) = &action.value_from {
+                match state_value(values, index, source)? {
+                    Value::List(items) => Value::List(items),
+                    _ => {
+                        return Err(CoreError::TypeMismatch {
+                            name: source.clone(),
+                            expected: "list",
+                        })
+                    }
+                }
+            } else if let Some(Value::List(items)) = &action.value {
+                Value::List(items.clone())
+            } else {
+                return Err(CoreError::InvalidIr(format!(
+                    "assign on {} has no value to apply",
+                    action.target
+                )));
             }
         }
         // Signals return before the state lookup above.
