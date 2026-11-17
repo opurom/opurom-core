@@ -331,3 +331,25 @@ fn routes_ir_helper_builds_parseable_ir() {
     );
     assert!(Ir::parse(&ir).is_ok());
 }
+
+// A push target may sort after the route that declares it: validation must
+// see the full route set, not the names parsed so far (HashMap order).
+#[test]
+fn push_to_a_later_sorted_route_is_accepted() {
+    let ir = json!({
+        "ir": "0.1.0",
+        "app": "T",
+        "state": [],
+        "initialRoute": "Aaa",
+        "routes": {
+            "Aaa": {"tree": node(0, "Button", json!({"tap": {"op": "push", "target": "Zulu"}}))},
+            "Zulu": {"tree": node(1, "Column", json!({}))}
+        },
+        "theme": {}
+    })
+    .to_string();
+    let mut runtime = Runtime::from_ir_json(&ir).unwrap();
+    let patches = runtime.dispatch(Event::Tap { node_id: 0 }).unwrap();
+    assert_eq!(patches[0].name, "@nav");
+    assert_eq!(patches[0].value, Value::Str("Zulu".to_string()));
+}
