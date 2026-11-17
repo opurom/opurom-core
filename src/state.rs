@@ -1210,10 +1210,18 @@ fn frame_record_json(record: &FrameRecord) -> Json {
 /// inspect layer view exactly.
 fn effect_layers(node: &Node) -> Json {
     let mut kinds: Vec<String> = Vec::new();
-    if let Some(shadow) = node.props.get("shadow").and_then(Json::as_f64) {
-        if shadow > 0.0 {
-            kinds.push("shadow".to_owned());
-        }
+    let has_shadow = node
+        .props
+        .get("shadow")
+        .and_then(Json::as_f64)
+        .is_some_and(|v| v > 0.0)
+        || node
+            .props
+            .get("elevation")
+            .and_then(Json::as_f64)
+            .is_some_and(|v| v > 0.0);
+    if has_shadow {
+        kinds.push("shadow".to_owned());
     }
     if node.props.get("glass").and_then(Json::as_bool) == Some(true) {
         kinds.push("glass".to_owned());
@@ -1284,5 +1292,27 @@ mod tests {
         );
         assert_eq!(records[2]["kind"].as_str(), Some("Text"));
         assert_eq!(records[2]["effects"], Json::Array(vec![]));
+    }
+
+    #[test]
+    fn layer_records_report_elevation_as_shadow() {
+        let ir = r##"{
+            "ir": "0.1.0", "app": "T",
+            "state": [],
+            "theme": {"mode": "system", "accent": "#097FEB", "radius": 12},
+            "tree": {
+                "id": 0, "kind": "Column", "props": {}, "children": [
+                    {"id": 1, "kind": "Container", "props": {"elevation": 2}, "children": [], "events": {}},
+                    {"id": 2, "kind": "Container", "props": {"shadow": 3, "elevation": 2}, "children": [], "events": {}},
+                    {"id": 3, "kind": "Container", "props": {"elevation": 0}, "children": [], "events": {}}
+                ], "events": {}
+            }
+        }"##;
+        let runtime = Runtime::from_ir_json(ir).expect("IR parses");
+        let records = runtime.layer_records();
+        let records = records.as_array().expect("layer records are an array");
+        assert_eq!(records[1]["effects"], serde_json::json!(["shadow"]));
+        assert_eq!(records[2]["effects"], serde_json::json!(["shadow"]));
+        assert_eq!(records[3]["effects"], Json::Array(vec![]));
     }
 }
