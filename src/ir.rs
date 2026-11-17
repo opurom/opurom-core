@@ -727,12 +727,15 @@ impl Ir {
                 ));
             }
             let mut ids = HashSet::new();
-            let mut route_names = Vec::with_capacity(map.len());
+            // A push target may name any declared route, including one that
+            // sorts after the route being parsed. Validate against the full
+            // name set, collected before any tree is parsed.
+            let all_route_names: Vec<String> = map.keys().cloned().collect();
+            if all_route_names.iter().any(|name| name.is_empty()) {
+                return Err(invalid("root.routes keys must not be empty"));
+            }
             let mut routes = Vec::with_capacity(map.len());
             for (name, entry) in map {
-                if name.is_empty() {
-                    return Err(invalid("root.routes keys must not be empty"));
-                }
                 let at = format!("root.routes.{name}");
                 let route_obj = entry
                     .as_object()
@@ -745,11 +748,10 @@ impl Ir {
                 let tree = parse_node(
                     field(route_obj, "tree", &at)?,
                     &types,
-                    Some((route_names.as_slice(), "route")),
+                    Some((all_route_names.as_slice(), "route")),
                     &mut ids,
                     &format!("{at}.tree"),
                 )?;
-                route_names.push(name.clone());
                 routes.push(Route {
                     name: name.clone(),
                     tree,
@@ -765,12 +767,12 @@ impl Ir {
                 Some(Json::String(name)) => name.clone(),
                 Some(_) => return Err(invalid("root.initialRoute must be a string")),
             };
-            if !route_names.iter().any(|name| name == &initial_route) {
+            if !all_route_names.iter().any(|name| name == &initial_route) {
                 return Err(invalid(format!(
                     "root.initialRoute {initial_route:?} is not a declared route"
                 )));
             }
-            (route_names, Node::empty(), routes, Some(initial_route))
+            (all_route_names, Node::empty(), routes, Some(initial_route))
         } else {
             if object.contains_key("initialRoute") {
                 return Err(invalid(
