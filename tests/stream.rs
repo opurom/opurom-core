@@ -1521,3 +1521,50 @@ fn broadcast_view_after_source_done_only_receives_done() {
     .expect("closed view must hand out a done-only subscription");
     assert_eq!(*events.borrow(), vec!["done"]);
 }
+
+#[test]
+fn broadcast_view_pause_buffers_and_resume_forwards_in_order() {
+    // stream_impl.dart:908-914: pausing the view pauses the shared source
+    // subscription; resuming forwards buffered events in order.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = view.listen(
+        Some(Rc::new(move |v| seen_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1), int(2)]);
+    runtime.add(&source, StreamEvent::Data(int(3)));
+    assert_eq!(*seen.borrow(), vec![int(1), int(2), int(3)]);
+}
+
+#[test]
+fn broadcast_view_nested_pause_waits_for_last_resume() {
+    // stream_impl.dart:908-914: the view forwards pause/resume until the
+    // last nested pause is released.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = view.listen(
+        Some(Rc::new(move |v| seen_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    subscription.resume();
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}

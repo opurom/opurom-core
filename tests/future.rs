@@ -1229,3 +1229,46 @@ fn wait_cleanup_multi_round_replay_is_byte_deterministic() {
         assert_eq!(snapshot(&rounds), first);
     }
 }
+
+#[test]
+fn wait_cleanup_arrival_order_is_deterministic_across_replays() {
+    // future.dart:538-548,579-590: values present before the first error are
+    // cleaned up first; values completing later follow in source order. The
+    // same completion sequence replays the same joint order every time.
+    let build = |values_before: &[i64], error_at: usize, values_after: &[i64]| {
+        let mut inputs: Vec<Option<Completion>> = Vec::new();
+        for value in values_before {
+            inputs.push(Some(ok(*value)));
+        }
+        inputs.push(Some(Completion::Error(AsyncError::new("boom"))));
+        for _ in 0..error_at.saturating_sub(values_before.len() + 1) {
+            inputs.push(None);
+        }
+        for value in values_after {
+            inputs.push(Some(ok(*value)));
+        }
+        WaitStep::advance(
+            &inputs,
+            FutureCombineErrorPolicy::Wait,
+            Some(&|value| match value {
+                FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+                _ => Ok(()),
+            }),
+        )
+    };
+    let first = build(&[1], 3, &[2, 3]);
+    assert_eq!(first.cleaned_up, vec![int(1), int(2), int(3)]);
+    assert_eq!(
+        first.cleanup_errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+    for _ in 0..4 {
+        let replay = build(&[1], 3, &[2, 3]);
+        assert_eq!(replay.cleaned_up, first.cleaned_up);
+        assert_eq!(replay.cleanup_errors, first.cleanup_errors);
+    }
+}

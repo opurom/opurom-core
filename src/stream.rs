@@ -50,8 +50,9 @@
 //! - `asBroadcastStream` shares one source subscription between all view
 //!   listeners, forwards source done to every current listener, and shuts
 //!   down the source when the last listener leaves; a closed view hands out
-//!   done-only subscriptions (`async/stream.dart:681-686`,
-//!   `async/stream_impl.dart:820-919`);
+//!   done-only subscriptions, and pausing the view pauses the shared source
+//!   subscription until the last nested resume
+//!   (`async/stream.dart:681-686`, `async/stream_impl.dart:820-919`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
