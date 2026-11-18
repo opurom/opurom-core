@@ -954,3 +954,53 @@ fn cleanup_future_errors_are_observed_after_pumping_in_cleanup_order() {
         ]
     );
 }
+
+#[test]
+fn wait_delivery_reports_cleanup_future_errors_before_the_combined_error() {
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+            _ => Ok(()),
+        }),
+    );
+    let cleanup_first = runtime.error(AsyncError::new("cleanup-future-1"));
+    let cleanup_second = runtime.error(AsyncError::new("cleanup-future-2"));
+    let future = step.deliver_with_cleanup_futures(&runtime, &[cleanup_first, cleanup_second], 16);
+    assert!(future.is_some());
+    let future = future.unwrap();
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup-future-1"),
+            AsyncError::new("cleanup-future-2"),
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+        ]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn wait_delivery_with_cleanup_futures_waits_for_all_inputs() {
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), None],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    assert!(step
+        .deliver_with_cleanup_futures(&runtime, &[], 16)
+        .is_none());
+}

@@ -36,8 +36,9 @@
 //!   forwards the first error and closes the target, while `false` forwards
 //!   all errors. Direct adds and closes during pumping are refused with the
 //!   controller's state error, and a paused target pauses its source
-//!   subscription (`async/stream_controller.dart:465-469,528-552,590-603,
-//!   913-938`, `async/broadcast_stream_controller.dart:247-276`);
+//!   subscription; the returned future completes after source done is
+//!   forwarded (`async/stream_controller.dart:465-469,528-552,590-603,
+//!   913-967`, `async/broadcast_stream_controller.dart:247-276`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).

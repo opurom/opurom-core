@@ -1181,3 +1181,32 @@ fn broadcast_close_during_add_stream_is_refused() {
     runtime.add(&source, StreamEvent::Done);
     assert!(runtime.try_close(&target).is_ok());
 }
+
+#[test]
+fn single_subscription_add_stream_completion_future_order() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let done_events = Rc::clone(&events);
+    target.listen(
+        None,
+        None,
+        Some(
+            Rc::new(move || done_events.borrow_mut().push("target-done".to_owned()))
+                as DoneCallback,
+        ),
+    );
+    let future = runtime.add_stream(&target, &source, false).unwrap();
+    assert!(!future.is_completed());
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["target-done"]);
+    // The addStream future is completed after source done is forwarded
+    // (stream_controller.dart:965-967); completion is observable even before
+    // the host drains the microtask queue in this data model.
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}

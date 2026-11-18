@@ -30,7 +30,8 @@
 //!   future completes; with several values the cleanup errors follow source
 //!   order. Eager wait discards inputs that arrive after the first error
 //!   instead of cleaning them up; a future returned by cleanUp reports its
-//!   own error asynchronously (`async/future.dart:322-330,542-546,550-552,
+//!   own error asynchronously; a combined delivery reports those errors
+//!   before the combined result (`async/future.dart:322-330,542-546,550-552,
 //!   579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
@@ -834,6 +835,39 @@ pub fn wait_cleanup_future_errors(
         .into_iter()
         .filter_map(|slot| slot.borrow().clone())
         .collect()
+}
+
+impl WaitStep {
+    /// Delivers the combined result and reports cleanup-future errors in one
+    /// deterministic pass.
+    ///
+    /// Order: each cleanup-future error (source order), then the combined
+    /// result. The combined error is reported as uncaught only when no
+    /// listener handles it; `Future.wait`'s own future always carries it
+    /// (`async/future.dart:322-330,542-546,550-557,581-590`). A returned
+    /// `None` means the host has not supplied every input yet.
+    pub fn deliver_with_cleanup_futures(
+        &self,
+        runtime: &FutureRuntime,
+        cleanup_futures: &[Future],
+        limit: usize,
+    ) -> Option<Future> {
+        if self.outcome.is_none() {
+            return None;
+        }
+        let observed = wait_cleanup_future_errors(runtime, cleanup_futures, limit);
+        for error in observed {
+            runtime.report_uncaught(error);
+        }
+        for error in &self.cleanup_errors {
+            runtime.report_uncaught(error.clone());
+        }
+        Some(match &self.outcome {
+            Some(CombineOutcome::Wait(values)) => runtime.value(FutureValue::List(values.clone())),
+            Some(CombineOutcome::Error(error)) => runtime.error(error.clone()),
+            _ => runtime.value(FutureValue::Null),
+        })
+    }
 }
 
 /// The order in which a host must surface uncaught errors after
