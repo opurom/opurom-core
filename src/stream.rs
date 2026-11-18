@@ -34,7 +34,9 @@
 //!   `async/stream_controller.dart:581-587,628-656`);
 //! - `addStream` forwards source events in order; `cancelOnError=true`
 //!   forwards the first error and closes the target, while `false` forwards
-//!   all errors (`async/stream_controller.dart:590-603,913-938`);
+//!   all errors. Direct adds during pumping are refused, and a paused target
+//!   pauses its source subscription
+//!   (`async/stream_controller.dart:465-469,528-552,590-603,913-938`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -392,6 +394,12 @@ struct StreamInner {
     /// forwarding pipe reports the source's refusal through this field
     /// (`async/stream_pipe.dart:134-146`).
     listen_error: Option<DartError>,
+    /// Mirrors `_STATE_ADDSTREAM`: direct adds are refused while a source is
+    /// being pumped (`async/stream_controller.dart:465-469,528-552`).
+    adding_stream: bool,
+    /// True while `add_stream` forwards an event through `try_add`; direct
+    /// host adds during the same period are refused.
+    forwarding_add_stream: bool,
     /// Events buffered for a single-subscription controller before listen
     /// (`stream_controller.dart:97-98`).
     pre_listen: VecDeque<StreamEvent>,
@@ -415,6 +423,8 @@ impl StreamInner {
             closed: false,
             ever_listened: false,
             listen_error: None,
+            adding_stream: false,
+            forwarding_add_stream: false,
             pre_listen: VecDeque::new(),
             subscriptions: std::collections::BTreeMap::new(),
             hooks,
@@ -760,7 +770,7 @@ impl StreamRuntime {
     /// `async/broadcast_stream_controller.dart:247-257`).
     pub fn try_add(&self, stream: &Stream, event: StreamEvent) -> Result<(), DartError> {
         let mut inner = stream.inner.borrow_mut();
-        if inner.closed {
+        if inner.closed && !inner.adding_stream {
             if matches!(event, StreamEvent::Done) {
                 // `close()` may be called more than once; only the first call
                 // has an effect (`async/stream_controller.dart:628-656`).
@@ -773,8 +783,15 @@ impl StreamRuntime {
             };
             return Err(DartError::State(error.to_owned()));
         }
+        let direct_add = !inner.forwarding_add_stream;
+        if inner.adding_stream && direct_add {
+            return Err(DartError::State(
+                "Cannot add event while adding a stream".to_owned(),
+            ));
+        }
         if matches!(event, StreamEvent::Done) {
             inner.closed = true;
+            inner.adding_stream = false;
         }
         if inner.subscriptions.is_empty() {
             if !inner.broadcast {
@@ -854,6 +871,8 @@ impl StreamRuntime {
     /// every error; `true` forwards the first error and then closes `target`,
     /// so later source data/errors are ignored. The returned future completes
     /// synchronously on source done, or after the first error when cancelling.
+    /// Direct adds to `target` are refused while pumping
+    /// (`async/stream_controller.dart:465-469,528-552`).
     pub fn add_stream(
         &self,
         target: &Stream,
@@ -871,6 +890,10 @@ impl StreamRuntime {
                 return Err(DartError::State(message.to_owned()));
             }
         }
+        {
+            let mut inner = target.inner.borrow_mut();
+            inner.adding_stream = true;
+        }
         let future_runtime = FutureRuntime::new();
         let future = future_runtime.completer();
         let data_target = target.clone();
@@ -880,25 +903,46 @@ impl StreamRuntime {
         let error_future = future.clone();
         let source_handle = source.try_listen_with(
             Some(Rc::new(move |value| {
-                let _ = StreamRuntime::default().try_add(&data_target, StreamEvent::Data(value));
+                StreamRuntime::forward_add(&data_target, StreamEvent::Data(value));
             })),
             Some(Rc::new(move |error| {
-                let _ = StreamRuntime::default()
-                    .try_add(&error_target, StreamEvent::Error(error.clone()));
+                StreamRuntime::forward_add(&error_target, StreamEvent::Error(error.clone()));
                 if cancel_on_error {
-                    let _ = StreamRuntime::default().try_add(&error_target, StreamEvent::Done);
+                    StreamRuntime::forward_add(&error_target, StreamEvent::Done);
                     let _ = error_future.complete(FutureValue::Null);
                 }
             })),
             Some(Rc::new(move || {
-                let _ = StreamRuntime::default().try_add(&done_target, StreamEvent::Done);
+                StreamRuntime::forward_add(&done_target, StreamEvent::Done);
                 let _ = done_future.complete(FutureValue::Null);
             })),
             ListenOptions { cancel_on_error },
         )?;
-        let _ = source_handle;
+        let source_handle = Rc::new(source_handle);
+        {
+            let mut state = target.inner.borrow_mut();
+            state.hooks.on_pause_input = Some(Rc::new({
+                let handle = Rc::clone(&source_handle);
+                move || handle.pause()
+            }));
+            state.hooks.on_resume_input = Some(Rc::new({
+                let handle = Rc::clone(&source_handle);
+                move || handle.resume()
+            }));
+        }
         future_runtime.pump(16);
         Ok(future.future())
+    }
+
+    fn forward_add(target: &Stream, event: StreamEvent) {
+        {
+            let mut inner = target.inner.borrow_mut();
+            inner.forwarding_add_stream = true;
+        }
+        let _ = StreamRuntime::default().try_add(target, event);
+        if let Ok(mut inner) = target.inner.try_borrow_mut() {
+            inner.forwarding_add_stream = false;
+        }
     }
 
     /// Pumps the microtask queue used by async stream controllers

@@ -887,3 +887,51 @@ fn wait_eager_delivery_ignores_later_values_and_cleanup() {
     );
     assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("boom")]);
 }
+
+#[test]
+fn wait_cleanup_errors_global_order_across_first_error_and_late_values() {
+    // future.dart:538-548,579-586: cleanup for values already present runs
+    // in source order when the first error fires; values completing later are
+    // cleaned up in source order after that, still before the non-eager
+    // combined error is delivered.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(ok(0)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+            Some(ok(3)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+            _ => Ok(()),
+        }),
+    );
+    assert_eq!(
+        step.outcome,
+        Some(CombineOutcome::Error(AsyncError::new("boom")))
+    );
+    assert_eq!(
+        step.cleanup_errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-0"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+    let future = step.deliver(&runtime);
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-0"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+}

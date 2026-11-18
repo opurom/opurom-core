@@ -27,8 +27,9 @@
 //! - an uncaught error is reported once and kept in reporting order
 //!   (`async/future.dart:819-823,1336-1351`);
 //! - a failing `cleanUp` body is uncaught and reported before the combined
-//!   future completes; eager wait discards inputs that arrive after the first
-//!   error instead of cleaning them up
+//!   future completes; with several values the cleanup errors follow source
+//!   order. Eager wait discards inputs that arrive after the first error
+//!   instead of cleaning them up
 //!   (`async/future.dart:542-546,550-552,579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);

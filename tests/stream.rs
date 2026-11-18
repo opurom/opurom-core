@@ -1076,3 +1076,51 @@ fn add_stream_after_close_is_rejected() {
     let error = runtime.add_stream(&target, &source, false);
     assert!(matches!(error, Err(DartError::State(_))));
 }
+
+#[test]
+fn direct_add_during_add_stream_is_rejected() {
+    // stream_controller.dart:528-552: while addStream is active, a direct
+    // add is a state error and never reaches target listeners.
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    target.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_add(&target, StreamEvent::Data(int(99)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add event while adding a stream".to_owned()
+        ))
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn paused_target_pauses_the_add_stream_source() {
+    // stream_controller.dart:970-986: a paused single-subscription controller
+    // pauses its addStream subscription until resumed.
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = target.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
