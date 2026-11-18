@@ -694,7 +694,9 @@ pub struct WaitStep {
     /// Successful values passed to `cleanUp`, in source order.
     pub cleaned_up: Vec<FutureValue>,
     /// Errors a host cleanup body raised, in the order their values were
-    /// cleaned up (`async/future.dart:542-546,581-585`).
+    /// cleaned up (`async/future.dart:542-546,581-585`). Dart reports these
+    /// as uncaught independently of the combined future's error
+    /// (`future.dart:542-546,581-585`).
     pub cleanup_errors: Vec<AsyncError>,
     /// The combined future's result at this step, if it is complete.
     pub outcome: Option<CombineOutcome>,
@@ -767,6 +769,31 @@ impl WaitStep {
             cleanup_errors,
             outcome,
         }
+    }
+}
+
+/// The order in which a host must surface uncaught errors after
+/// `Future.wait` finishes. Cleanup errors are represented in the order their
+/// values were cleaned up (`async/future.dart:542-546,581-585`); each one is
+/// reported independently through `Future.sync`. The combined error is kept
+/// separately because it belongs to the returned future
+/// (`future.dart:550-557,587-590`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitUncaughtErrors {
+    /// Cleanup errors in cleanup order.
+    pub cleanup: Vec<AsyncError>,
+    /// The combined future's error, if any.
+    pub combined: Option<AsyncError>,
+}
+
+/// Collects the uncaught errors a `WaitStep` produced, in report order.
+pub fn wait_uncaught_errors(step: &WaitStep) -> WaitUncaughtErrors {
+    WaitUncaughtErrors {
+        cleanup: step.cleanup_errors.clone(),
+        combined: match &step.outcome {
+            Some(CombineOutcome::Error(error)) => Some(error.clone()),
+            _ => None,
+        },
     }
 }
 

@@ -299,6 +299,8 @@ impl StreamSubscription {
         let cancel_self = self.clone();
         let mut overrides = self.inner.borrow_mut();
         if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
+            // The overrides replace this subscription's terminal handlers
+            // only (`stream_impl.dart:253-269`); other listeners keep theirs.
             subscription.on_done = Some(Rc::new(move || {
                 let _ = done_completer.complete(value.clone());
             }));

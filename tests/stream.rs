@@ -821,3 +821,40 @@ fn as_future_error_preserves_stack_trace() {
     future_runtime.pump(16);
     assert_eq!(future.completion(), Some(Completion::Error(original)));
 }
+
+// asFuture independence across listeners, pinned to Dart 3.14
+// (async/stream_impl.dart:243-270, stream_controller.dart:141-143).
+#[test]
+fn as_future_is_independent_per_listener() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let first_subscription = stream.listen(None, None, None);
+    let second_subscription = stream.listen(None, None, None);
+    let first = first_subscription.as_future(&future_runtime, int(1));
+    let second = second_subscription.as_future(&future_runtime, int(2));
+    runtime.add(&stream, StreamEvent::Data(int(9)));
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(first.completion(), Some(Completion::Value(int(1))));
+    assert_eq!(second.completion(), Some(Completion::Value(int(2))));
+}
+
+#[test]
+fn as_future_error_completes_only_its_own_future() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let first_subscription = stream.listen(None, None, None);
+    let second_subscription = stream.listen(None, None, None);
+    let first = first_subscription.as_future(&future_runtime, int(1));
+    let _second = second_subscription.as_future(&future_runtime, int(2));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    future_runtime.pump(16);
+    assert_eq!(
+        first.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+    assert!(first_subscription.id() != second_subscription.id());
+    assert!(future_runtime.unhandled_errors().is_empty());
+}

@@ -427,7 +427,7 @@ fn for_each_values_are_discarded() {
 
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
-use opurom_core::wait_error_at;
+use opurom_core::{wait_error_at, wait_uncaught_errors};
 
 #[test]
 fn wait_error_uses_source_order_not_completion_order() {
@@ -637,4 +637,69 @@ fn wait_empty_input_completes_with_empty_list() {
         assert!(step.cleaned_up.is_empty());
         assert!(step.cleanup_errors.is_empty());
     }
+}
+
+// Future.wait uncaught error ordering, pinned to Dart 3.14
+// (async/future.dart:529-559,579-600).
+#[test]
+fn wait_cleanup_errors_are_reported_before_the_combined_error() {
+    // future.dart:542-546,581-585: Future.sync schedules each cleanup error
+    // before the combined future completes with the first input error.
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(_) => Err(AsyncError::new(format!(
+                "cleanup-{}",
+                match value {
+                    FutureValue::Int(v) => *v,
+                    _ => 0,
+                }
+            ))),
+            _ => Ok(()),
+        }),
+    );
+    let uncaught = wait_uncaught_errors(&step);
+    assert_eq!(
+        uncaught.cleanup,
+        vec![AsyncError::new("cleanup-1"), AsyncError::new("cleanup-2")]
+    );
+    assert_eq!(uncaught.combined, Some(AsyncError::new("boom")));
+}
+
+#[test]
+fn wait_without_error_has_only_the_combined_outcome() {
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let uncaught = wait_uncaught_errors(&step);
+    assert!(uncaught.cleanup.is_empty());
+    assert_eq!(uncaught.combined, None);
+}
+
+#[test]
+fn wait_without_input_errors_never_runs_cleanup() {
+    // future.dart:538-548,579-586: cleanUp only runs when an error occurred;
+    // a fully successful wait never invokes it.
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(2) => Err(AsyncError::new("cleanup-only")),
+            _ => Ok(()),
+        }),
+    );
+    let uncaught = wait_uncaught_errors(&step);
+    assert!(uncaught.cleanup.is_empty());
+    assert_eq!(uncaught.combined, None);
+    assert_eq!(
+        step.outcome,
+        Some(CombineOutcome::Wait(vec![int(1), int(2)]))
+    );
 }
