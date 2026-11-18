@@ -7,6 +7,7 @@
 pub mod async_sched;
 pub mod capabilities;
 pub mod clamping_scroll;
+pub mod collections;
 pub mod convert;
 pub mod drag_axis;
 pub mod error;
@@ -32,6 +33,10 @@ pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
 pub use clamping_scroll::{
     deceleration_rate, ClampingScrollSimulation, DEFAULT_FRICTION, INFLEXION, PHYSICAL_COEFF,
     TOLERANCE,
+};
+pub use collections::{
+    add_all, fold, index_of, last_index_of, map, r#where as collect_where, reduce, remove_at,
+    reversed, skip_take, sublist, to_list, NoElementError, OrderedMap, OrderedSet,
 };
 pub use convert::{
     base64_decode, base64_encode, clamp_i64, uri_encode_component, uri_encode_query_component,
