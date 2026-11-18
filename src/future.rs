@@ -36,7 +36,8 @@
 //!   while waiting for all inputs, and cleanup errors that arrive later are
 //!   reported after the result, even when the combined wait succeeded; a
 //!   fully late set of cleanup futures aggregates in cleanup order, with the
-//!   combined error last (`async/future.dart:322-330,542-558,574-590`);
+//!   combined error last; repeated wait rounds replay byte-identically
+//!   (`async/future.dart:322-330,517-600`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask

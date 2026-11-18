@@ -1431,3 +1431,52 @@ fn controller_done_and_as_future_share_the_same_terminal_step() {
     );
     assert_eq!(bridge.completion(), Some(Completion::Value(int(42))));
 }
+
+// asBroadcastStream listen/cancel ordering, pinned to Dart 3.14
+// (async/stream_impl.dart:681-686,849-906).
+#[test]
+fn as_broadcast_stream_shares_one_source_subscription() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let first = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let second = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let first_clone = Rc::clone(&first);
+    let second_clone = Rc::clone(&second);
+    view.listen(
+        Some(Rc::new(move |v| first_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    view.listen(
+        Some(Rc::new(move |v| second_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*first.borrow(), vec![int(1)]);
+    assert_eq!(*second.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn as_broadcast_stream_cancels_source_when_last_listener_leaves() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let first = view.listen(None, None, None);
+    let second = view.listen(None, None, None);
+    first.cancel();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    second.cancel();
+    let observed = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let observed_clone = Rc::clone(&observed);
+    let late = view.try_listen_with(
+        Some(Rc::new(move |v| observed_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+        ListenOptions::default(),
+    );
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    assert!(late.is_err());
+    assert!(observed.borrow().is_empty());
+}

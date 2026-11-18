@@ -1163,3 +1163,30 @@ fn aggregate_wait_uncaught_errors_final_order() {
         ]
     );
 }
+
+#[test]
+fn wait_multi_round_results_are_byte_deterministic() {
+    // future.dart:517-600: the same completion sequence always produces the
+    // same wait result, including cleanup and uncaught ordering.
+    let rounds = vec![
+        vec![Some(ok(1)), Some(ok(2))],
+        vec![
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+        ],
+        vec![None, None],
+    ];
+    let mut first = Vec::new();
+    for inputs in &rounds {
+        let step = WaitStep::advance(inputs, FutureCombineErrorPolicy::Wait, None);
+        first.push(format!("{:?}", step.outcome));
+    }
+    for _ in 0..4 {
+        let mut replay = Vec::new();
+        for inputs in &rounds {
+            let step = WaitStep::advance(inputs, FutureCombineErrorPolicy::Wait, None);
+            replay.push(format!("{:?}", step.outcome));
+        }
+        assert_eq!(replay, first);
+    }
+}

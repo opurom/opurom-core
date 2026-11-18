@@ -47,6 +47,9 @@
 //!   (`async/stream_impl.dart:232-240,287-294`,
 //!   `async/stream_controller.dart:465-469,528-552,590-613,725-775,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
+//! - `asBroadcastStream` shares one source subscription between all view
+//!   listeners, and shuts down the source when the last listener leaves
+//!   (`async/stream.dart:681-686`, `async/stream_impl.dart:820-919`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -447,6 +450,9 @@ struct StreamInner {
     /// rejects every later listen, even after the first one was canceled
     /// (`async/stream_controller.dart:440-452,509-519,688-696`).
     ever_listened: bool,
+    /// Set by an `asBroadcastStream` view after its source subscription was
+    /// shut down; unlike a normal closed controller, late listens are refused.
+    view_shutdown: bool,
     /// Error raised while the `onListen` hook subscribed to the source. A
     /// forwarding pipe reports the source's refusal through this field
     /// (`async/stream_pipe.dart:134-146`).
@@ -484,6 +490,7 @@ impl StreamInner {
             broadcast,
             closed: false,
             ever_listened: false,
+            view_shutdown: false,
             listen_error: None,
             adding_stream: false,
             forwarding_add_stream: false,
@@ -576,6 +583,11 @@ impl Stream {
         options: ListenOptions,
     ) -> Result<StreamSubscription, DartError> {
         let mut inner = self.inner.borrow_mut();
+        if inner.view_shutdown {
+            return Err(DartError::State(
+                "Cannot add new events after calling close".to_owned(),
+            ));
+        }
         if !inner.broadcast && inner.ever_listened {
             // `_subscribe` rejects every listen after the first one
             // (`async/stream_controller.dart:688-696`).
@@ -812,6 +824,81 @@ impl StreamRuntime {
     /// (`stream_controller.dart:132-139`).
     pub fn broadcast_controller(&self, hooks: StreamHooks) -> Stream {
         self.controller_with(hooks, true)
+    }
+
+    /// Wraps `source` in a broadcast view like `Stream.asBroadcastStream`
+    /// (`async/stream_impl.dart:820-919`).
+    ///
+    /// The view subscribes to `source` once, when its first listener
+    /// registers; every later listener joins the same broadcast. When the
+    /// last listener leaves, the view cancels the source subscription and
+    /// stops accepting listeners (`async/stream_impl.dart:874-906`).
+    pub fn as_broadcast_stream(&self, source: &Stream) -> Stream {
+        let target = Stream::new(Rc::new(RefCell::new(StreamInner::new(
+            true,
+            StreamHooks::default(),
+        ))));
+        let listen_inner = Rc::clone(&target.inner);
+        let closure_inner = Rc::clone(&target.inner);
+        let source_inner = Rc::clone(&source.inner);
+        let source_attached = Rc::new(Cell::new(false));
+        {
+            let attached_for_hook = Rc::clone(&source_attached);
+            let mut state = listen_inner.borrow_mut();
+            state.hooks.on_listen = Some(Rc::new(move || {
+                let target = Stream::new(Rc::clone(&closure_inner));
+                let source = Stream::new(Rc::clone(&source_inner));
+                let data_target = target.clone();
+                let error_target = target.clone();
+                let done_target = target.clone();
+                let cancel_target = target.clone();
+                if attached_for_hook.replace(true) {
+                    return;
+                }
+                let source_handle = Rc::new(
+                    source
+                        .try_listen_with(
+                            Some(Rc::new(move |value| {
+                                StreamRuntime::forward_add(&data_target, StreamEvent::Data(value));
+                            })),
+                            Some(Rc::new(move |error| {
+                                StreamRuntime::forward_add(
+                                    &error_target,
+                                    StreamEvent::Error(error.clone()),
+                                );
+                            })),
+                            Some(Rc::new(move || {
+                                StreamRuntime::forward_add(&done_target, StreamEvent::Done);
+                            })),
+                            ListenOptions::default(),
+                        )
+                        .expect("source must accept the broadcast view subscription"),
+                );
+                let cancel_inner = Rc::clone(&closure_inner);
+                {
+                    let mut state = cancel_target.inner.borrow_mut();
+                    state.hooks.on_cancel = Some(Rc::new(move || {
+                        let last = cancel_inner
+                            .borrow()
+                            .subscriptions
+                            .values()
+                            .all(|subscription| subscription.state.canceled);
+                        if last {
+                            source_handle.cancel();
+                            // The source subscription is gone, so this view
+                            // is no longer listenable
+                            // (`async/stream_impl.dart:897-906`).
+                            let mut state = cancel_inner.borrow_mut();
+                            state.ever_listened = false;
+                            state.closed = true;
+                            state.view_shutdown = true;
+                        }
+                        None
+                    }));
+                }
+            }));
+        }
+        target
     }
 
     fn complete_done_waiters(stream: &Stream) {
