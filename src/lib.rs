@@ -15,6 +15,7 @@ pub mod future;
 pub mod gestures;
 pub mod host;
 pub mod ir;
+pub mod json_codec;
 pub mod microtask;
 pub mod parallel_sched;
 pub mod plugin;
@@ -57,6 +58,7 @@ pub use gestures::{
 };
 pub use host::{AdapterFault, Host};
 pub use ir::{Action, Ir, Locale, Node, Op, Route, StateDecl, IR_VERSION};
+pub use json_codec::{json_decode, json_encode, json_encode_pretty, JsonError};
 pub use microtask::{CallbackId, FrameCallbacks, FramePhase, FramePump, FrameStep, MicrotaskQueue};
 pub use parallel_sched::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, SchedulerMetrics, SpeedupMeasurement,
