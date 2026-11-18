@@ -21,6 +21,9 @@
 //! - during an error or done callback a terminal event waits for cancellation;
 //!   an explicit cancel clears that state and suppresses the pending done
 //!   (`async/stream_impl.dart:69-76,392-395,429-445`);
+//! - `asFuture` overwrites the terminal handlers: done completes with a
+//!   supplied value, error cancels first and then completes with the original
+//!   error and stack trace (`async/stream_impl.dart:243-270`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
 //! - `close` sends a done event to the listeners subscribed at close time
@@ -39,7 +42,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::future::{AsyncError, FutureValue};
+use crate::future::{AsyncError, Future, FutureRuntime, FutureValue};
 use crate::microtask::{CallbackId, MicrotaskQueue};
 
 /// An event carried by a stream.
@@ -283,6 +286,29 @@ impl StreamSubscription {
             inner: Rc::clone(&self.inner),
         }
         .finalize_pending_cancels()
+    }
+
+    /// Bridges terminal events to a `Future` like `StreamSubscription.asFuture`
+    /// (`async/stream_impl.dart:243-270`). Done completes with `value`; an
+    /// error cancels the subscription and completes with that error, keeping
+    /// its stack trace byte for byte.
+    pub fn as_future(&self, runtime: &FutureRuntime, value: FutureValue) -> Future {
+        let completer = runtime.completer_with_error_handler();
+        let done_completer = completer.clone();
+        let error_completer = completer.clone();
+        let cancel_self = self.clone();
+        let mut overrides = self.inner.borrow_mut();
+        if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
+            subscription.on_done = Some(Rc::new(move || {
+                let _ = done_completer.complete(value.clone());
+            }));
+            subscription.on_error = Some(Rc::new(move |error| {
+                cancel_self.cancel();
+                let _ = error_completer.complete_error(error.clone());
+            }));
+        }
+        drop(overrides);
+        completer.future()
     }
 
     pub fn cancel(&self) {

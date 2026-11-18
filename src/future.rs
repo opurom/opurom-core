@@ -21,7 +21,9 @@
 //!   result through (`async/future.dart:877-926`);
 //! - `Future.wait` stores the first error and, with `cleanUp`, releases
 //!   already-delivered values in source order before reporting the combined
-//!   result (`async/future.dart:529-559,579-590`);
+//!   result; cleanup errors are reported as uncaught in value order, and an
+//!   empty input completes with an empty list
+//!   (`async/future.dart:529-559,579-600`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -153,6 +155,8 @@ struct FutureInner {
     completion: Option<Completion>,
     /// The listener list while incomplete (`async/future_impl.dart:341-355`).
     listeners: Vec<Listener>,
+    /// Mirrors `_STATE_HAS_ERROR_HANDLER` (`async/stream_impl.dart:78-83`).
+    has_error_handler: bool,
 }
 
 /// A future handle. Cloning shares the same underlying state, exactly like
@@ -213,6 +217,24 @@ impl FutureRuntime {
         let future = Future::new();
         self.schedule(Rc::clone(&future.inner), Completion::Error(error));
         future
+    }
+
+    /// A future already marked as having an error handler, like the result
+    /// future created by `StreamSubscription.asFuture`
+    /// (`async/stream_impl.dart:253-269`). This prevents the error from being
+    /// reported as unhandled when the host completes it before a listener is
+    /// attached.
+    pub fn completer_with_error_handler(&self) -> Completer {
+        let future = Future::new();
+        {
+            let mut state = future.inner.borrow_mut();
+            state.has_error_handler = true;
+        }
+        Completer {
+            runtime: self.clone(),
+            future,
+            completed: Rc::new(RefCell::new(false)),
+        }
     }
 
     /// A future completed by the host: `complete` / `completeError` mirror
@@ -288,10 +310,14 @@ impl FutureRuntime {
             (completion, std::mem::take(&mut state.listeners))
         };
         if listeners.is_empty() {
-            // An error nobody listens for is unhandled
-            // (`async/future.dart:819-823`).
+            // An error nobody listens for is unhandled. `asFuture` installs
+            // its own error handler before the stream can complete it
+            // (`async/stream_impl.dart:253-269`).
             if let Completion::Error(error) = &completion {
-                self.unhandled.borrow_mut().push(error.clone());
+                let handled = inner.borrow().has_error_handler;
+                if !handled {
+                    self.unhandled.borrow_mut().push(error.clone());
+                }
             }
             return;
         }
@@ -382,6 +408,7 @@ impl Future {
                 state: FutureState::Incomplete,
                 completion: None,
                 listeners: Vec::new(),
+                has_error_handler: false,
             })),
         }
     }
@@ -666,6 +693,9 @@ pub struct WaitStep {
     pub values: Vec<Option<FutureValue>>,
     /// Successful values passed to `cleanUp`, in source order.
     pub cleaned_up: Vec<FutureValue>,
+    /// Errors a host cleanup body raised, in the order their values were
+    /// cleaned up (`async/future.dart:542-546,581-585`).
+    pub cleanup_errors: Vec<AsyncError>,
     /// The combined future's result at this step, if it is complete.
     pub outcome: Option<CombineOutcome>,
 }
@@ -676,17 +706,18 @@ impl WaitStep {
     ///
     /// `cleaned_up` receives values available when the first error fires in
     /// source order (`future.dart:538-548`), followed by values that complete
-    /// later (`future.dart:579-586`). Errors from a cleanup body belong to the
-    /// host because the core stores plain data only.
+    /// later (`future.dart:579-586`). Cleanup errors are recorded separately
+    /// so the host can report them as uncaught (`future.dart:542-546,581-585`).
     pub fn advance(
         inputs: &[Option<Completion>],
         policy: FutureCombineErrorPolicy,
-        cleanup: bool,
+        cleanup: Option<&dyn Fn(&FutureValue) -> Result<(), AsyncError>>,
     ) -> Self {
         let mut values: Vec<Option<FutureValue>> = vec![None; inputs.len()];
         let mut first_error: Option<AsyncError> = None;
         let mut remaining = inputs.len();
         let mut cleaned_up = Vec::new();
+        let mut cleanup_errors = Vec::new();
         for (index, input) in inputs.iter().enumerate() {
             let Some(completion) = input else { continue };
             remaining -= 1;
@@ -694,15 +725,23 @@ impl WaitStep {
                 Completion::Value(value) => {
                     if first_error.is_none() {
                         values[index] = Some(value.clone());
-                    } else if cleanup {
+                    } else if let Some(cleanup) = cleanup {
                         cleaned_up.push(value.clone());
+                        if let Err(error) = cleanup(value) {
+                            cleanup_errors.push(error);
+                        }
                     }
                 }
                 Completion::Error(error) => {
                     if first_error.is_none() {
                         first_error = Some(error.clone());
-                        if cleanup {
-                            cleaned_up.extend(values.iter().take(index).flatten().cloned());
+                        if let Some(cleanup) = cleanup {
+                            for value in values.iter().take(index).flatten() {
+                                cleaned_up.push(value.clone());
+                                if let Err(error) = cleanup(value) {
+                                    cleanup_errors.push(error);
+                                }
+                            }
                         }
                         for slot in &mut values {
                             *slot = None;
@@ -725,6 +764,7 @@ impl WaitStep {
         Self {
             values: if complete { Vec::new() } else { values },
             cleaned_up,
+            cleanup_errors,
             outcome,
         }
     }

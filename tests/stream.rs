@@ -3,8 +3,8 @@
 //! (Dart SDK 3.14.0).
 
 use opurom_core::{
-    AsyncError, DataCallback, DoneCallback, ErrorCallback, FutureValue, StreamEvent, StreamHooks,
-    StreamRuntime,
+    AsyncError, Completion, DataCallback, DoneCallback, ErrorCallback, FutureRuntime, FutureValue,
+    StreamEvent, StreamHooks, StreamRuntime,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -769,4 +769,55 @@ fn cancel_on_error_closes_after_error_without_done() {
     runtime.add(&stream, StreamEvent::Done);
     runtime.add(&stream, StreamEvent::Done);
     assert_eq!(*events.borrow(), vec!["error:boom"]);
+}
+
+// StreamSubscription.asFuture, pinned to Dart 3.14
+// (async/stream_impl.dart:243-270).
+#[test]
+fn as_future_completes_with_value_on_done() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let future = subscription.as_future(&future_runtime, int(42));
+    assert!(!future.is_completed());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(future.completion(), Some(Completion::Value(int(42))));
+}
+
+#[test]
+fn as_future_cancels_then_completes_with_error() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let future = subscription.as_future(&future_runtime, int(0));
+    let original = AsyncError::new("boom");
+    runtime.add(&stream, StreamEvent::Error(original.clone()));
+    future_runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(original.clone()))
+    );
+    assert!(future_runtime.unhandled_errors().is_empty());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(future.completion(), Some(Completion::Error(original)));
+}
+
+#[test]
+fn as_future_error_preserves_stack_trace() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let future = subscription.as_future(&future_runtime, int(0));
+    let original = AsyncError {
+        message: "boom".to_owned(),
+        stack_trace: "frame-a\nframe-b".to_owned(),
+    };
+    runtime.add(&stream, StreamEvent::Error(original.clone()));
+    future_runtime.pump(16);
+    assert_eq!(future.completion(), Some(Completion::Error(original)));
 }
