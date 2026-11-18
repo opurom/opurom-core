@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod clamping_scroll;
 pub mod collections;
 pub mod convert;
+pub mod dart_error;
 pub mod drag_axis;
 pub mod error;
 pub mod future;
@@ -42,6 +43,10 @@ pub use collections::{
 pub use convert::{
     base64_decode, base64_encode, clamp_i64, uri_encode_component, uri_encode_query_component,
     utf8_decode, utf8_encode, Base64Variant, ConvertError,
+};
+pub use dart_error::{
+    check_not_null, check_valid_index, check_value_in_interval, DartError, DartException,
+    DartStackTrace,
 };
 pub use drag_axis::{
     consider_fling, has_sufficient_distance, is_fling_gesture, primary_delta, primary_value,
