@@ -1190,3 +1190,42 @@ fn wait_multi_round_results_are_byte_deterministic() {
         assert_eq!(replay, first);
     }
 }
+
+#[test]
+fn wait_cleanup_multi_round_replay_is_byte_deterministic() {
+    // future.dart:517-600: the same completion sequence produces identical
+    // cleaned_up, cleanup_errors and outcome on every replay.
+    let rounds = vec![
+        vec![
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        vec![
+            Some(ok(1)),
+            Some(ok(2)),
+            Some(Completion::Error(AsyncError::new("first"))),
+            Some(Completion::Error(AsyncError::new("second"))),
+        ],
+    ];
+    let snapshot = |rounds: &Vec<Vec<Option<Completion>>>| {
+        rounds
+            .iter()
+            .map(|inputs| {
+                let step = WaitStep::advance(
+                    inputs,
+                    FutureCombineErrorPolicy::Wait,
+                    Some(&|value| match value {
+                        FutureValue::Int(v) if *v == 1 => Err(AsyncError::new("cleanup-1")),
+                        _ => Ok(()),
+                    }),
+                );
+                format!("{:?}", (step.cleaned_up, step.cleanup_errors, step.outcome))
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = snapshot(&rounds);
+    for _ in 0..4 {
+        assert_eq!(snapshot(&rounds), first);
+    }
+}

@@ -48,8 +48,10 @@
 //!   `async/stream_controller.dart:465-469,528-552,590-613,725-775,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
 //! - `asBroadcastStream` shares one source subscription between all view
-//!   listeners, and shuts down the source when the last listener leaves
-//!   (`async/stream.dart:681-686`, `async/stream_impl.dart:820-919`);
+//!   listeners, forwards source done to every current listener, and shuts
+//!   down the source when the last listener leaves; a closed view hands out
+//!   done-only subscriptions (`async/stream.dart:681-686`,
+//!   `async/stream_impl.dart:820-919`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).

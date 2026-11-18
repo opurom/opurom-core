@@ -1480,3 +1480,44 @@ fn as_broadcast_stream_cancels_source_when_last_listener_leaves() {
     assert!(late.is_err());
     assert!(observed.borrow().is_empty());
 }
+
+#[test]
+fn broadcast_view_forwards_source_done_to_all_listeners() {
+    // stream_impl.dart:849-872,903-906: source done closes the view's
+    // broadcast controller, so every current view listener sees done once.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let counts = Rc::new(RefCell::new(vec![0, 0]));
+    for index in 0..2 {
+        let counts = Rc::clone(&counts);
+        view.listen(
+            None,
+            None,
+            Some(Rc::new(move || counts.borrow_mut()[index] += 1) as DoneCallback),
+        );
+    }
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*counts.borrow(), vec![1, 1]);
+}
+
+#[test]
+fn broadcast_view_after_source_done_only_receives_done() {
+    // stream_impl.dart:855-860: a closed view hands out a done-only
+    // subscription.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    runtime.add(&source, StreamEvent::Done);
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    view.try_listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        None,
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions::default(),
+    )
+    .expect("closed view must hand out a done-only subscription");
+    assert_eq!(*events.borrow(), vec!["done"]);
+}
