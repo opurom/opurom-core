@@ -1606,3 +1606,33 @@ fn reentrant_on_cancel_cancels_once_and_suppresses_done() {
     let late = stream.try_listen_with(None, None, None, ListenOptions::default());
     assert!(late.is_err());
 }
+
+#[test]
+fn async_on_cancel_error_reaches_cancel_future_and_done_still_completes() {
+    // stream_controller.dart:725-775: an onCancel error is returned through
+    // the cancel future, while controller.done completes in whenComplete.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let hook_error = future_runtime.completer();
+    let hook_future = hook_error.future();
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || Some(hook_future.clone()))),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    let done_waiter = stream_runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert!(!cancel_future.is_completed());
+    assert!(!done_waiter.is_completed());
+    let _ = hook_error.complete_error(AsyncError::new("cancel-failed"));
+    future_runtime.pump(16);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Error(AsyncError::new("cancel-failed")))
+    );
+    assert_eq!(
+        done_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}

@@ -21,8 +21,11 @@
 //!   `async/stream_controller.dart:141-143`);
 //! - during an error or done callback a terminal event waits for cancellation;
 //!   an explicit cancel clears that state and suppresses the pending done; a
-//!   repeated or re-entrant cancel reuses the cached cancel state
-//!   (`async/stream_impl.dart:69-76,232-240,287-294,392-395,429-445`);
+//!   repeated or re-entrant cancel reuses the cached cancel state; an error
+//!   from an asynchronous cancel hook reaches the cancel future while the
+//!   controller done future still completes
+//!   (`async/stream_impl.dart:69-76,232-240,287-294,392-395,429-445`,
+//!   `async/stream_controller.dart:725-775`);
 //! - `asFuture` overwrites the terminal handlers: done completes with a
 //!   supplied value, error cancels first and then completes with the original
 //!   error and stack trace. On an already-done subscription it completes
@@ -964,6 +967,20 @@ impl StreamRuntime {
                 }
                 FutureValue::Null
             }) as crate::future::OnValue,
+        );
+        // An error from the onCancel future must reach the cancel future,
+        // while controller.done still completes (`stream_controller.dart:
+        // 725-775`).
+        let error_waiter = Rc::new(RefCell::new(cancel_waiter));
+        let error_waiter_clone = Rc::clone(&error_waiter);
+        trigger.catch_error(
+            &runtime,
+            Rc::new(move |error: &crate::future::AsyncError| {
+                if let Some(completer) = error_waiter_clone.borrow_mut().take() {
+                    let _ = completer.complete_error(error.clone());
+                }
+                FutureValue::Null
+            }) as crate::future::OnError,
         );
         runtime.pump(16);
     }

@@ -1304,3 +1304,32 @@ fn wait_combined_future_ignores_repeated_delivery() {
     // The late error future is a separate future and is unhandled.
     assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("late")]);
 }
+
+#[test]
+fn repeated_listener_attachments_follow_source_order() {
+    // future_impl.dart:593-612: listeners are stored in registration order
+    // and delivered in that order. Repeated attachments each notify once.
+    let runtime = FutureRuntime::new();
+    let future = runtime.value(int(1));
+    let order = Rc::new(RefCell::new(Vec::<String>::new()));
+    for tag in ["first", "second", "third"] {
+        let order = Rc::clone(&order);
+        let tag = tag.to_owned();
+        let _ = future.then(
+            &runtime,
+            Rc::new(move |value| {
+                order.borrow_mut().push(format!("{tag}:{value:?}"));
+                value
+            }) as OnValue,
+        );
+    }
+    runtime.pump(16);
+    assert_eq!(
+        *order.borrow(),
+        vec![
+            "first:Int(1)".to_owned(),
+            "second:Int(1)".to_owned(),
+            "third:Int(1)".to_owned(),
+        ]
+    );
+}

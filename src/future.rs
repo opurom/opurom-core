@@ -40,7 +40,8 @@
 //!   including cleaned-up values, cleanup errors, and the arrival order of
 //!   values around the first error (`async/future.dart:322-330,517-600`);
 //! - a future may only complete once; repeated combined deliveries preserve
-//!   the first result (`async/future_impl.dart:485-491,745-755`);
+//!   the first result, and listeners attached repeatedly are notified in
+//!   registration order (`async/future_impl.dart:485-491,593-612,745-755`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
