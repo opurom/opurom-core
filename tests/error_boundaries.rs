@@ -149,3 +149,48 @@ fn error_to_string_is_deterministic_across_instances() {
     assert_eq!(a.dart_to_string(), b.dart_to_string());
     assert_eq!(a.dart_to_string().as_bytes(), b.dart_to_string().as_bytes());
 }
+
+#[test]
+fn format_exception_reports_lf_line_and_column() {
+    // core/exceptions.dart:107-127: line and character are 1-based; an LF
+    // starts a new line.
+    let error = DartError::FormatException {
+        message: "bad".to_owned(),
+        source: Some("ab\ncd".to_owned()),
+        offset: Some(3),
+    };
+    assert_eq!(
+        error.dart_to_string(),
+        "FormatException: bad (at line 2, character 1)\ncd\n^\n"
+    );
+}
+
+#[test]
+fn format_exception_treats_crlf_as_one_line_break() {
+    // core/exceptions.dart:112-121: LF after CR does not increment twice.
+    let error = DartError::FormatException {
+        message: "bad".to_owned(),
+        source: Some("ab\r\ncd".to_owned()),
+        offset: Some(4),
+    };
+    assert_eq!(
+        error.dart_to_string(),
+        "FormatException: bad (at line 2, character 1)\ncd\n^\n"
+    );
+}
+
+#[test]
+fn format_exception_limits_long_line_to_context_window() {
+    // core/exceptions.dart:142-161: with the offset far from both ends,
+    // only 36 characters on each side are shown with ellipses.
+    let source = format!("{}X{}", "a".repeat(100), "b".repeat(100));
+    let error = DartError::FormatException {
+        message: "bad".to_owned(),
+        source: Some(source),
+        offset: Some(100),
+    };
+    let rendered = error.dart_to_string();
+    assert!(rendered.contains("..."));
+    assert!(rendered.contains('X'));
+    assert!(rendered.ends_with("^\n"));
+}

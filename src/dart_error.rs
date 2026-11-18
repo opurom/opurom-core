@@ -153,9 +153,9 @@ impl DartError {
                 source,
                 offset,
             } => {
-                // `core/exceptions.dart:88-127,162-165`: the report always
-                // contains the message; a string source and a valid offset
-                // add a caret line. Long sources are truncated at 78 chars.
+                // `core/exceptions.dart:88-161`: always include the message;
+                // for a string source with a valid offset, mark the exact
+                // character with a caret and report 1-based line/column.
                 let mut report = "FormatException".to_owned();
                 if !message.is_empty() {
                     report.push_str(": ");
@@ -164,22 +164,71 @@ impl DartError {
                 if let Some(source) = source {
                     match offset {
                         Some(offset) if *offset >= 0 && *offset <= source.len() as i64 => {
-                            report.push_str(" (at character ");
-                            report.push_str(&(*offset + 1).to_string());
-                            report.push_str(")\n");
-                            let mut slice = source.clone();
-                            if slice.len() > 78 {
-                                slice.truncate(75);
-                                slice.push_str("...");
+                            let offset = *offset as usize;
+                            let mut line_num = 1usize;
+                            let mut line_start = 0usize;
+                            let mut previous_was_cr = false;
+                            for (index, character) in
+                                source.char_indices().take_while(|(i, _)| *i < offset)
+                            {
+                                match character {
+                                    '\n' => {
+                                        if line_start != index || !previous_was_cr {
+                                            line_num += 1;
+                                        }
+                                        line_start = index + 1;
+                                        previous_was_cr = false;
+                                    }
+                                    '\r' => {
+                                        line_num += 1;
+                                        line_start = index + 1;
+                                        previous_was_cr = true;
+                                    }
+                                    _ => previous_was_cr = false,
+                                }
                             }
-                            report.push_str(&slice);
+                            if line_num > 1 {
+                                report.push_str(&format!(
+                                    " (at line {line_num}, character {})\n",
+                                    offset - line_start + 1
+                                ));
+                            } else {
+                                report.push_str(&format!(" (at character {})\n", offset + 1));
+                            }
+                            let line_end = source[offset..]
+                                .find(['\n', '\r'])
+                                .map_or(source.len(), |relative| offset + relative);
+                            let mut slice = &source[line_start..line_end];
+                            let mut prefix = "";
+                            let mut postfix = "";
+                            if line_end - line_start > 78 {
+                                let index = offset - line_start;
+                                if index < 75 {
+                                    slice = &slice[..75];
+                                    postfix = "...";
+                                } else if line_end - offset < 75 {
+                                    slice = &slice[slice.len() - 75..];
+                                    prefix = "...";
+                                } else {
+                                    slice = &source[offset - 36..offset + 36];
+                                    prefix = "...";
+                                    postfix = "...";
+                                }
+                            }
+                            let mark = prefix.len() + offset
+                                - line_start
+                                - if prefix.is_empty() { 0 } else { 0 };
+                            report.push_str(prefix);
+                            report.push_str(slice);
+                            report.push_str(postfix);
                             report.push('\n');
-                            for _ in 0..*offset {
+                            for _ in 0..mark {
                                 report.push(' ');
                             }
                             report.push_str("^\n");
                         }
                         _ => {
+                            // core/exceptions.dart:101-105: no valid offset.
                             report.push('\n');
                             let mut slice = source.clone();
                             if slice.len() > 78 {
