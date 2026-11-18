@@ -137,7 +137,10 @@ fn hooks_fire_on_first_listen_and_last_cancel() {
     let canceled_clone = Rc::clone(&canceled);
     let hooks = StreamHooks {
         on_listen: Some(Rc::new(move || *listened_clone.borrow_mut() += 1)),
-        on_cancel: Some(Rc::new(move || *canceled_clone.borrow_mut() += 1)),
+        on_cancel: Some(Rc::new(move || {
+            *canceled_clone.borrow_mut() += 1;
+            None
+        })),
         ..StreamHooks::default()
     };
     let stream = runtime.broadcast_controller(hooks);
@@ -1316,6 +1319,42 @@ fn cancel_future_without_a_cancel_hook_completes_immediately() {
     let cancel_future = subscription.cancel_future(&future_runtime);
     assert_eq!(
         cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn on_cancel_future_delays_cancel_and_done_futures() {
+    // stream_controller.dart:725-775: when onCancel returns a future, both
+    // subscription.cancel's future and controller.done wait for it.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let cancel_gate = future_runtime.completer();
+    let cancel_gate_future = cancel_gate.future();
+    let cancel_calls = Rc::new(RefCell::new(0));
+    let cancel_calls_clone = Rc::clone(&cancel_calls);
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || {
+            *cancel_calls_clone.borrow_mut() += 1;
+            Some(cancel_gate_future.clone())
+        })),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    let stream_done = stream_runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(*cancel_calls.borrow(), 1);
+    assert!(!cancel_future.is_completed());
+    assert!(!stream_done.is_completed());
+    let _ = cancel_gate.complete(FutureValue::Int(7));
+    future_runtime.pump(16);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Int(7)))
+    );
+    assert_eq!(
+        stream_done.completion(),
         Some(Completion::Value(FutureValue::Null))
     );
 }

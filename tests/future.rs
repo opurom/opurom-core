@@ -1084,3 +1084,28 @@ fn late_cleanup_future_errors_follow_the_combined_error() {
         vec![AsyncError::new("late-cleanup")]
     );
 }
+
+#[test]
+fn late_cleanup_after_successful_wait_is_reported() {
+    // future.dart:574-577,579-586: a late cleanup future is not part of the
+    // successful wait result, but its error is still reported to the zone.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::List(vec![int(1), int(2)])))
+    );
+    let errors = report_late_cleanup_future_errors(
+        &runtime,
+        &[runtime.error(AsyncError::new("late-after-success"))],
+        16,
+    );
+    assert_eq!(errors, vec![AsyncError::new("late-after-success")]);
+    assert_eq!(runtime.unhandled_errors(), errors);
+}

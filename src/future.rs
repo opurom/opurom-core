@@ -34,8 +34,8 @@
 //!   before the combined result, and eager mode reports only cleanup futures
 //!   produced before the first error; non-eager delivery keeps that order
 //!   while waiting for all inputs, and cleanup errors that arrive later are
-//!   reported after the combined error (`async/future.dart:322-330,542-558,
-//!   579-590`);
+//!   reported after the result, even when the combined wait succeeded
+//!   (`async/future.dart:322-330,542-558,574-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask

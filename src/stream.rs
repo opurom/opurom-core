@@ -40,8 +40,9 @@
 //!   forwarded; the controller `done` future is completed at the terminal
 //!   event even without listeners, and a canceled single subscription
 //!   completes it immediately; `cancel()` returns the controller's cancel
-//!   future (`async/stream_impl.dart:232-240,287-294`,
-//!   `async/stream_controller.dart:465-469,528-552,590-613,913-967`,
+//!   future, which waits for an asynchronous `onCancel` hook
+//!   (`async/stream_impl.dart:232-240,287-294`,
+//!   `async/stream_controller.dart:465-469,528-552,590-613,725-775,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
@@ -370,8 +371,17 @@ impl StreamSubscription {
             (on_cancel, done_waiters)
         };
         self.pending_cancel.set(false);
-        if let Some(on_cancel) = on_cancel {
-            on_cancel();
+        let hook_future = on_cancel.and_then(|hook| hook());
+        // Dart waits for the controller's onCancel future before completing
+        // the cancel future and the controller done future
+        // (`stream_controller.dart:725-775`).
+        if let Some(hook_future) = hook_future {
+            StreamRuntime::complete_terminal_waiters_after(
+                &hook_future,
+                cancel_completer,
+                done_waiters,
+            );
+            return;
         }
         if let Some(completer) = cancel_completer {
             let _ = completer.complete(FutureValue::Null);
@@ -406,7 +416,7 @@ pub struct StreamHooks {
     pub on_resume: Option<Rc<dyn Fn()>>,
     #[doc(hidden)]
     pub on_resume_input: Option<Rc<dyn Fn()>>,
-    pub on_cancel: Option<Rc<dyn Fn()>>,
+    pub on_cancel: Option<Rc<dyn Fn() -> Option<Future>>>,
 }
 
 impl std::fmt::Debug for StreamHooks {
@@ -447,7 +457,7 @@ struct StreamInner {
 }
 
 impl StreamInner {
-    fn take_cancel_hook_if_last(&mut self) -> Option<Rc<dyn Fn()>> {
+    fn take_cancel_hook_if_last(&mut self) -> Option<Rc<dyn Fn() -> Option<Future>>> {
         if self.subscriptions.values().all(|s| s.state.canceled) {
             self.hooks.on_cancel.take()
         } else {
@@ -744,7 +754,10 @@ impl Stream {
                     let mut state = cancel_target.inner.borrow_mut();
                     state.hooks.on_pause_input = Some(Rc::new(move || pause_source.pause()));
                     state.hooks.on_resume_input = Some(Rc::new(move || resume_source.resume()));
-                    state.hooks.on_cancel = Some(Rc::new(move || cancel_source.cancel()));
+                    state.hooks.on_cancel = Some(Rc::new(move || {
+                        cancel_source.cancel();
+                        None
+                    }));
                 }))
             };
         }
@@ -795,6 +808,37 @@ impl StreamRuntime {
         for waiter in waiters {
             let _ = waiter.complete(FutureValue::Null);
         }
+    }
+
+    fn complete_terminal_waiters_after(
+        trigger: &Future,
+        cancel_completer: Option<crate::future::Completer>,
+        done_waiters: Vec<crate::future::Completer>,
+    ) {
+        let cancel_waiter = Rc::new(RefCell::new(cancel_completer));
+        let cancel_waiter_clone = Rc::clone(&cancel_waiter);
+        let done_waiters = Rc::new(RefCell::new(done_waiters));
+        let done_waiters_clone = Rc::clone(&done_waiters);
+        let runtime = FutureRuntime::new();
+        trigger.clone().then(
+            &runtime,
+            Rc::new(move |value| {
+                if let Some(completer) = cancel_waiter_clone.borrow_mut().take() {
+                    let _ = completer.complete(value);
+                }
+                FutureValue::Null
+            }) as crate::future::OnValue,
+        );
+        trigger.clone().then(
+            &runtime,
+            Rc::new(move |_| {
+                for waiter in done_waiters_clone.borrow_mut().drain(..) {
+                    let _ = waiter.complete(FutureValue::Null);
+                }
+                FutureValue::Null
+            }) as crate::future::OnValue,
+        );
+        runtime.pump(16);
     }
 
     fn controller_with(&self, hooks: StreamHooks, broadcast: bool) -> Stream {
