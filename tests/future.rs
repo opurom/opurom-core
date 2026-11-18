@@ -703,3 +703,51 @@ fn wait_without_input_errors_never_runs_cleanup() {
         Some(CombineOutcome::Wait(vec![int(1), int(2)]))
     );
 }
+
+// End-to-end uncaught reporting order, pinned to Dart 3.14
+// (async/future.dart:529-600, schedule_microtask.dart:63-105).
+#[test]
+fn wait_cleanup_errors_are_reported_uncaught_before_the_combined_error() {
+    // future.dart:542-546,581-585: each cleanup body runs inside Future.sync,
+    // so its error is uncaught; the combined error follows in the same zone.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(1) => Err(AsyncError::new("cleanup-1")),
+            FutureValue::Int(2) => Err(AsyncError::new("cleanup-2")),
+            _ => Ok(()),
+        }),
+    );
+    let uncaught = wait_uncaught_errors(&step);
+    uncaught.report_cleanup_errors(&runtime);
+    if let Some(combined) = &uncaught.combined {
+        runtime.report_uncaught(combined.clone());
+    }
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("boom"),
+        ]
+    );
+}
+
+#[test]
+fn uncaught_reporting_keeps_insertion_order() {
+    // future.dart:819-823: uncaught errors are reported in the order they
+    // occur.
+    let runtime = FutureRuntime::new();
+    runtime.report_uncaught(AsyncError::new("first"));
+    runtime.report_uncaught(AsyncError::new("second"));
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("first"), AsyncError::new("second")]
+    );
+}

@@ -3,8 +3,8 @@
 //! (Dart SDK 3.14.0).
 
 use opurom_core::{
-    AsyncError, Completion, DataCallback, DoneCallback, ErrorCallback, FutureRuntime, FutureValue,
-    StreamEvent, StreamHooks, StreamRuntime,
+    AsyncError, Completion, DartError, DataCallback, DoneCallback, ErrorCallback, FutureRuntime,
+    FutureValue, StreamEvent, StreamHooks, StreamRuntime,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -857,4 +857,59 @@ fn as_future_error_completes_only_its_own_future() {
     );
     assert!(first_subscription.id() != second_subscription.id());
     assert!(future_runtime.unhandled_errors().is_empty());
+}
+
+// Single-subscription protocol boundary, pinned to Dart 3.14
+// (async/stream_controller.dart:440-452,509-519,688-696).
+#[test]
+fn single_subscription_rejects_a_second_listen() {
+    // stream_controller.dart:688-696: a single-subscription controller
+    // accepts one listener only.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let _first = stream.listen(None, None, None);
+    let error = stream.try_listen_with(None, None, None, ListenOptions::default());
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Stream has already been listened to.".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn single_subscription_rejects_a_listen_after_cancel() {
+    // stream_controller.dart:509-519: after a listener was canceled the
+    // controller is no longer in its initial state, so a later listen fails.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let first = stream.listen(None, None, None);
+    first.cancel();
+    let error = stream.try_listen_with(None, None, None, ListenOptions::default());
+    assert!(matches!(error, Err(DartError::State(_))));
+}
+
+#[test]
+fn broadcast_accepts_many_listeners() {
+    // stream_controller.dart:266-275: a broadcast controller keeps one
+    // subscription per listener and never rejects a later listen.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let first = stream.try_listen_with(None, None, None, ListenOptions::default());
+    let second = stream.try_listen_with(None, None, None, ListenOptions::default());
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    assert_ne!(first.unwrap().id(), second.unwrap().id());
+}
+
+#[test]
+fn pipe_over_an_already_listened_source_reports_the_refusal() {
+    // stream_controller.dart:688-696: a pipe subscribes to its source, so a
+    // source that already has a listener refuses the pipe's subscription.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let _first = source.listen(None, None, None);
+    let mapped = source.map(Rc::new(|value| value));
+    let error = mapped.try_listen_with(None, None, None, ListenOptions::default());
+    assert!(matches!(error, Err(DartError::State(_))));
 }

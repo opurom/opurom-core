@@ -7,7 +7,8 @@
 //!
 //! Ported rules:
 //! - a single-subscription controller buffers events until a listener is
-//!   registered (`async/stream_controller.dart:92-120`);
+//!   registered and refuses every later listen with a state error
+//!   (`async/stream_controller.dart:92-120,440-452,688-696`);
 //! - a broadcast controller does not buffer events when there is no
 //!   listener: events sent while nobody is subscribed are dropped
 //!   (`async/stream_controller.dart:132-139`);
@@ -42,6 +43,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::dart_error::DartError;
 use crate::future::{AsyncError, Future, FutureRuntime, FutureValue};
 use crate::microtask::{CallbackId, MicrotaskQueue};
 
@@ -377,6 +379,14 @@ impl std::fmt::Debug for StreamHooks {
 struct StreamInner {
     broadcast: bool,
     closed: bool,
+    /// Whether a listener was ever created. A single-subscription controller
+    /// rejects every later listen, even after the first one was canceled
+    /// (`async/stream_controller.dart:440-452,509-519,688-696`).
+    ever_listened: bool,
+    /// Error raised while the `onListen` hook subscribed to the source. A
+    /// forwarding pipe reports the source's refusal through this field
+    /// (`async/stream_pipe.dart:134-146`).
+    listen_error: Option<DartError>,
     /// Events buffered for a single-subscription controller before listen
     /// (`stream_controller.dart:97-98`).
     pre_listen: VecDeque<StreamEvent>,
@@ -398,6 +408,8 @@ impl StreamInner {
         Self {
             broadcast,
             closed: false,
+            ever_listened: false,
+            listen_error: None,
             pre_listen: VecDeque::new(),
             subscriptions: std::collections::BTreeMap::new(),
             hooks,
@@ -458,6 +470,11 @@ impl Stream {
 
     /// Registers a listener with `cancelOnError` support
     /// (`stream.dart:723`, `async/stream_impl.dart:121-138`).
+    ///
+    /// A single-subscription controller accepts one listener only; a second
+    /// listen is a protocol violation and panics with the Dart message
+    /// (`async/stream_controller.dart:688-696`). Hosts that need the error
+    /// as data use [`Stream::try_listen_with`].
     pub fn listen_with(
         &self,
         on_data: Option<DataCallback>,
@@ -465,7 +482,30 @@ impl Stream {
         on_done: Option<DoneCallback>,
         options: ListenOptions,
     ) -> StreamSubscription {
+        match self.try_listen_with(on_data, on_error, on_done, options) {
+            Ok(subscription) => subscription,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Registers a listener and reports the single-subscription protocol
+    /// violation as data (`async/stream_controller.dart:688-696`).
+    pub fn try_listen_with(
+        &self,
+        on_data: Option<DataCallback>,
+        on_error: Option<ErrorCallback>,
+        on_done: Option<DoneCallback>,
+        options: ListenOptions,
+    ) -> Result<StreamSubscription, DartError> {
         let mut inner = self.inner.borrow_mut();
+        if !inner.broadcast && inner.ever_listened {
+            // `_subscribe` rejects every listen after the first one
+            // (`async/stream_controller.dart:688-696`).
+            return Err(DartError::State(
+                "Stream has already been listened to.".to_owned(),
+            ));
+        }
+        inner.ever_listened = true;
         let id = inner.next_subscription;
         inner.next_subscription += 1;
         let subscription = Subscription::new(id, on_data, on_error, on_done)
@@ -478,6 +518,7 @@ impl Stream {
         } else {
             None
         };
+        inner.listen_error = None;
         let pre_listen = if !inner.broadcast {
             std::mem::take(&mut inner.pre_listen)
         } else {
@@ -489,6 +530,18 @@ impl Stream {
         }
         if let Some(on_listen) = on_listen {
             on_listen();
+        }
+        let listen_error = {
+            let mut state = self.inner.borrow_mut();
+            state.listen_error.take()
+        };
+        if let Some(error) = listen_error {
+            // The upstream refused the subscription; the pipe never becomes a
+            // listener (`async/stream_pipe.dart:134-146`).
+            let mut state = self.inner.borrow_mut();
+            state.subscriptions.remove(&id);
+            state.ever_listened = false;
+            return Err(error);
         }
         let pending_cancel = {
             let state = self.inner.borrow();
@@ -502,7 +555,7 @@ impl Stream {
         for event in pre_listen {
             let _ = handle.deliver(&event);
         }
-        handle
+        Ok(handle)
     }
 
     /// Applies `map` semantics (`stream_pipe.dart:237-253`): each data event
@@ -588,7 +641,7 @@ impl Stream {
                         let mut state = options_target.inner.borrow_mut();
                         state.hooks.on_error_options = Some(options_hook_target);
                     }
-                    let subscription = source.listen_with(
+                    let subscription = source.try_listen_with(
                         Some(Rc::new(move |value| {
                             if let Some(StreamEvent::Data(mapped)) =
                                 forward_data(StreamEvent::Data(value))
@@ -615,6 +668,14 @@ impl Stream {
                         // (`stream_pipe.dart:134-145,164-179`).
                         ListenOptions::default(),
                     );
+                    let subscription = match subscription {
+                        Ok(subscription) => subscription,
+                        Err(error) => {
+                            let mut state = options_target.inner.borrow_mut();
+                            state.listen_error = Some(error);
+                            return;
+                        }
+                    };
                     let source_subscription = subscription;
                     let pause_source = source_subscription.clone();
                     let resume_source = source_subscription.clone();

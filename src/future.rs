@@ -24,6 +24,8 @@
 //!   result; cleanup errors are reported as uncaught in value order, and an
 //!   empty input completes with an empty list
 //!   (`async/future.dart:529-559,579-600`);
+//! - an uncaught error is reported once and kept in reporting order
+//!   (`async/future.dart:819-823,1336-1351`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -201,6 +203,13 @@ impl FutureRuntime {
     /// Errors reported without a handler, oldest first.
     pub fn unhandled_errors(&self) -> Vec<AsyncError> {
         self.unhandled.borrow().clone()
+    }
+
+    /// Reports an error that no handler caught. Dart routes such errors to
+    /// the zone's uncaught-error handler (`async/future.dart:542-546,581-585`
+    /// for cleanup bodies); the core keeps them in reporting order.
+    pub fn report_uncaught(&self, error: AsyncError) {
+        self.unhandled.borrow_mut().push(error);
     }
 
     /// A future that completes with `value`. Dart completes such a future
@@ -794,6 +803,17 @@ pub fn wait_uncaught_errors(step: &WaitStep) -> WaitUncaughtErrors {
             Some(CombineOutcome::Error(error)) => Some(error.clone()),
             _ => None,
         },
+    }
+}
+
+impl WaitUncaughtErrors {
+    /// Reports the cleanup errors to the runtime as uncaught, in cleanup
+    /// order. The combined error belongs to the returned future and is
+    /// therefore not reported here (`async/future.dart:550-557,587-590`).
+    pub fn report_cleanup_errors(&self, runtime: &FutureRuntime) {
+        for error in &self.cleanup {
+            runtime.report_uncaught(error.clone());
+        }
     }
 }
 
