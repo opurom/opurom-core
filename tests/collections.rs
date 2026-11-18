@@ -3,14 +3,17 @@
 
 use opurom_core::{
     add_all, collect_where, fold, index_of, last_index_of, map, reduce, remove_at, reversed,
-    skip_take, sublist, to_list, NoElementError, OrderedMap, OrderedSet,
+    skip_take, sort_by, sublist, to_list, GuardedIterator, NoElementError, OrderedMap, OrderedSet,
 };
 
 #[test]
 fn reduce_uses_first_element_and_folds_the_rest() {
     // core/iterable.dart:392-402.
     assert_eq!(reduce(&[10, 2, 5, 1], |a, b| a + b), Ok(18));
-    assert_eq!(reduce::<i64, _>(&[], |a, b| a + b), Err(NoElementError));
+    assert_eq!(
+        reduce::<i64, _>(&[], |a, b| a + b),
+        Err(NoElementError::NoElement)
+    );
 }
 
 #[test]
@@ -119,4 +122,148 @@ fn collection_results_are_byte_deterministic() {
     let b: OrderedSet<i64> = values.into_iter().collect();
     assert_eq!(a, b);
     assert_eq!(fold(&values, 0, |sum, value| sum + value), 14);
+}
+
+#[test]
+fn reduce_empty_uses_typed_no_element_variant() {
+    assert_eq!(
+        reduce::<i64, _>(&[], |a, b| a + b),
+        Err(NoElementError::NoElement)
+    );
+    assert_eq!(
+        NoElementError::NoElement.to_string(),
+        "IterableElementError.noElement"
+    );
+}
+
+#[test]
+fn guarded_iterator_walks_empty_and_single_element() {
+    // internal/iterable.dart:363-375: moveNext returns false past the end.
+    let empty: Vec<i64> = Vec::new();
+    let mut iterator = GuardedIterator::new(&empty);
+    assert_eq!(iterator.move_next(), Ok(None));
+    assert_eq!(iterator.index(), 0);
+
+    let single = vec![7];
+    let mut iterator = GuardedIterator::new(&single);
+    assert_eq!(iterator.move_next(), Ok(Some(&7)));
+    assert_eq!(iterator.move_next(), Ok(None));
+    assert_eq!(iterator.index(), 1);
+}
+
+#[test]
+fn guarded_iterator_detects_length_change() {
+    // core/iterable.dart:54-58, internal/iterable.dart:363-367: changing a
+    // collection during iteration is reported at the next moveNext.
+    let values = vec![1, 2, 3];
+    let live_length = std::cell::Cell::new(values.len());
+    let mut iterator = GuardedIterator::new(&values).with_live_length(&live_length);
+    assert_eq!(iterator.move_next(), Ok(Some(&1)));
+    live_length.set(4); // host mutates the collection
+    assert_eq!(
+        iterator.move_next(),
+        Err(NoElementError::ConcurrentModification)
+    );
+}
+
+#[test]
+fn guarded_iterator_detects_shrink() {
+    let values = vec![1, 2, 3];
+    let live_length = std::cell::Cell::new(values.len());
+    let mut iterator = GuardedIterator::new(&values).with_live_length(&live_length);
+    live_length.set(2);
+    assert_eq!(
+        iterator.move_next(),
+        Err(NoElementError::ConcurrentModification)
+    );
+}
+
+#[test]
+fn large_sequential_iteration_is_exact() {
+    // core/iterable.dart:69-88: operators iterate in source order.
+    let values: Vec<i64> = (0..10_000).collect();
+    let mut iterator = GuardedIterator::new(&values);
+    let mut count = 0i64;
+    while let Ok(Some(value)) = iterator.move_next() {
+        assert_eq!(*value, count);
+        count += 1;
+    }
+    assert_eq!(count, 10_000);
+}
+
+#[test]
+fn duplicates_are_preserved_by_iterables_but_removed_by_sets() {
+    // core/iterable.dart:257,279: map/where keep duplicates; core/set.dart:194
+    // enforces uniqueness.
+    let values = [1, 1, 2, 2, 2, 3];
+    assert_eq!(collect_where(&values, |_| true), values);
+    let set: OrderedSet<i64> = values.into_iter().collect();
+    assert_eq!(set.to_vec(), vec![1, 2, 3]);
+    assert_eq!(set.len(), 3);
+}
+
+#[test]
+fn comparator_errors_propagate_without_swallowing() {
+    // core/list.dart:485-511: the comparator must act as a Comparator and
+    // its failure surfaces to the caller.
+    let result = std::panic::catch_unwind(|| {
+        let mut values = vec![3, 1, 2];
+        sort_by(&mut values, |left, right| {
+            if *left == 1 {
+                panic!("comparator failed");
+            }
+            left.cmp(right)
+        });
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn comparator_sorts_extreme_and_duplicate_values() {
+    // core/list.dart:485-500: a comparator defines the result order.
+    let mut values = vec![i64::MAX, 0, i64::MIN, -1, 0];
+    sort_by(&mut values, |left, right| left.cmp(right));
+    assert_eq!(values, vec![i64::MIN, -1, 0, 0, i64::MAX]);
+}
+
+#[test]
+fn map_and_add_all_do_not_alias_source() {
+    // core/iterable.dart:257, core/list.dart:473: results are fresh lists.
+    let source = vec![1, 2, 3];
+    let mapped = map(&source, |value| value * 2);
+    let mut target = Vec::new();
+    add_all(&mut target, &mapped);
+    assert_eq!(target, vec![2, 4, 6]);
+    assert_eq!(source, vec![1, 2, 3]);
+}
+
+#[test]
+fn ordered_set_empty_set_algebra() {
+    // core/set.dart:298,312,326: empty sets are identities for union and
+    // annihilators for intersection/difference.
+    let empty = OrderedSet::<i64>::new();
+    let full: OrderedSet<i64> = [1, 2].into_iter().collect();
+    assert_eq!(full.union(&empty).to_vec(), vec![1, 2]);
+    assert!(full.intersection(&empty).is_empty());
+    assert_eq!(full.difference(&empty).to_vec(), vec![1, 2]);
+    assert!(empty.union(&full).to_vec() == vec![1, 2]);
+}
+
+#[test]
+fn ordered_map_large_insertion_and_removal_keeps_order() {
+    // core/map.dart:397,411,425: insertion order remains stable across
+    // overwrite and removal.
+    let mut map = OrderedMap::new();
+    for value in 0..1_000 {
+        map.insert(value, value * 2);
+    }
+    map.insert(500, -1);
+    assert_eq!(map.len(), 1_000);
+    assert_eq!(map.get(&500), Some(&-1));
+    assert_eq!(
+        map.keys().copied().collect::<Vec<_>>(),
+        (0..1_000).collect::<Vec<_>>()
+    );
+    assert_eq!(map.remove(&0), Some(0));
+    assert_eq!(map.keys().next(), Some(&1));
 }

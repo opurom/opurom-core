@@ -38,7 +38,8 @@ pub use clamping_scroll::{
 };
 pub use collections::{
     add_all, fold, index_of, last_index_of, map, r#where as collect_where, reduce, remove_at,
-    reversed, skip_take, sublist, to_list, NoElementError, OrderedMap, OrderedSet,
+    reversed, skip_take, sort_by, sublist, to_list, GuardedIterator, NoElementError, OrderedMap,
+    OrderedSet,
 };
 pub use convert::{
     base64_decode, base64_encode, clamp_i64, convert_error_as_format, uri_encode_component,

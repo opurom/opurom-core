@@ -32,9 +32,16 @@
 use std::collections::HashMap;
 
 /// Error produced by `reduce` on an empty iterable
-/// (`core/iterable.dart:392-396`).
+/// (`core/iterable.dart:392-396`), or by a guarded iterator when the
+/// underlying collection changed (`internal/iterable.dart:363-367`,
+/// `core/errors.dart:626-643`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoElementError;
+pub enum NoElementError {
+    /// `IterableElementError.noElement`.
+    NoElement,
+    /// `ConcurrentModificationError` during iteration.
+    ConcurrentModification,
+}
 
 impl std::fmt::Display for NoElementError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,7 +57,7 @@ where
     T: Clone,
     F: Fn(&T, &T) -> T,
 {
-    let (first, rest) = elements.split_first().ok_or(NoElementError)?;
+    let (first, rest) = elements.split_first().ok_or(NoElementError::NoElement)?;
     let mut value = first.clone();
     for element in rest {
         value = combine(&value, element);
@@ -366,4 +373,71 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> OrderedMap<K, V> {
             .iter()
             .map(|key| (key, self.values.get(key).unwrap()))
     }
+}
+
+/// A deterministic iterator with Dart's length-change guard
+/// (`internal/iterable.dart:346-375`, `core/iterable.dart:54-61`).
+///
+/// The length is captured at construction. A later `move_next` checks the
+/// current length and returns `ConcurrentModificationError` if it changed,
+/// exactly as Dart's `ListIterator.moveNext` does.
+pub struct GuardedIterator<'a, T> {
+    elements: &'a [T],
+    captured_length: usize,
+    /// The host reports the live collection length through this cell when
+    /// the collection can change during iteration. A plain slice iterator
+    /// never changes it.
+    live_length: Option<&'a std::cell::Cell<usize>>,
+    index: usize,
+}
+
+impl<'a, T> GuardedIterator<'a, T> {
+    pub fn new(elements: &'a [T]) -> Self {
+        Self {
+            elements,
+            captured_length: elements.len(),
+            live_length: None,
+            index: 0,
+        }
+    }
+
+    /// Attaches a live length observer, used by hosts whose collection can
+    /// be mutated while the iterator exists (`core/iterable.dart:54-58`).
+    pub fn with_live_length(mut self, live: &'a std::cell::Cell<usize>) -> Self {
+        self.live_length = Some(live);
+        self
+    }
+
+    /// `ListIterator.moveNext` (`internal/iterable.dart:363-375`).
+    pub fn move_next(&mut self) -> Result<Option<&'a T>, NoElementError> {
+        let live = self
+            .live_length
+            .map_or(self.elements.len(), |cell| cell.get());
+        if live != self.captured_length {
+            return Err(NoElementError::ConcurrentModification);
+        }
+        if self.index >= self.elements.len() {
+            return Ok(None);
+        }
+        let current = &self.elements[self.index];
+        self.index += 1;
+        Ok(Some(current))
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
+/// Sorts using Dart's comparator contract (`core/list.dart:485-511`). The
+/// comparator's error is propagated unchanged; because Dart's sort is not
+/// guaranteed stable (`list.dart:502-505`), equal elements may be reordered.
+pub fn sort_by<T, F>(elements: &mut [T], compare: F)
+where
+    F: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    // Rust's stable sort is stricter than Dart's requirement but still
+    // satisfies the comparator contract; a panicking comparator propagates
+    // to the caller just like Dart's.
+    elements.sort_by(compare);
 }

@@ -113,7 +113,7 @@ fn reduce_empty_error_is_distinct_from_format_error() {
     // core/iterable.dart:392-396: reduce throws IterableElementError on an
     // empty iterable, not a format error.
     let error = reduce::<i64, _>(&[], |a, b| a + b).unwrap_err();
-    assert_eq!(error, NoElementError);
+    assert_eq!(error, NoElementError::NoElement);
     assert_eq!(error.to_string(), "IterableElementError.noElement");
 }
 
