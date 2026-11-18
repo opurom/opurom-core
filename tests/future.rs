@@ -2,7 +2,9 @@
 //! `flutter-golden` HEAD ab2912035e160d9cad6306df307576da6128ebdb
 //! (Dart SDK 3.14.0).
 
-use opurom_core::{AsyncError, Completion, FutureRuntime, FutureValue, OnError, OnValue};
+use opurom_core::{
+    AsyncError, CombineOutcome, Completion, FutureRuntime, FutureValue, OnError, OnValue,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -276,4 +278,149 @@ fn chained_error_becomes_handled_at_the_end() {
         .catch_error(&runtime, Rc::new(|_: &AsyncError| int(1)) as OnError);
     runtime.pump(16);
     assert!(runtime.unhandled_errors().is_empty());
+}
+
+// Future combinator boundary tests, pinned to Dart 3.14
+// (flutter-golden HEAD ab2912035e160d9cad6306df307576da6128ebdb).
+use opurom_core::{combine_completions, should_complete_wait_early, FutureCombineErrorPolicy};
+
+fn ok(value: i64) -> Completion {
+    Completion::Value(int(value))
+}
+
+fn err(message: &str) -> Completion {
+    Completion::Error(AsyncError::new(message))
+}
+
+#[test]
+fn wait_empty_returns_empty_list() {
+    // future.dart:598-600: no futures completes with an empty list.
+    assert_eq!(
+        combine_completions(&[], FutureCombineErrorPolicy::Wait),
+        CombineOutcome::Wait(Vec::new())
+    );
+}
+
+#[test]
+fn wait_collects_values_in_source_order() {
+    // future.dart:562-577: values are stored at their original positions.
+    assert_eq!(
+        combine_completions(&[ok(1), ok(2), ok(3)], FutureCombineErrorPolicy::Wait,),
+        CombineOutcome::Wait(vec![int(1), int(2), int(3)])
+    );
+}
+
+#[test]
+fn wait_keeps_first_error_and_its_stack_trace() {
+    // future.dart:530-537,553-558: later errors never replace the first.
+    let first = AsyncError {
+        message: "first".to_owned(),
+        stack_trace: "frame-a\nframe-b".to_owned(),
+    };
+    let second = AsyncError::new("second");
+    let outcome = combine_completions(
+        &[
+            ok(1),
+            Completion::Error(first.clone()),
+            Completion::Error(second),
+        ],
+        FutureCombineErrorPolicy::Wait,
+    );
+    assert_eq!(outcome, CombineOutcome::Error(first));
+}
+
+#[test]
+fn wait_eager_policy_signals_immediate_completion() {
+    // future.dart:550-552: eagerError completes on the first failure.
+    let inputs = [ok(1), err("boom"), ok(3)];
+    assert!(should_complete_wait_early(
+        &inputs,
+        FutureCombineErrorPolicy::WaitEager
+    ));
+    assert!(!should_complete_wait_early(
+        &inputs,
+        FutureCombineErrorPolicy::Wait
+    ));
+}
+
+#[test]
+fn any_returns_first_input_value() {
+    // future.dart:656-670: listeners are attached in source order; the
+    // first completed value wins.
+    assert_eq!(
+        combine_completions(&[ok(10), ok(20)], FutureCombineErrorPolicy::Any),
+        CombineOutcome::Any(int(10))
+    );
+}
+
+#[test]
+fn any_returns_first_error_when_it_precedes_values() {
+    // future.dart:662-664: an error also completes `any`.
+    assert_eq!(
+        combine_completions(&[err("first"), ok(20)], FutureCombineErrorPolicy::Any,),
+        CombineOutcome::Error(AsyncError::new("first"))
+    );
+}
+
+#[test]
+fn any_empty_never_completes_and_is_represented_as_empty_wait() {
+    // future.dart:666-669: with no inputs no listener can complete the
+    // completer, so the kernel returns a distinguishable empty outcome.
+    assert_eq!(
+        combine_completions(&[], FutureCombineErrorPolicy::Any),
+        CombineOutcome::Wait(Vec::new())
+    );
+}
+
+#[test]
+fn combinator_results_are_byte_deterministic() {
+    let inputs = [ok(1), err("x"), ok(3)];
+    for policy in [
+        FutureCombineErrorPolicy::Wait,
+        FutureCombineErrorPolicy::WaitEager,
+        FutureCombineErrorPolicy::Any,
+    ] {
+        let a = format!("{:?}", combine_completions(&inputs, policy));
+        let b = format!("{:?}", combine_completions(&inputs, policy));
+        assert_eq!(a, b);
+    }
+}
+
+// Future.forEach sequential boundary tests, pinned to Dart 3.14
+// (async/future.dart:672-699).
+use opurom_core::for_each_outcomes;
+
+#[test]
+fn for_each_processes_elements_in_order() {
+    let elements = vec![int(1), int(2), int(3)];
+    let outcomes = vec![ok(10), ok(20), ok(30)];
+    let result = for_each_outcomes(&elements, &outcomes);
+    assert_eq!(result.processed, elements);
+    assert_eq!(result.error, None);
+}
+
+#[test]
+fn for_each_stops_at_first_error() {
+    // future.dart:686-687: an error stops the iteration.
+    let elements = vec![int(1), int(2), int(3)];
+    let outcomes = vec![ok(10), err("stop"), ok(30)];
+    let result = for_each_outcomes(&elements, &outcomes);
+    assert_eq!(result.processed, vec![int(1)]);
+    assert_eq!(result.error, Some(AsyncError::new("stop")));
+}
+
+#[test]
+fn for_each_empty_list_completes_without_actions() {
+    let result = for_each_outcomes(&[], &[]);
+    assert!(result.processed.is_empty());
+    assert_eq!(result.error, None);
+}
+
+#[test]
+fn for_each_values_are_discarded() {
+    // future.dart:680-684: future values do not enter the result.
+    let elements = vec![int(7)];
+    let outcomes = vec![Completion::Value(FutureValue::Str("ignored".to_owned()))];
+    let result = for_each_outcomes(&elements, &outcomes);
+    assert_eq!(result.processed, vec![int(7)]);
 }

@@ -55,8 +55,9 @@ pub use drag_axis::{
 };
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use future::{
-    AsyncError, Completer, Completion, ErrorTest, Future, FutureRuntime, FutureValue, OnError,
-    OnValue,
+    combine_completions, for_each_outcomes, should_complete_wait_early, AsyncError, CombineOutcome,
+    Completer, Completion, ErrorTest, ForEachResult, Future, FutureCombineErrorPolicy,
+    FutureRuntime, FutureValue, OnError, OnValue,
 };
 pub use gestures::{
     ArenaEvent, ArenaStep, CancelReason, GestureArenaKernel, GestureKind, HitEntry, Point,

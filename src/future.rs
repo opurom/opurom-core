@@ -552,3 +552,118 @@ impl Completer {
         *self.completed.borrow()
     }
 }
+
+/// `Future.wait` / `Future.any` policy for how an error is reported
+/// (`async/future.dart:517-600,656-670`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutureCombineErrorPolicy {
+    /// `Future.wait` with `eagerError = false`: the first error is reported
+    /// after every input completes (`future.dart:550-559,587-590`).
+    Wait,
+    /// `Future.wait` with `eagerError = true`: the first error completes the
+    /// combined future immediately (`future.dart:550-552`).
+    WaitEager,
+    /// `Future.any`: the first completion (value or error) wins
+    /// (`future.dart:656-670`).
+    Any,
+}
+
+/// Result of combining futures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CombineOutcome {
+    /// `Future.wait` success: one value per input, in source order
+    /// (`future.dart:574-577`).
+    Wait(Vec<FutureValue>),
+    /// `Future.any` success: the first completed value.
+    Any(FutureValue),
+    /// The first error, with its stack trace (`future.dart:530-537,662-664`).
+    Error(AsyncError),
+}
+
+/// Combines already-completed futures with deterministic, source-ordered
+/// resolution. Inputs arrive as `Completion`s so the kernel never reads a
+/// clock or subscribes to an external source.
+///
+/// Sources: `async/future.dart:517-600` (`wait`) and `:656-670` (`any`).
+pub fn combine_completions(
+    inputs: &[Completion],
+    policy: FutureCombineErrorPolicy,
+) -> CombineOutcome {
+    match policy {
+        FutureCombineErrorPolicy::Any => {
+            // `any` attaches listeners in source order and the first one to
+            // complete wins (`future.dart:656-670`).
+            for input in inputs {
+                match input {
+                    Completion::Value(value) => return CombineOutcome::Any(value.clone()),
+                    Completion::Error(error) => return CombineOutcome::Error(error.clone()),
+                }
+            }
+            CombineOutcome::Wait(Vec::new())
+        }
+        FutureCombineErrorPolicy::Wait | FutureCombineErrorPolicy::WaitEager => {
+            let first_error = inputs.iter().find_map(|input| match input {
+                Completion::Error(error) => Some(error.clone()),
+                Completion::Value(_) => None,
+            });
+            if let Some(error) = first_error {
+                // The first error is kept, even when later inputs also fail
+                // (`future.dart:530-537,553-558`).
+                return CombineOutcome::Error(error);
+            }
+            CombineOutcome::Wait(
+                inputs
+                    .iter()
+                    .map(|input| match input {
+                        Completion::Value(value) => value.clone(),
+                        Completion::Error(_) => FutureValue::Null,
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Whether an eager error may complete `wait` before later inputs finish
+/// (`future.dart:550-552`). Kept as a separate predicate so hosts can drive
+/// partially-completed input sets without duplicating the policy branch.
+pub fn should_complete_wait_early(inputs: &[Completion], policy: FutureCombineErrorPolicy) -> bool {
+    policy == FutureCombineErrorPolicy::WaitEager
+        && inputs
+            .iter()
+            .any(|input| matches!(input, Completion::Error(_)))
+}
+
+/// Deterministic result of a host-driven `Future.forEach` sequence
+/// (`async/future.dart:672-699`): actions run in source order, and the first
+/// error stops the loop (`:686-687`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForEachResult {
+    /// Elements whose action completed successfully, in source order.
+    pub processed: Vec<FutureValue>,
+    /// The first error from an action, if any.
+    pub error: Option<AsyncError>,
+}
+
+/// Drives one `forEach` action per element. The host supplies the outcome of
+/// each action, so the kernel interprets no code and reads no clock.
+/// Non-future return values and future values are discarded
+/// (`future.dart:680-684`).
+pub fn for_each_outcomes(elements: &[FutureValue], outcomes: &[Completion]) -> ForEachResult {
+    let mut processed = Vec::new();
+    for (element, outcome) in elements.iter().zip(outcomes.iter()) {
+        match outcome {
+            Completion::Value(_) => processed.push(element.clone()),
+            Completion::Error(error) => {
+                return ForEachResult {
+                    processed,
+                    error: Some(error.clone()),
+                }
+            }
+        }
+    }
+    ForEachResult {
+        processed,
+        error: None,
+    }
+}
