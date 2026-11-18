@@ -1333,3 +1333,38 @@ fn repeated_listener_attachments_follow_source_order() {
         ]
     );
 }
+
+#[test]
+fn combined_future_listener_chain_stays_stable_across_completions() {
+    // future_impl.dart:593-612,745-755: once the combined future completes,
+    // later listener attachments notify immediately; the chain order stays
+    // deterministic and no listener is dropped.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    );
+    let combined = step.deliver(&runtime);
+    runtime.pump(16);
+    let order = Rc::new(RefCell::new(Vec::<String>::new()));
+    for tag in ["early", "late"] {
+        let order = Rc::clone(&order);
+        let tag = tag.to_owned();
+        let _ = combined.then(
+            &runtime,
+            Rc::new(move |value| {
+                order.borrow_mut().push(format!("{tag}:{value:?}"));
+                value
+            }) as OnValue,
+        );
+    }
+    runtime.pump(16);
+    assert_eq!(
+        *order.borrow(),
+        vec![
+            "early:List([Int(1), Int(2)])".to_owned(),
+            "late:List([Int(1), Int(2)])".to_owned(),
+        ]
+    );
+}
