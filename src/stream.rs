@@ -39,8 +39,9 @@
 //!   subscription; the returned future completes after source done is
 //!   forwarded; the controller `done` future is completed at the terminal
 //!   event even without listeners, and a canceled single subscription
-//!   completes it immediately
-//!   (`async/stream_controller.dart:465-469,528-552,590-613,913-967`,
+//!   completes it immediately; `cancel()` returns the controller's cancel
+//!   future (`async/stream_impl.dart:232-240,287-294`,
+//!   `async/stream_controller.dart:465-469,528-552,590-613,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
@@ -327,7 +328,20 @@ impl StreamSubscription {
         completer.future()
     }
 
+    /// Cancels this subscription and returns the controller's cancel future.
+    /// Dart returns `_cancelFuture` (or a null future) from
+    /// `StreamSubscription.cancel` (`async/stream_impl.dart:232-240,287-294`).
+    pub fn cancel_future(&self, runtime: &FutureRuntime) -> Future {
+        let completer = runtime.completer();
+        self.cancel_with_completer(Some(completer.clone()));
+        completer.future()
+    }
+
     pub fn cancel(&self) {
+        self.cancel_with_completer(None);
+    }
+
+    fn cancel_with_completer(&self, cancel_completer: Option<crate::future::Completer>) {
         let (on_cancel, done_waiters) = {
             let Ok(mut inner) = self.inner.try_borrow_mut() else {
                 // Re-entrant cancel during callback delivery; finalize after
@@ -358,6 +372,9 @@ impl StreamSubscription {
         self.pending_cancel.set(false);
         if let Some(on_cancel) = on_cancel {
             on_cancel();
+        }
+        if let Some(completer) = cancel_completer {
+            let _ = completer.complete(FutureValue::Null);
         }
         // A single-subscription controller's `done` future completes as soon
         // as its subscriber cancels (`stream_controller.dart:605-613`).

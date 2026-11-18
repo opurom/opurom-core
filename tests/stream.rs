@@ -1286,3 +1286,36 @@ fn broadcast_done_future_waits_for_done_not_cancel() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+// Cancel future and controller done future ordering, pinned to Dart 3.14
+// (async/stream_impl.dart:232-240,287-294, stream_controller.dart:605-613).
+#[test]
+fn cancel_future_completes_with_or_before_controller_done() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn cancel_future_without_a_cancel_hook_completes_immediately() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
