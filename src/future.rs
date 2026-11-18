@@ -27,7 +27,9 @@
 //! - an uncaught error is reported once and kept in reporting order
 //!   (`async/future.dart:819-823,1336-1351`);
 //! - a failing `cleanUp` body is uncaught and reported before the combined
-//!   future completes (`async/future.dart:542-546,581-585`);
+//!   future completes; eager wait discards inputs that arrive after the first
+//!   error instead of cleaning them up
+//!   (`async/future.dart:542-546,550-552,579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -739,9 +741,14 @@ impl WaitStep {
                     if first_error.is_none() {
                         values[index] = Some(value.clone());
                     } else if let Some(cleanup) = cleanup {
-                        cleaned_up.push(value.clone());
-                        if let Err(error) = cleanup(value) {
-                            cleanup_errors.push(error);
+                        // Eager wait has already completed on the first error,
+                        // so later inputs never reach cleanUp
+                        // (`future.dart:550-552,579-590`).
+                        if policy != FutureCombineErrorPolicy::WaitEager {
+                            cleaned_up.push(value.clone());
+                            if let Err(error) = cleanup(value) {
+                                cleanup_errors.push(error);
+                            }
                         }
                     }
                 }

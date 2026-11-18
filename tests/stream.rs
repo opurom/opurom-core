@@ -995,3 +995,84 @@ fn single_subscription_listen_after_close_still_gets_done() {
     assert!(subscription.is_ok());
     assert_eq!(*done_count.borrow(), 1);
 }
+
+// StreamController.addStream ordering, pinned to Dart 3.14
+// (async/stream_controller.dart:590-603,913-938,
+//  async/broadcast_stream_controller.dart:280-303).
+#[test]
+fn add_stream_forwards_source_order_then_closes() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let done_count = Rc::new(RefCell::new(0));
+    let seen_clone = Rc::clone(&seen);
+    let done_clone = Rc::clone(&done_count);
+    target.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        Some(Rc::new(move || *done_clone.borrow_mut() += 1) as DoneCallback),
+    );
+    let future = runtime.add_stream(&target, &source, false);
+    assert!(future.is_ok());
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*seen.borrow(), vec![int(1), int(2)]);
+    assert_eq!(*done_count.borrow(), 1);
+}
+
+#[test]
+fn add_stream_cancel_on_error_forwards_first_error_then_closes() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    target.listen(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(Rc::new(move |error: &AsyncError| {
+            error_events.borrow_mut().push(error.message.clone())
+        }) as ErrorCallback),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+    );
+    let future = runtime.add_stream(&target, &source, true);
+    assert!(future.is_ok());
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("first")));
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("second")));
+    assert_eq!(*events.borrow(), vec!["first", "done"]);
+}
+
+#[test]
+fn add_stream_without_cancel_forwards_all_errors() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let errors = Rc::new(RefCell::new(Vec::<String>::new()));
+    let errors_clone = Rc::clone(&errors);
+    target.listen(
+        None,
+        Some(Rc::new(move |error: &AsyncError| {
+            errors_clone.borrow_mut().push(error.message.clone())
+        }) as ErrorCallback),
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("first")));
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("second")));
+    assert_eq!(*errors.borrow(), vec!["first", "second"]);
+}
+
+#[test]
+fn add_stream_after_close_is_rejected() {
+    // stream_controller.dart:581-587: addStream refuses a closed controller.
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    runtime.add(&target, StreamEvent::Done);
+    let error = runtime.add_stream(&target, &source, false);
+    assert!(matches!(error, Err(DartError::State(_))));
+}

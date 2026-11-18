@@ -834,3 +834,56 @@ fn wait_delivery_of_a_successful_wait_yields_the_value_list() {
     );
     assert!(runtime.unhandled_errors().is_empty());
 }
+
+#[test]
+fn wait_eager_delivery_reports_cleanup_errors_before_the_combined_error() {
+    // future.dart:542-546,550-552,581-585: with eagerError the first error
+    // completes the wait future immediately, after its cleanup bodies have
+    // been scheduled as uncaught errors.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            None,
+        ],
+        FutureCombineErrorPolicy::WaitEager,
+        Some(&|value| match value {
+            FutureValue::Int(1) => Err(AsyncError::new("cleanup-1")),
+            _ => Ok(()),
+        }),
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("cleanup-1"), AsyncError::new("boom")]
+    );
+}
+
+#[test]
+fn wait_eager_delivery_ignores_later_values_and_cleanup() {
+    // future.dart:550-552,579-586: eagerError completes on the first error;
+    // pending inputs are not part of the delivered result.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            None,
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(3)),
+        ],
+        FutureCombineErrorPolicy::WaitEager,
+        Some(&|_| Err(AsyncError::new("cleanup-late"))),
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+    assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("boom")]);
+}

@@ -32,6 +32,9 @@
 //!   and a listener that subscribes after the close receives only the done
 //!   event (`async/broadcast_stream_controller.dart:201-209,247-276`,
 //!   `async/stream_controller.dart:581-587,628-656`);
+//! - `addStream` forwards source events in order; `cancelOnError=true`
+//!   forwards the first error and closes the target, while `false` forwards
+//!   all errors (`async/stream_controller.dart:590-603,913-938`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -763,11 +766,12 @@ impl StreamRuntime {
                 // has an effect (`async/stream_controller.dart:628-656`).
                 return Ok(());
             }
-            return Err(if inner.broadcast {
-                DartError::State("Cannot add new events after calling close".to_owned())
+            let error = if inner.broadcast {
+                "Cannot add new events after calling close"
             } else {
-                DartError::State("Cannot add event after closing".to_owned())
-            });
+                "Cannot add event after closing"
+            };
+            return Err(DartError::State(error.to_owned()));
         }
         if matches!(event, StreamEvent::Done) {
             inner.closed = true;
@@ -840,6 +844,61 @@ impl StreamRuntime {
         drop(inner);
         stream.finalize_pending_cancels();
         Ok(())
+    }
+
+    /// Pumps a source stream into `target` like `StreamController.addStream`
+    /// (`async/stream_controller.dart:590-603,913-938`,
+    /// `async/broadcast_stream_controller.dart:280-303`).
+    ///
+    /// Data is forwarded in source order. `cancel_on_error=false` forwards
+    /// every error; `true` forwards the first error and then closes `target`,
+    /// so later source data/errors are ignored. The returned future completes
+    /// synchronously on source done, or after the first error when cancelling.
+    pub fn add_stream(
+        &self,
+        target: &Stream,
+        source: &Stream,
+        cancel_on_error: bool,
+    ) -> Result<Future, DartError> {
+        {
+            let inner = target.inner.borrow();
+            if inner.closed {
+                let message = if inner.broadcast {
+                    "Cannot add new events after calling close"
+                } else {
+                    "Cannot add event after closing"
+                };
+                return Err(DartError::State(message.to_owned()));
+            }
+        }
+        let future_runtime = FutureRuntime::new();
+        let future = future_runtime.completer();
+        let data_target = target.clone();
+        let error_target = target.clone();
+        let done_target = target.clone();
+        let done_future = future.clone();
+        let error_future = future.clone();
+        let source_handle = source.try_listen_with(
+            Some(Rc::new(move |value| {
+                let _ = StreamRuntime::default().try_add(&data_target, StreamEvent::Data(value));
+            })),
+            Some(Rc::new(move |error| {
+                let _ = StreamRuntime::default()
+                    .try_add(&error_target, StreamEvent::Error(error.clone()));
+                if cancel_on_error {
+                    let _ = StreamRuntime::default().try_add(&error_target, StreamEvent::Done);
+                    let _ = error_future.complete(FutureValue::Null);
+                }
+            })),
+            Some(Rc::new(move || {
+                let _ = StreamRuntime::default().try_add(&done_target, StreamEvent::Done);
+                let _ = done_future.complete(FutureValue::Null);
+            })),
+            ListenOptions { cancel_on_error },
+        )?;
+        let _ = source_handle;
+        future_runtime.pump(16);
+        Ok(future.future())
     }
 
     /// Pumps the microtask queue used by async stream controllers
