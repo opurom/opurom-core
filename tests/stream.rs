@@ -401,3 +401,166 @@ fn broadcast_event_order_is_independent_per_listener() {
     assert_eq!(*first.borrow(), vec![int(1), int(2), int(3), int(4)]);
     assert_eq!(*second.borrow(), vec![int(1), int(2), int(3), int(4)]);
 }
+
+// cancelOnError and post-error ordering, pinned to Dart 3.14
+// (flutter-golden HEAD ab2912035e160d9cad6306df307576da6128ebdb).
+use opurom_core::ListenOptions;
+
+#[test]
+fn cancel_on_error_delivers_error_then_stops() {
+    // stream_impl.dart:386-421: the error callback runs once, then the
+    // subscription is canceled; later data is not delivered.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    stream.listen_with(
+        Some(
+            Rc::new(move |_: FutureValue| data_events.borrow_mut().push("data".to_owned()))
+                as DataCallback,
+        ),
+        Some(Rc::new(move |error: &AsyncError| {
+            error_events
+                .borrow_mut()
+                .push(format!("error:{}", error.message))
+        }) as ErrorCallback),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&stream, StreamEvent::Data(int(2)));
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["data", "error:boom"]);
+}
+
+#[test]
+fn cancel_on_error_false_keeps_receiving_after_error() {
+    // stream_impl.dart:417-421: without the flag, the subscription stays
+    // open and continues to receive later events.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    stream.listen(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(
+            Rc::new(move |_: &AsyncError| error_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+    );
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("soft")));
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["error", "data", "done"]);
+}
+
+#[test]
+fn broadcast_cancel_on_error_is_per_subscription() {
+    // stream_controller.dart:141-143: each subscription is independent, so
+    // one listener's auto-cancel must not affect another.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let strict = Rc::new(RefCell::new(Vec::<String>::new()));
+    let lenient = Rc::new(RefCell::new(Vec::<String>::new()));
+    let strict_events = Rc::clone(&strict);
+    let lenient_events = Rc::clone(&lenient);
+    stream.listen_with(
+        None,
+        Some(Rc::new(move |_| {
+            strict_events.borrow_mut().push("error".to_owned())
+        })),
+        None,
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    stream.listen(
+        None,
+        Some(
+            Rc::new(move |_: &AsyncError| lenient_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        None,
+    );
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("later")));
+    assert_eq!(*strict.borrow(), vec!["error"]);
+    assert_eq!(*lenient.borrow(), vec!["error", "error"]);
+}
+
+#[test]
+fn cancel_on_error_with_pause_buffers_then_suppresses() {
+    // stream_impl.dart:69-76,407-421: a paused listener buffers the error;
+    // after resume the error is delivered and then cancels the subscription.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let subscription = stream.listen_with(
+        Some(Rc::new(move |_| {
+            data_events.borrow_mut().push("data".to_owned())
+        })),
+        Some(Rc::new(move |_| {
+            error_events.borrow_mut().push("error".to_owned())
+        })),
+        None,
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    subscription.pause();
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    subscription.resume();
+    runtime.add(&stream, StreamEvent::Data(int(2)));
+    assert_eq!(*events.borrow(), vec!["data", "error"]);
+}
+
+#[test]
+fn manual_cancel_before_error_suppresses_error_callback() {
+    // stream_impl.dart:392-395: a subscription canceled before the error is
+    // sent must not report it.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let errors_clone = Rc::clone(&errors);
+    let subscription = stream.listen(
+        None,
+        Some(
+            Rc::new(move |error: &AsyncError| errors_clone.borrow_mut().push(error.clone()))
+                as ErrorCallback,
+        ),
+        None,
+    );
+    subscription.cancel();
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("suppressed")));
+    assert!(errors.borrow().is_empty());
+}
+
+#[test]
+fn done_after_error_without_cancel_is_suppressed_by_closed_controller() {
+    // broadcast_stream_controller.dart:266-275: close marks the controller
+    // closed, so a second done is ignored even if the listener stays open.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let counts = Rc::new(RefCell::new(0));
+    let counts_clone = Rc::clone(&counts);
+    stream.listen(
+        None,
+        None,
+        Some(Rc::new(move || *counts_clone.borrow_mut() += 1) as DoneCallback),
+    );
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("soft")));
+    runtime.add(&stream, StreamEvent::Done);
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*counts.borrow(), 1);
+}

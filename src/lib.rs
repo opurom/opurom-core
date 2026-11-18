@@ -87,8 +87,8 @@ pub use state::{
     DEFAULT_RESOURCE_BUDGET, FRAME_RING, MEMORY_HISTORY_RING, NETWORK_RING,
 };
 pub use stream::{
-    DataCallback, DoneCallback, ErrorCallback, Stream, StreamEvent, StreamHooks, StreamRuntime,
-    StreamSubscription,
+    DataCallback, DoneCallback, ErrorCallback, ListenOptions, Stream, StreamEvent, StreamHooks,
+    StreamRuntime, StreamSubscription,
 };
 pub use text_buffer::{TextBuffer, TextBufferError};
 pub use text_input::{TextInputError, TextInputState, DEFAULT_TEXT_INPUT_CAPACITY, TEXT_INPUT_BUS};

@@ -14,6 +14,10 @@
 //! - each broadcast subscription is independent: a paused listener buffers
 //!   events until resumed or canceled while other listeners keep receiving
 //!   (`async/stream_controller.dart:141-143`);
+//! - `cancelOnError` reports the error once and then cancels the subscription;
+//!   a paused listener applies the transition only when the buffered error is
+//!   delivered (`async/stream_impl.dart:50-51,386-421`,
+//!   `async/stream_controller.dart:141-143`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
 //! - `close` sends a done event to the listeners subscribed at close time
@@ -52,6 +56,8 @@ pub type DoneCallback = Rc<dyn Fn()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubscriptionState {
+    /// `_STATE_CANCEL_ON_ERROR` (`async/stream_impl.dart:50-51,133-135`).
+    cancel_on_error: bool,
     /// Dart counts nested pauses in `_STATE_PAUSE_COUNT`
     /// (`async/stream_impl.dart:204-229`); one resume only decrements.
     pause_count: usize,
@@ -84,6 +90,11 @@ impl std::fmt::Debug for Subscription {
 }
 
 impl Subscription {
+    fn with_cancel_on_error(mut self, value: bool) -> Self {
+        self.state.cancel_on_error = value;
+        self
+    }
+
     fn new(
         id: u32,
         on_data: Option<DataCallback>,
@@ -93,6 +104,7 @@ impl Subscription {
         Self {
             id,
             state: SubscriptionState {
+                cancel_on_error: false,
                 pause_count: 0,
                 canceled: false,
             },
@@ -117,6 +129,8 @@ impl Subscription {
                 if let Some(callback) = &self.on_error {
                     callback(error);
                 }
+                // `stream_impl.dart:407-421`: the error callback runs before
+                // cancelOnError takes effect, so this error is reported once.
             }
             StreamEvent::Done => {
                 if let Some(callback) = &self.on_done {
@@ -176,7 +190,32 @@ impl StreamSubscription {
             return;
         }
         for event in buffered {
+            let cancel_after_error = matches!(event, StreamEvent::Error(_)) && {
+                let inner = self.inner.borrow();
+                inner
+                    .subscriptions
+                    .get(&self.id)
+                    .is_some_and(|subscription| subscription.state.cancel_on_error)
+            };
+            let was_canceled = {
+                let inner = self.inner.borrow();
+                inner
+                    .subscriptions
+                    .get(&self.id)
+                    .is_some_and(|subscription| subscription.state.canceled)
+            };
             self.deliver(&event);
+            if !was_canceled && cancel_after_error {
+                // A buffered error triggers the same cancelOnError transition
+                // as a live one (`stream_impl.dart:407-421`): later events in
+                // the buffer are discarded.
+                let mut inner = self.inner.borrow_mut();
+                if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
+                    subscription.state.canceled = true;
+                    subscription.buffered.clear();
+                }
+                break;
+            }
         }
         if let Some(hook) = hook {
             hook();
@@ -251,6 +290,14 @@ impl StreamInner {
     }
 }
 
+/// Options for `Stream.listen` (`async/stream_impl.dart:121-138`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListenOptions {
+    /// Cancel the subscription when an error is delivered, while still
+    /// reporting that error once (`stream_impl.dart:386-421`).
+    pub cancel_on_error: bool,
+}
+
 /// A stream handle. Cloning shares the same controller state.
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -269,10 +316,23 @@ impl Stream {
         on_error: Option<ErrorCallback>,
         on_done: Option<DoneCallback>,
     ) -> StreamSubscription {
+        self.listen_with(on_data, on_error, on_done, ListenOptions::default())
+    }
+
+    /// Registers a listener with `cancelOnError` support
+    /// (`stream.dart:723`, `async/stream_impl.dart:121-138`).
+    pub fn listen_with(
+        &self,
+        on_data: Option<DataCallback>,
+        on_error: Option<ErrorCallback>,
+        on_done: Option<DoneCallback>,
+        options: ListenOptions,
+    ) -> StreamSubscription {
         let mut inner = self.inner.borrow_mut();
         let id = inner.next_subscription;
         inner.next_subscription += 1;
-        let subscription = Subscription::new(id, on_data, on_error, on_done);
+        let subscription = Subscription::new(id, on_data, on_error, on_done)
+            .with_cancel_on_error(options.cancel_on_error);
         let first = inner.subscriptions.is_empty();
         inner.subscriptions.insert(id, subscription);
         let on_listen = if first {
@@ -442,11 +502,28 @@ impl StreamRuntime {
         }
         let ids: Vec<u32> = inner.subscriptions.keys().copied().collect();
         for id in ids {
+            let was_canceled = inner
+                .subscriptions
+                .get(&id)
+                .is_some_and(|subscription| subscription.state.canceled);
+            if was_canceled {
+                continue;
+            }
             let subscription = inner.subscriptions.get_mut(&id).unwrap();
             if subscription.state.pause_count > 0 {
+                // Paused listeners buffer without applying cancelOnError; the
+                // transition happens when the buffered error is delivered
+                // (`stream_controller.dart:141-143`, `stream_impl.dart:407-421`).
                 subscription.buffered.push_back(event.clone());
-            } else {
-                subscription.deliver(&event);
+                continue;
+            }
+            let cancel_after_error =
+                matches!(event, StreamEvent::Error(_)) && subscription.state.cancel_on_error;
+            subscription.deliver(&event);
+            if cancel_after_error {
+                // Report first, then cancel (`stream_impl.dart:407-421`).
+                subscription.state.canceled = true;
+                subscription.buffered.clear();
             }
         }
     }
