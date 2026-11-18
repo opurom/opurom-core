@@ -18,6 +18,9 @@
 //!   a paused listener applies the transition only when the buffered error is
 //!   delivered (`async/stream_impl.dart:50-51,386-421`,
 //!   `async/stream_controller.dart:141-143`);
+//! - during an error or done callback a terminal event waits for cancellation;
+//!   an explicit cancel clears that state and suppresses the pending done
+//!   (`async/stream_impl.dart:69-76,392-395,429-445`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
 //! - `close` sends a done event to the listeners subscribed at close time
@@ -70,6 +73,13 @@ struct SubscriptionState {
 struct Subscription {
     id: u32,
     state: SubscriptionState,
+    /// `_STATE_WAIT_FOR_CANCEL`: the terminal event is awaiting the cancel
+    /// future and must be discarded if the listener cancels meanwhile
+    /// (`async/stream_impl.dart:69-76,392-395,429-445`).
+    waiting_for_cancel: bool,
+    /// A done event has already been delivered; later events are dropped
+    /// (`stream_impl.dart:53-55,424-445`).
+    closed: bool,
     /// Set when `cancel()` is called while the controller is still delivering
     /// a callback. Dart defers such cancellation until the callback returns
     /// (`stream_impl.dart:407-421`); the kernel finalizes it at the end of
@@ -113,6 +123,8 @@ impl Subscription {
                 pause_count: 0,
                 canceled: false,
             },
+            waiting_for_cancel: false,
+            closed: false,
             pending_cancel: Rc::new(Cell::new(false)),
             on_data,
             on_error,
@@ -127,7 +139,10 @@ impl Subscription {
     /// (`stream_impl.dart:386-421`); the caller applies the state change so
     /// this method can keep taking `&self`.
     fn deliver(&self, event: &StreamEvent) -> bool {
-        if self.state.canceled {
+        // `_sendDone` runs its callback while WAIT_FOR_CANCEL is set
+        // (`stream_impl.dart:429-435`); other canceled subscriptions drop
+        // events (`stream_impl.dart:308-325`).
+        if self.state.canceled && !self.waiting_for_cancel {
             return false;
         }
         match event {
@@ -142,6 +157,11 @@ impl Subscription {
                 }
             }
             StreamEvent::Done => {
+                // `sendDone` reports only while WAIT_FOR_CANCEL is set
+                // (`stream_impl.dart:429-435`), and only once.
+                if self.closed || self.state.canceled && !self.waiting_for_cancel {
+                    return false;
+                }
                 if let Some(callback) = &self.on_done {
                     callback();
                 }
@@ -276,6 +296,7 @@ impl StreamSubscription {
             let was_subscribed = !inner.subscriptions.is_empty();
             if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
                 subscription.state.canceled = true;
+                subscription.waiting_for_cancel = false;
                 subscription.buffered.clear();
             }
             inner.subscriptions.remove(&self.id);
@@ -638,46 +659,65 @@ impl StreamRuntime {
             return;
         }
         let ids: Vec<u32> = inner.subscriptions.keys().copied().collect();
-        let mut canceled_ids = Vec::new();
         for id in ids {
-            let was_canceled = inner
-                .subscriptions
-                .get(&id)
-                .is_some_and(|subscription| subscription.state.canceled);
-            if was_canceled {
+            let Some(existing) = inner.subscriptions.get(&id).cloned() else {
+                continue;
+            };
+            let pending_done = matches!(event, StreamEvent::Done)
+                && existing.waiting_for_cancel
+                && !existing.pending_cancel.get();
+            if existing.closed || existing.state.canceled && !pending_done {
                 continue;
             }
-            let subscription = inner.subscriptions.get(&id).unwrap().clone();
-            if subscription.state.pause_count > 0 {
+            if existing.state.pause_count > 0 {
                 // Paused listeners buffer without applying cancelOnError; the
                 // transition happens when the buffered error is delivered
                 // (`stream_controller.dart:141-143`, `stream_impl.dart:407-421`).
-                let subscription = inner.subscriptions.get_mut(&id).unwrap();
-                subscription.buffered.push_back(event.clone());
+                inner
+                    .subscriptions
+                    .get_mut(&id)
+                    .unwrap()
+                    .buffered
+                    .push_back(event.clone());
                 continue;
             }
-            if subscription.deliver(&event) {
-                canceled_ids.push(id);
+            let error_cancels =
+                matches!(event, StreamEvent::Error(_)) && existing.state.cancel_on_error;
+            let is_done = matches!(event, StreamEvent::Done);
+            if !existing.state.canceled || existing.waiting_for_cancel {
+                existing.deliver(&event);
             }
-        }
-        let mut hooks = Vec::new();
-        for id in canceled_ids {
-            let hook = {
-                let Some(subscription) = inner.subscriptions.get_mut(&id) else {
-                    continue;
-                };
-                subscription.state.canceled = true;
-                subscription.buffered.clear();
-                inner.take_cancel_hook_if_last()
-            };
-            if let Some(hook) = hook {
-                hooks.push(hook);
+            if error_cancels {
+                // `_sendError` marks wait-for-cancel before invoking the
+                // handler (`stream_impl.dart:407-416`). A cancel fired from
+                // the handler clears that flag and suppresses the done event
+                // (`stream_impl.dart:69-76,232-240,392-395`).
+                let canceled_during_callback = inner
+                    .subscriptions
+                    .get(&id)
+                    .is_some_and(|subscription| subscription.pending_cancel.get());
+                if let Some(subscription) = inner.subscriptions.get_mut(&id) {
+                    if canceled_during_callback || subscription.state.cancel_on_error {
+                        // An explicit cancel clears WAIT_FOR_CANCEL. A plain
+                        // cancelOnError subscription has no pending done: its
+                        // cancel future is already the terminal transition.
+                        subscription.waiting_for_cancel = false;
+                    } else {
+                        subscription.waiting_for_cancel = true;
+                    }
+                    subscription.state.canceled = true;
+                    subscription.buffered.clear();
+                }
+            } else if is_done {
+                if let Some(subscription) = inner.subscriptions.get_mut(&id) {
+                    subscription.closed = true;
+                    subscription.state.canceled = true;
+                    subscription.waiting_for_cancel = false;
+                    subscription.buffered.clear();
+                }
             }
         }
         drop(inner);
-        for hook in hooks {
-            hook();
-        }
         stream.finalize_pending_cancels();
     }
 

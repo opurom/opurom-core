@@ -19,6 +19,9 @@
 //!   and its stack trace untouched (`async/future.dart:836-846`);
 //! - `whenComplete` runs its action on both paths and lets the original
 //!   result through (`async/future.dart:877-926`);
+//! - `Future.wait` stores the first error and, with `cleanUp`, releases
+//!   already-delivered values in source order before reporting the combined
+//!   result (`async/future.dart:529-559,579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -661,6 +664,8 @@ pub fn wait_error_at(
 pub struct WaitStep {
     /// Values collected so far, in source order.
     pub values: Vec<Option<FutureValue>>,
+    /// Successful values passed to `cleanUp`, in source order.
+    pub cleaned_up: Vec<FutureValue>,
     /// The combined future's result at this step, if it is complete.
     pub outcome: Option<CombineOutcome>,
 }
@@ -668,10 +673,20 @@ pub struct WaitStep {
 impl WaitStep {
     /// Applies all completions supplied so far according to Dart's
     /// `Future.wait` state machine (`async/future.dart:517-600`).
-    pub fn advance(inputs: &[Option<Completion>], policy: FutureCombineErrorPolicy) -> Self {
+    ///
+    /// `cleaned_up` receives values available when the first error fires in
+    /// source order (`future.dart:538-548`), followed by values that complete
+    /// later (`future.dart:579-586`). Errors from a cleanup body belong to the
+    /// host because the core stores plain data only.
+    pub fn advance(
+        inputs: &[Option<Completion>],
+        policy: FutureCombineErrorPolicy,
+        cleanup: bool,
+    ) -> Self {
         let mut values: Vec<Option<FutureValue>> = vec![None; inputs.len()];
         let mut first_error: Option<AsyncError> = None;
         let mut remaining = inputs.len();
+        let mut cleaned_up = Vec::new();
         for (index, input) in inputs.iter().enumerate() {
             let Some(completion) = input else { continue };
             remaining -= 1;
@@ -679,11 +694,16 @@ impl WaitStep {
                 Completion::Value(value) => {
                     if first_error.is_none() {
                         values[index] = Some(value.clone());
+                    } else if cleanup {
+                        cleaned_up.push(value.clone());
                     }
                 }
                 Completion::Error(error) => {
                     if first_error.is_none() {
                         first_error = Some(error.clone());
+                        if cleanup {
+                            cleaned_up.extend(values.iter().take(index).flatten().cloned());
+                        }
                         for slot in &mut values {
                             *slot = None;
                         }
@@ -704,6 +724,7 @@ impl WaitStep {
         };
         Self {
             values: if complete { Vec::new() } else { values },
+            cleaned_up,
             outcome,
         }
     }

@@ -713,3 +713,60 @@ fn paused_pipe_cancel_on_error_reports_buffered_error_before_cancel() {
     runtime.add(&source, StreamEvent::Data(int(3)));
     assert_eq!(*events.borrow(), vec!["data", "error"]);
 }
+
+// Cancellation and done ordering, pinned to Dart 3.14
+// (async/stream_impl.dart:69-76,232-240,386-445).
+#[test]
+fn cancel_from_error_callback_suppresses_done() {
+    // stream_impl.dart:392-395,429-432: an explicit cancel during the error
+    // callback clears WAIT_FOR_CANCEL, so the later done must be suppressed.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    let subscription: Rc<RefCell<Option<opurom_core::StreamSubscription>>> =
+        Rc::new(RefCell::new(None));
+    let subscription_clone = Rc::clone(&subscription);
+    *subscription.borrow_mut() = Some(stream.listen_with(
+        None,
+        Some(Rc::new(move |error: &AsyncError| {
+            error_events.borrow_mut().push(error.message.clone());
+            if let Some(subscription) = subscription_clone.borrow().as_ref() {
+                subscription.cancel();
+            }
+        }) as ErrorCallback),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions::default(),
+    ));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["boom"]);
+}
+
+#[test]
+fn cancel_on_error_closes_after_error_without_done() {
+    // stream_impl.dart:407-421,467-483: cancelOnError reports the error once
+    // and cancels the subscription; a following done is dropped.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    stream.listen_with(
+        None,
+        Some(Rc::new(move |error: &AsyncError| {
+            error_events
+                .borrow_mut()
+                .push(format!("error:{}", error.message))
+        }) as ErrorCallback),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&stream, StreamEvent::Done);
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["error:boom"]);
+}

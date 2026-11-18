@@ -486,7 +486,11 @@ use opurom_core::WaitStep;
 fn wait_partial_values_stay_unresolved_until_all_inputs_complete() {
     // future.dart:567-577: a value only completes `wait` when remaining
     // reaches zero.
-    let step = WaitStep::advance(&[None, Some(ok(2)), None], FutureCombineErrorPolicy::Wait);
+    let step = WaitStep::advance(
+        &[None, Some(ok(2)), None],
+        FutureCombineErrorPolicy::Wait,
+        false,
+    );
     assert_eq!(step.outcome, None);
     assert_eq!(step.values, vec![None, Some(int(2)), None]);
 }
@@ -499,6 +503,7 @@ fn wait_non_eager_error_is_delayed_until_the_last_input() {
     let partial = WaitStep::advance(
         &[Some(ok(1)), Some(Completion::Error(first.clone())), None],
         FutureCombineErrorPolicy::Wait,
+        false,
     );
     assert_eq!(partial.outcome, None);
     let second = err("second");
@@ -509,6 +514,7 @@ fn wait_non_eager_error_is_delayed_until_the_last_input() {
             Some(second),
         ],
         FutureCombineErrorPolicy::Wait,
+        false,
     );
     assert_eq!(complete.outcome, Some(CombineOutcome::Error(first)));
 }
@@ -520,6 +526,7 @@ fn wait_eager_error_completes_before_later_inputs() {
     let step = WaitStep::advance(
         &[None, Some(err("boom")), None],
         FutureCombineErrorPolicy::WaitEager,
+        false,
     );
     assert_eq!(
         step.outcome,
@@ -540,6 +547,51 @@ fn wait_non_eager_error_after_all_values_keeps_first_error() {
             Some(err("later")),
         ],
         FutureCombineErrorPolicy::Wait,
+        false,
     );
     assert_eq!(step.outcome, Some(CombineOutcome::Error(first)));
+}
+
+// Future.wait cleanUp ordering, pinned to Dart 3.14
+// (async/future.dart:517-600).
+#[test]
+fn wait_cleanup_uses_source_order_before_and_after_error() {
+    // future.dart:538-548,579-586: values already produced are cleaned up in
+    // source order when the first error fires; later values follow.
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+            None,
+        ],
+        FutureCombineErrorPolicy::Wait,
+        true,
+    );
+    assert_eq!(step.cleaned_up, vec![int(1), int(2)]);
+}
+
+#[test]
+fn wait_cleanup_ignores_later_errors_and_respects_flag() {
+    let step = WaitStep::advance(
+        &[
+            Some(ok(7)),
+            Some(Completion::Error(AsyncError::new("first"))),
+            Some(Completion::Error(AsyncError::new("second"))),
+            Some(ok(8)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        true,
+    );
+    assert_eq!(step.cleaned_up, vec![int(7), int(8)]);
+    let without = WaitStep::advance(
+        &[
+            Some(ok(7)),
+            Some(Completion::Error(AsyncError::new("first"))),
+            Some(ok(8)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        false,
+    );
+    assert!(without.cleaned_up.is_empty());
 }
