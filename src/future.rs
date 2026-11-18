@@ -655,6 +655,60 @@ pub fn wait_error_at(
         })
 }
 
+/// One deterministic step of `Future.wait` over a host-supplied sequence of
+/// input completions. `None` means an input is still pending.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitStep {
+    /// Values collected so far, in source order.
+    pub values: Vec<Option<FutureValue>>,
+    /// The combined future's result at this step, if it is complete.
+    pub outcome: Option<CombineOutcome>,
+}
+
+impl WaitStep {
+    /// Applies all completions supplied so far according to Dart's
+    /// `Future.wait` state machine (`async/future.dart:517-600`).
+    pub fn advance(inputs: &[Option<Completion>], policy: FutureCombineErrorPolicy) -> Self {
+        let mut values: Vec<Option<FutureValue>> = vec![None; inputs.len()];
+        let mut first_error: Option<AsyncError> = None;
+        let mut remaining = inputs.len();
+        for (index, input) in inputs.iter().enumerate() {
+            let Some(completion) = input else { continue };
+            remaining -= 1;
+            match completion {
+                Completion::Value(value) => {
+                    if first_error.is_none() {
+                        values[index] = Some(value.clone());
+                    }
+                }
+                Completion::Error(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.clone());
+                        for slot in &mut values {
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+        }
+        let eager = policy == FutureCombineErrorPolicy::WaitEager && first_error.is_some();
+        let complete = remaining == 0 || eager;
+        let outcome = if !complete {
+            None
+        } else if let Some(error) = first_error {
+            Some(CombineOutcome::Error(error))
+        } else {
+            Some(CombineOutcome::Wait(
+                values.iter().map(|value| value.clone().unwrap()).collect(),
+            ))
+        };
+        Self {
+            values: if complete { Vec::new() } else { values },
+            outcome,
+        }
+    }
+}
+
 /// Deterministic result of a host-driven `Future.forEach` sequence
 /// (`async/future.dart:672-699`): actions run in source order, and the first
 /// error stops the loop (`:686-687`).

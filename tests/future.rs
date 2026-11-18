@@ -477,3 +477,69 @@ fn wait_error_keeps_stack_trace_byte_for_byte() {
     let outcome = wait_error_at(&inputs, FutureCombineErrorPolicy::WaitEager);
     assert_eq!(outcome, Some((0, original)));
 }
+
+// Future.wait partial completion and non-eager error delay, pinned to Dart
+// 3.14 (async/future.dart:517-600).
+use opurom_core::WaitStep;
+
+#[test]
+fn wait_partial_values_stay_unresolved_until_all_inputs_complete() {
+    // future.dart:567-577: a value only completes `wait` when remaining
+    // reaches zero.
+    let step = WaitStep::advance(&[None, Some(ok(2)), None], FutureCombineErrorPolicy::Wait);
+    assert_eq!(step.outcome, None);
+    assert_eq!(step.values, vec![None, Some(int(2)), None]);
+}
+
+#[test]
+fn wait_non_eager_error_is_delayed_until_the_last_input() {
+    // future.dart:530-537,555-557: the first error is stored, but non-eager
+    // wait keeps waiting for every other input.
+    let first = AsyncError::new("first");
+    let partial = WaitStep::advance(
+        &[Some(ok(1)), Some(Completion::Error(first.clone())), None],
+        FutureCombineErrorPolicy::Wait,
+    );
+    assert_eq!(partial.outcome, None);
+    let second = err("second");
+    let complete = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(first.clone())),
+            Some(second),
+        ],
+        FutureCombineErrorPolicy::Wait,
+    );
+    assert_eq!(complete.outcome, Some(CombineOutcome::Error(first)));
+}
+
+#[test]
+fn wait_eager_error_completes_before_later_inputs() {
+    // future.dart:550-552: eagerError reports the first error as soon as its
+    // listener fires, without waiting for the remaining inputs.
+    let step = WaitStep::advance(
+        &[None, Some(err("boom")), None],
+        FutureCombineErrorPolicy::WaitEager,
+    );
+    assert_eq!(
+        step.outcome,
+        Some(CombineOutcome::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn wait_non_eager_error_after_all_values_keeps_first_error() {
+    // Values completing after the error must not replace the stored first
+    // error (`future.dart:579-590`). The first error wins even if a later
+    // input fails first in arrival order.
+    let first = AsyncError::new("first");
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(first.clone())),
+            Some(err("later")),
+        ],
+        FutureCombineErrorPolicy::Wait,
+    );
+    assert_eq!(step.outcome, Some(CombineOutcome::Error(first)));
+}

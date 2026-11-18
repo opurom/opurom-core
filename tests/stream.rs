@@ -639,3 +639,77 @@ fn chained_pipes_propagate_cancel_to_the_source() {
     runtime.add(&source, StreamEvent::Data(int(1)));
     assert_eq!(*events.borrow(), vec!["error"]);
 }
+
+// Paused pipe subscriptions buffer upstream events and forward them in order
+// after the last matching resume (`stream_impl.dart:204-229`,
+// `stream_pipe.dart:164-170`).
+#[test]
+fn paused_pipe_buffers_and_forwards_in_order_after_resume() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let mapped = source.map(Rc::new(|value| value));
+    let events = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let events_clone = Rc::clone(&events);
+    let subscription = mapped.listen(
+        Some(Rc::new(move |value| events_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    assert!(events.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*events.borrow(), vec![int(1), int(2)]);
+    runtime.add(&source, StreamEvent::Data(int(3)));
+    assert_eq!(*events.borrow(), vec![int(1), int(2), int(3)]);
+}
+
+#[test]
+fn nested_pause_on_pipe_resumes_upstream_only_after_last_resume() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let mapped = source.map(Rc::new(|value| value));
+    let events = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let events_clone = Rc::clone(&events);
+    let subscription = mapped.listen(
+        Some(Rc::new(move |value| events_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    subscription.resume();
+    assert!(events.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*events.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn paused_pipe_cancel_on_error_reports_buffered_error_before_cancel() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let mapped = source.map(Rc::new(|value| value));
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let subscription = mapped.listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(
+            Rc::new(move |_: &AsyncError| error_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        None,
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    subscription.resume();
+    runtime.add(&source, StreamEvent::Data(int(3)));
+    assert_eq!(*events.borrow(), vec!["data", "error"]);
+}

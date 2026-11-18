@@ -32,7 +32,7 @@
 //! core microtask queue in scheduling order, and the same event stream
 //! always yields the same data on every host.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -70,6 +70,11 @@ struct SubscriptionState {
 struct Subscription {
     id: u32,
     state: SubscriptionState,
+    /// Set when `cancel()` is called while the controller is still delivering
+    /// a callback. Dart defers such cancellation until the callback returns
+    /// (`stream_impl.dart:407-421`); the kernel finalizes it at the end of
+    /// the delivery step (`stream_impl.dart:69-76`).
+    pending_cancel: Rc<Cell<bool>>,
     on_data: Option<DataCallback>,
     on_error: Option<ErrorCallback>,
     on_done: Option<DoneCallback>,
@@ -108,6 +113,7 @@ impl Subscription {
                 pause_count: 0,
                 canceled: false,
             },
+            pending_cancel: Rc::new(Cell::new(false)),
             on_data,
             on_error,
             on_done,
@@ -115,9 +121,14 @@ impl Subscription {
         }
     }
 
-    fn deliver(&self, event: &StreamEvent) {
+    /// Delivers one event and reports whether `cancelOnError` must cancel the
+    /// subscription afterwards. `_sendError` sets the wait-for-cancel state
+    /// before invoking the handler but still reports the error exactly once
+    /// (`stream_impl.dart:386-421`); the caller applies the state change so
+    /// this method can keep taking `&self`.
+    fn deliver(&self, event: &StreamEvent) -> bool {
         if self.state.canceled {
-            return;
+            return false;
         }
         match event {
             StreamEvent::Data(value) => {
@@ -129,8 +140,6 @@ impl Subscription {
                 if let Some(callback) = &self.on_error {
                     callback(error);
                 }
-                // `stream_impl.dart:407-421`: the error callback runs before
-                // cancelOnError takes effect, so this error is reported once.
             }
             StreamEvent::Done => {
                 if let Some(callback) = &self.on_done {
@@ -138,6 +147,7 @@ impl Subscription {
                 }
             }
         }
+        matches!(event, StreamEvent::Error(_)) && self.state.cancel_on_error
     }
 }
 
@@ -146,6 +156,7 @@ impl Subscription {
 pub struct StreamSubscription {
     id: u32,
     inner: Rc<RefCell<StreamInner>>,
+    pending_cancel: Rc<Cell<bool>>,
 }
 
 impl StreamSubscription {
@@ -154,28 +165,46 @@ impl StreamSubscription {
     }
 
     pub fn pause(&self) {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
-            subscription.state.pause_count += 1;
+        let (hook, input_hook, propagate) = {
+            let mut inner = self.inner.borrow_mut();
+            let mut propagate = false;
+            if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
+                propagate = subscription.state.pause_count == 0;
+                subscription.state.pause_count += 1;
+            }
+            (
+                inner.hooks.on_pause.clone(),
+                inner.hooks.on_pause_input.clone(),
+                propagate,
+            )
+        };
+        if propagate {
+            if let Some(input_hook) = input_hook {
+                input_hook();
+            }
         }
-        if let Some(hook) = inner.hooks.on_pause.clone() {
-            drop(inner);
+        if let Some(hook) = hook {
             hook();
         }
     }
 
     pub fn resume(&self) {
-        let (buffered, hook, still_paused) = {
+        let (buffered, hook, still_paused, resume_input) = {
             let mut inner = self.inner.borrow_mut();
             let Some(subscription) = inner.subscriptions.get_mut(&self.id) else {
                 return;
             };
             subscription.state.pause_count = subscription.state.pause_count.saturating_sub(1);
             let still_paused = subscription.state.pause_count > 0;
+            // `_onResume` runs only after the last nested pause is released
+            // (`stream_impl.dart:215-229`); the pipe then resumes its source
+            // subscription (`stream_pipe.dart:164-170`).
+            let resume_input = !still_paused;
             (
                 std::mem::take(&mut subscription.buffered),
                 inner.hooks.on_resume.clone(),
                 still_paused,
+                resume_input,
             )
         };
         if still_paused {
@@ -189,23 +218,10 @@ impl StreamSubscription {
             }
             return;
         }
+        let mut cancel_hook = None;
         for event in buffered {
-            let cancel_after_error = matches!(event, StreamEvent::Error(_)) && {
-                let inner = self.inner.borrow();
-                inner
-                    .subscriptions
-                    .get(&self.id)
-                    .is_some_and(|subscription| subscription.state.cancel_on_error)
-            };
-            let was_canceled = {
-                let inner = self.inner.borrow();
-                inner
-                    .subscriptions
-                    .get(&self.id)
-                    .is_some_and(|subscription| subscription.state.canceled)
-            };
-            self.deliver(&event);
-            if !was_canceled && cancel_after_error {
+            let cancel_after_error = self.deliver(&event);
+            if cancel_after_error {
                 // A buffered error triggers the same cancelOnError transition
                 // as a live one (`stream_impl.dart:407-421`): later events in
                 // the buffer are discarded.
@@ -214,39 +230,73 @@ impl StreamSubscription {
                     subscription.state.canceled = true;
                     subscription.buffered.clear();
                 }
+                cancel_hook = inner.take_cancel_hook_if_last();
                 break;
             }
+        }
+        let still_active = {
+            let inner = self.inner.borrow();
+            inner
+                .subscriptions
+                .get(&self.id)
+                .is_some_and(|subscription| !subscription.state.canceled)
+        };
+        if resume_input && still_active {
+            if let Some(resume_input) = {
+                let inner = self.inner.borrow();
+                inner.hooks.on_resume_input.clone()
+            } {
+                resume_input();
+            }
+        }
+        if let Some(hook) = cancel_hook {
+            hook();
         }
         if let Some(hook) = hook {
             hook();
         }
+        self.finalize_pending_cancels();
+    }
+
+    fn finalize_pending_cancels(&self) {
+        Stream {
+            inner: Rc::clone(&self.inner),
+        }
+        .finalize_pending_cancels()
     }
 
     pub fn cancel(&self) {
-        let mut inner = self.inner.borrow_mut();
-        let was_subscribed = !inner.subscriptions.is_empty();
-        if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
-            subscription.state.canceled = true;
-            subscription.buffered.clear();
-        }
-        inner.subscriptions.remove(&self.id);
-        let no_subscribers = inner.subscriptions.values().all(|s| s.state.canceled);
-        let on_cancel = if was_subscribed && no_subscribers {
-            inner.hooks.on_cancel.take()
-        } else {
-            None
+        let on_cancel = {
+            let Ok(mut inner) = self.inner.try_borrow_mut() else {
+                // Re-entrant cancel during callback delivery; finalize after
+                // the current delivery step releases the controller borrow.
+                self.pending_cancel.set(true);
+                return;
+            };
+            let was_subscribed = !inner.subscriptions.is_empty();
+            if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
+                subscription.state.canceled = true;
+                subscription.buffered.clear();
+            }
+            inner.subscriptions.remove(&self.id);
+            let no_subscribers = inner.subscriptions.values().all(|s| s.state.canceled);
+            if was_subscribed && no_subscribers {
+                inner.hooks.on_cancel.take()
+            } else {
+                None
+            }
         };
-        drop(inner);
+        self.pending_cancel.set(false);
         if let Some(on_cancel) = on_cancel {
             on_cancel();
         }
     }
 
-    fn deliver(&self, event: &StreamEvent) {
+    fn deliver(&self, event: &StreamEvent) -> bool {
         let subscription = self.inner.borrow().subscriptions.get(&self.id).cloned();
-        if let Some(subscription) = subscription {
-            subscription.deliver(event);
-        }
+        subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.deliver(event))
     }
 }
 
@@ -260,7 +310,11 @@ pub struct StreamHooks {
     #[doc(hidden)]
     pub on_error_options: Option<Rc<dyn Fn(ListenOptions)>>,
     pub on_pause: Option<Rc<dyn Fn()>>,
+    #[doc(hidden)]
+    pub on_pause_input: Option<Rc<dyn Fn()>>,
     pub on_resume: Option<Rc<dyn Fn()>>,
+    #[doc(hidden)]
+    pub on_resume_input: Option<Rc<dyn Fn()>>,
     pub on_cancel: Option<Rc<dyn Fn()>>,
 }
 
@@ -283,6 +337,14 @@ struct StreamInner {
 }
 
 impl StreamInner {
+    fn take_cancel_hook_if_last(&mut self) -> Option<Rc<dyn Fn()>> {
+        if self.subscriptions.values().all(|s| s.state.canceled) {
+            self.hooks.on_cancel.take()
+        } else {
+            None
+        }
+    }
+
     fn new(broadcast: bool, hooks: StreamHooks) -> Self {
         Self {
             broadcast,
@@ -312,6 +374,27 @@ pub struct Stream {
 impl Stream {
     fn new(inner: Rc<RefCell<StreamInner>>) -> Self {
         Self { inner }
+    }
+
+    fn finalize_pending_cancels(&self) {
+        let pending: Vec<(u32, Rc<Cell<bool>>)> = {
+            let inner = self.inner.borrow();
+            inner
+                .subscriptions
+                .iter()
+                .filter(|(_, subscription)| subscription.pending_cancel.get())
+                .map(|(id, subscription)| (*id, Rc::clone(&subscription.pending_cancel)))
+                .collect()
+        };
+        for (id, flag) in pending {
+            flag.set(false);
+            StreamSubscription {
+                id,
+                inner: Rc::clone(&self.inner),
+                pending_cancel: flag,
+            }
+            .cancel();
+        }
     }
 
     /// Registers a listener (`stream.dart:723`, `stream_controller.dart:406-411`).
@@ -358,12 +441,17 @@ impl Stream {
         if let Some(on_listen) = on_listen {
             on_listen();
         }
+        let pending_cancel = {
+            let state = self.inner.borrow();
+            Rc::clone(&state.subscriptions.get(&id).unwrap().pending_cancel)
+        };
         let handle = StreamSubscription {
             id,
             inner: Rc::clone(&self.inner),
+            pending_cancel,
         };
         for event in pre_listen {
-            handle.deliver(&event);
+            let _ = handle.deliver(&event);
         }
         handle
     }
@@ -471,13 +559,20 @@ impl Stream {
                         Some(Rc::new(move || {
                             StreamRuntime::default().add(&done_target, StreamEvent::Done);
                         })),
-                        ListenOptions {
-                            cancel_on_error: *cancel_on_error.borrow(),
-                        },
+                        // The source subscription never auto-cancels on
+                        // error. The forwarding subscription owns the
+                        // downstream cancelOnError policy and cancels this
+                        // source through its onCancel hook
+                        // (`stream_pipe.dart:134-145,164-179`).
+                        ListenOptions::default(),
                     );
-                    let source_subscription = Rc::new(subscription);
-                    let cancel_source = Rc::clone(&source_subscription);
+                    let source_subscription = subscription;
+                    let pause_source = source_subscription.clone();
+                    let resume_source = source_subscription.clone();
+                    let cancel_source = source_subscription;
                     let mut state = cancel_target.inner.borrow_mut();
+                    state.hooks.on_pause_input = Some(Rc::new(move || pause_source.pause()));
+                    state.hooks.on_resume_input = Some(Rc::new(move || resume_source.resume()));
                     state.hooks.on_cancel = Some(Rc::new(move || cancel_source.cancel()));
                 }))
             };
@@ -543,6 +638,7 @@ impl StreamRuntime {
             return;
         }
         let ids: Vec<u32> = inner.subscriptions.keys().copied().collect();
+        let mut canceled_ids = Vec::new();
         for id in ids {
             let was_canceled = inner
                 .subscriptions
@@ -551,23 +647,38 @@ impl StreamRuntime {
             if was_canceled {
                 continue;
             }
-            let subscription = inner.subscriptions.get_mut(&id).unwrap();
+            let subscription = inner.subscriptions.get(&id).unwrap().clone();
             if subscription.state.pause_count > 0 {
                 // Paused listeners buffer without applying cancelOnError; the
                 // transition happens when the buffered error is delivered
                 // (`stream_controller.dart:141-143`, `stream_impl.dart:407-421`).
+                let subscription = inner.subscriptions.get_mut(&id).unwrap();
                 subscription.buffered.push_back(event.clone());
                 continue;
             }
-            let cancel_after_error =
-                matches!(event, StreamEvent::Error(_)) && subscription.state.cancel_on_error;
-            subscription.deliver(&event);
-            if cancel_after_error {
-                // Report first, then cancel (`stream_impl.dart:407-421`).
-                subscription.state.canceled = true;
-                subscription.buffered.clear();
+            if subscription.deliver(&event) {
+                canceled_ids.push(id);
             }
         }
+        let mut hooks = Vec::new();
+        for id in canceled_ids {
+            let hook = {
+                let Some(subscription) = inner.subscriptions.get_mut(&id) else {
+                    continue;
+                };
+                subscription.state.canceled = true;
+                subscription.buffered.clear();
+                inner.take_cancel_hook_if_last()
+            };
+            if let Some(hook) = hook {
+                hooks.push(hook);
+            }
+        }
+        drop(inner);
+        for hook in hooks {
+            hook();
+        }
+        stream.finalize_pending_cancels();
     }
 
     /// Pumps the microtask queue used by async stream controllers
