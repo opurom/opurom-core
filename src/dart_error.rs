@@ -66,6 +66,13 @@ pub enum DartError {
     Unimplemented(Option<String>),
     /// `StateError` (`core/errors.dart:619-624`).
     State(String),
+    /// `FormatException` (`core/exceptions.dart:40-165`): message, optional
+    /// source and zero-based offset.
+    FormatException {
+        message: String,
+        source: Option<String>,
+        offset: Option<i64>,
+    },
     /// `ConcurrentModificationError` (`core/errors.dart:631-643`).
     ConcurrentModification(Option<String>),
     /// `OutOfMemoryError` (`core/errors.dart:646-653`).
@@ -141,6 +148,52 @@ impl DartError {
                 None => "UnimplementedError".to_owned(),
             },
             Self::State(message) => format!("Bad state: {message}"),
+            Self::FormatException {
+                message,
+                source,
+                offset,
+            } => {
+                // `core/exceptions.dart:88-127,162-165`: the report always
+                // contains the message; a string source and a valid offset
+                // add a caret line. Long sources are truncated at 78 chars.
+                let mut report = "FormatException".to_owned();
+                if !message.is_empty() {
+                    report.push_str(": ");
+                    report.push_str(message);
+                }
+                if let Some(source) = source {
+                    match offset {
+                        Some(offset) if *offset >= 0 && *offset <= source.len() as i64 => {
+                            report.push_str(" (at character ");
+                            report.push_str(&(*offset + 1).to_string());
+                            report.push_str(")\n");
+                            let mut slice = source.clone();
+                            if slice.len() > 78 {
+                                slice.truncate(75);
+                                slice.push_str("...");
+                            }
+                            report.push_str(&slice);
+                            report.push('\n');
+                            for _ in 0..*offset {
+                                report.push(' ');
+                            }
+                            report.push_str("^\n");
+                        }
+                        _ => {
+                            report.push('\n');
+                            let mut slice = source.clone();
+                            if slice.len() > 78 {
+                                slice.truncate(75);
+                                slice.push_str("...");
+                            }
+                            report.push_str(&slice);
+                        }
+                    }
+                } else if let Some(offset) = offset {
+                    report.push_str(&format!(" (at offset {offset})"));
+                }
+                report
+            }
             Self::ConcurrentModification(object) => match object {
                 Some(object) => {
                     format!("Concurrent modification during iteration: {object}.")

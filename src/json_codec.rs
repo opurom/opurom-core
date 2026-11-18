@@ -184,3 +184,17 @@ fn from_json(value: &Json) -> Result<FutureValue, JsonError> {
         }
     }
 }
+
+/// Converts a JSON error into Dart's `FormatException` value
+/// (`convert/json.dart:592`, `core/exceptions.dart:40-165`).
+pub fn json_error_as_format(error: &JsonError) -> crate::dart_error::DartError {
+    crate::dart_error::DartError::FormatException {
+        message: match error {
+            JsonError::InvalidJson(reason) => reason.clone(),
+            JsonError::Unencodable(reason) => reason.clone(),
+            JsonError::NonFiniteFloat => "Invalid JSON number".to_owned(),
+        },
+        source: None,
+        offset: None,
+    }
+}

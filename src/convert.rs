@@ -268,3 +268,20 @@ pub fn uri_encode_query_component(text: &str) -> String {
 pub fn clamp_i64(value: i64, min: i64, max: i64) -> i64 {
     value.clamp(min, max)
 }
+
+/// Converts Base64/UTF-8 errors into Dart's `FormatException` value using
+/// the exact decoder messages (`convert/base64.dart:683-761`,
+/// `convert/utf.dart:571`, `core/exceptions.dart:40-165`).
+pub fn convert_error_as_format(error: &ConvertError) -> crate::dart_error::DartError {
+    let message = match error {
+        ConvertError::InvalidUtf8(_) => "Malformed UTF-8 data",
+        ConvertError::InvalidBase64(_) => "Invalid character",
+        ConvertError::InvalidPadding => "Missing padding character",
+        ConvertError::InvalidEncoding => "Invalid encoding before padding",
+    };
+    crate::dart_error::DartError::FormatException {
+        message: message.to_owned(),
+        source: None,
+        offset: None,
+    }
+}

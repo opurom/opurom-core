@@ -41,8 +41,8 @@ pub use collections::{
     reversed, skip_take, sublist, to_list, NoElementError, OrderedMap, OrderedSet,
 };
 pub use convert::{
-    base64_decode, base64_encode, clamp_i64, uri_encode_component, uri_encode_query_component,
-    utf8_decode, utf8_encode, Base64Variant, ConvertError,
+    base64_decode, base64_encode, clamp_i64, convert_error_as_format, uri_encode_component,
+    uri_encode_query_component, utf8_decode, utf8_encode, Base64Variant, ConvertError,
 };
 pub use dart_error::{
     check_not_null, check_valid_index, check_value_in_interval, DartError, DartException,
@@ -63,7 +63,9 @@ pub use gestures::{
 };
 pub use host::{AdapterFault, Host};
 pub use ir::{Action, Ir, Locale, Node, Op, Route, StateDecl, IR_VERSION};
-pub use json_codec::{json_decode, json_encode, json_encode_pretty, JsonError};
+pub use json_codec::{
+    json_decode, json_encode, json_encode_pretty, json_error_as_format, JsonError,
+};
 pub use microtask::{CallbackId, FrameCallbacks, FramePhase, FramePump, FrameStep, MicrotaskQueue};
 pub use parallel_sched::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, SchedulerMetrics, SpeedupMeasurement,
