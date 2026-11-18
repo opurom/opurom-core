@@ -20,8 +20,9 @@
 //!   delivered (`async/stream_impl.dart:50-51,386-421`,
 //!   `async/stream_controller.dart:141-143`);
 //! - during an error or done callback a terminal event waits for cancellation;
-//!   an explicit cancel clears that state and suppresses the pending done
-//!   (`async/stream_impl.dart:69-76,392-395,429-445`);
+//!   an explicit cancel clears that state and suppresses the pending done; a
+//!   repeated or re-entrant cancel reuses the cached cancel state
+//!   (`async/stream_impl.dart:69-76,232-240,287-294,392-395,429-445`);
 //! - `asFuture` overwrites the terminal handlers: done completes with a
 //!   supplied value, error cancels first and then completes with the original
 //!   error and stack trace. On an already-done subscription it completes
@@ -363,6 +364,27 @@ impl StreamSubscription {
     }
 
     fn cancel_with_completer(&self, cancel_completer: Option<crate::future::Completer>) {
+        let already_canceled = self.pending_cancel.get() || {
+            let Ok(inner) = self.inner.try_borrow() else {
+                // Re-entrant cancel from a callback: mark cancellation
+                // now and finalize when delivery ends
+                // (`stream_impl.dart:287-294`).
+                self.pending_cancel.set(true);
+                return;
+            };
+            !inner
+                .subscriptions
+                .get(&self.id)
+                .is_some_and(|subscription| !subscription.state.canceled)
+        };
+        if already_canceled {
+            // Dart's cancel() returns the cached cancel future on a repeated
+            // cancel (`async/stream_impl.dart:232-240,287-294`).
+            if let Some(completer) = cancel_completer {
+                let _ = completer.complete(FutureValue::Null);
+            }
+            return;
+        }
         let (on_cancel, done_waiters) = {
             let Ok(mut inner) = self.inner.try_borrow_mut() else {
                 // Re-entrant cancel during callback delivery; finalize after
@@ -370,6 +392,7 @@ impl StreamSubscription {
                 self.pending_cancel.set(true);
                 return;
             };
+            self.pending_cancel.set(false);
             let was_subscribed = !inner.subscriptions.is_empty();
             if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
                 subscription.state.canceled = true;

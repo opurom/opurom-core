@@ -1272,3 +1272,35 @@ fn wait_cleanup_arrival_order_is_deterministic_across_replays() {
         assert_eq!(replay.cleanup_errors, first.cleanup_errors);
     }
 }
+
+#[test]
+fn wait_combined_future_ignores_repeated_delivery() {
+    // future_impl.dart:485-491,745-755: a future may only complete once;
+    // repeated combined completions keep the first result byte for byte.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    );
+    let future = step.deliver(&runtime);
+    let first = step.deliver(&runtime);
+    let failed = WaitStep::advance(
+        &[Some(Completion::Error(AsyncError::new("late")))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    )
+    .deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(first.completion(), future.completion());
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::List(vec![int(1), int(2)])))
+    );
+    assert_eq!(
+        failed.completion(),
+        Some(Completion::Error(AsyncError::new("late")))
+    );
+    // The late error future is a separate future and is unhandled.
+    assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("late")]);
+}

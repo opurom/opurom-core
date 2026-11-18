@@ -1568,3 +1568,41 @@ fn broadcast_view_nested_pause_waits_for_last_resume() {
     subscription.resume();
     assert_eq!(*seen.borrow(), vec![int(1)]);
 }
+
+#[test]
+fn reentrant_on_cancel_cancels_once_and_suppresses_done() {
+    // stream_impl.dart:232-240,287-294: cancel() sets CANCELED before calling
+    // onCancel; a nested cancel from the hook reuses that state.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let calls = Rc::new(RefCell::new(0));
+    let calls_clone = Rc::clone(&calls);
+    let subscription: Rc<RefCell<Option<opurom_core::StreamSubscription>>> =
+        Rc::new(RefCell::new(None));
+    let subscription_clone = Rc::clone(&subscription);
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || {
+            *calls_clone.borrow_mut() += 1;
+            if let Some(subscription) = subscription_clone.borrow().as_ref() {
+                subscription.cancel();
+            }
+            None
+        })),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    *subscription.borrow_mut() = Some(stream.listen(None, None, None));
+    let cancel_future = subscription
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .cancel_future(&future_runtime);
+    future_runtime.pump(16);
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    let late = stream.try_listen_with(None, None, None, ListenOptions::default());
+    assert!(late.is_err());
+}
