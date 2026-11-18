@@ -231,9 +231,9 @@ fn a_cancelled_subscription_stops_receiving() {
 }
 
 #[test]
-fn closed_stream_ignores_new_events() {
-    // broadcast_stream_controller.dart:266-275: close marks the controller
-    // closed and sends done to current listeners.
+fn closed_stream_rejects_new_events() {
+    // broadcast_stream_controller.dart:247-257: adding after close throws a
+    // state error; the listener never sees the rejected event.
     let runtime = StreamRuntime::new();
     let stream = runtime.broadcast_controller(StreamHooks::default());
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -244,7 +244,13 @@ fn closed_stream_ignores_new_events() {
         None,
     );
     runtime.add(&stream, StreamEvent::Done);
-    runtime.add(&stream, StreamEvent::Data(int(1)));
+    let error = runtime.try_add(&stream, StreamEvent::Data(int(1)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add new events after calling close".to_owned()
+        ))
+    );
     assert!(seen.borrow().is_empty());
 }
 
@@ -912,4 +918,80 @@ fn pipe_over_an_already_listened_source_reports_the_refusal() {
     let mapped = source.map(Rc::new(|value| value));
     let error = mapped.try_listen_with(None, None, None, ListenOptions::default());
     assert!(matches!(error, Err(DartError::State(_))));
+}
+
+// Close boundary, pinned to Dart 3.14
+// (async/stream_controller.dart:581-587,628-656,688-696,
+//  async/broadcast_stream_controller.dart:201-209,247-257).
+#[test]
+fn single_subscription_add_after_close_is_a_state_error() {
+    // stream_controller.dart:581-587,616-618: a single-subscription
+    // controller refuses events after close.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    runtime.add(&stream, StreamEvent::Done);
+    let error = runtime.try_add(&stream, StreamEvent::Data(int(1)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add event after closing".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn closing_twice_is_allowed() {
+    // stream_controller.dart:628-656: close may be called more than once;
+    // only the first call has an effect.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let done_count = Rc::new(RefCell::new(0));
+    let done_clone = Rc::clone(&done_count);
+    stream.listen(
+        None,
+        None,
+        Some(Rc::new(move || *done_clone.borrow_mut() += 1) as DoneCallback),
+    );
+    runtime.add(&stream, StreamEvent::Done);
+    assert!(runtime.try_add(&stream, StreamEvent::Done).is_ok());
+    assert_eq!(*done_count.borrow(), 1);
+}
+
+#[test]
+fn listen_after_close_receives_only_done() {
+    // broadcast_stream_controller.dart:201-209: a closed broadcast
+    // controller hands out a done-only subscription.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    runtime.add(&stream, StreamEvent::Done);
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    let subscription = stream.try_listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        None,
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions::default(),
+    );
+    assert!(subscription.is_ok());
+    assert_eq!(*events.borrow(), vec!["done"]);
+}
+
+#[test]
+fn single_subscription_listen_after_close_still_gets_done() {
+    // stream_controller.dart:649-656: closing without a listener queues a
+    // pending done event that the first listener receives.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    runtime.add(&stream, StreamEvent::Done);
+    let done_count = Rc::new(RefCell::new(0));
+    let done_clone = Rc::clone(&done_count);
+    let subscription = stream.try_listen_with(
+        None,
+        None,
+        Some(Rc::new(move || *done_clone.borrow_mut() += 1) as DoneCallback),
+        ListenOptions::default(),
+    );
+    assert!(subscription.is_ok());
+    assert_eq!(*done_count.borrow(), 1);
 }

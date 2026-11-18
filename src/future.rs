@@ -26,6 +26,8 @@
 //!   (`async/future.dart:529-559,579-600`);
 //! - an uncaught error is reported once and kept in reporting order
 //!   (`async/future.dart:819-823,1336-1351`);
+//! - a failing `cleanUp` body is uncaught and reported before the combined
+//!   future completes (`async/future.dart:542-546,581-585`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -813,6 +815,27 @@ impl WaitUncaughtErrors {
     pub fn report_cleanup_errors(&self, runtime: &FutureRuntime) {
         for error in &self.cleanup {
             runtime.report_uncaught(error.clone());
+        }
+    }
+}
+
+impl WaitStep {
+    /// Completes a future with the combined result and reports the cleanup
+    /// errors as uncaught first.
+    ///
+    /// Dart runs every cleanup body inside `Future.sync`, so a failing
+    /// cleanup is reported to the zone before the combined future completes
+    /// (`async/future.dart:542-546,581-585`); the combined error is delivered
+    /// to the wait future's listeners afterwards
+    /// (`async/future.dart:550-557,587-590`).
+    pub fn deliver(&self, runtime: &FutureRuntime) -> Future {
+        for error in &self.cleanup_errors {
+            runtime.report_uncaught(error.clone());
+        }
+        match &self.outcome {
+            Some(CombineOutcome::Wait(values)) => runtime.value(FutureValue::List(values.clone())),
+            Some(CombineOutcome::Error(error)) => runtime.error(error.clone()),
+            _ => runtime.value(FutureValue::Null),
         }
     }
 }

@@ -27,9 +27,11 @@
 //!   error and stack trace (`async/stream_impl.dart:243-270`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
-//! - `close` sends a done event to the listeners subscribed at close time
-//!   (`async/broadcast_stream_controller.dart:266-275`,
-//!   `async/stream_controller.dart:254-260`);
+//! - `close` sends a done event to the listeners subscribed at close time;
+//!   adding an event afterwards is a state error, closing twice is allowed,
+//!   and a listener that subscribes after the close receives only the done
+//!   event (`async/broadcast_stream_controller.dart:201-209,247-276`,
+//!   `async/stream_controller.dart:581-587,628-656`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -505,6 +507,8 @@ impl Stream {
                 "Stream has already been listened to.".to_owned(),
             ));
         }
+        let closed = inner.closed;
+        let inner_broadcast = inner.broadcast;
         inner.ever_listened = true;
         let id = inner.next_subscription;
         inner.next_subscription += 1;
@@ -554,6 +558,11 @@ impl Stream {
         };
         for event in pre_listen {
             let _ = handle.deliver(&event);
+        }
+        if closed && inner_broadcast {
+            // A closed broadcast controller hands out a done-only
+            // subscription (`async/broadcast_stream_controller.dart:201-209`).
+            let _ = handle.deliver(&StreamEvent::Done);
         }
         Ok(handle)
     }
@@ -733,10 +742,32 @@ impl StreamRuntime {
     /// Adds an event to a stream. Delivery is synchronous here; the host
     /// decides when to call it, and the core never reads a clock
     /// (`stream_controller.dart:134-139`).
+    ///
+    /// Adding an event after the controller was closed is a protocol
+    /// violation and panics with the Dart message; hosts that need the error
+    /// as data use [`StreamRuntime::try_add`].
     pub fn add(&self, stream: &Stream, event: StreamEvent) {
+        if let Err(error) = self.try_add(stream, event) {
+            panic!("{error}");
+        }
+    }
+
+    /// Adds an event to a stream and reports the closed-controller
+    /// violation as data (`async/stream_controller.dart:581-587,616-618`,
+    /// `async/broadcast_stream_controller.dart:247-257`).
+    pub fn try_add(&self, stream: &Stream, event: StreamEvent) -> Result<(), DartError> {
         let mut inner = stream.inner.borrow_mut();
         if inner.closed {
-            return;
+            if matches!(event, StreamEvent::Done) {
+                // `close()` may be called more than once; only the first call
+                // has an effect (`async/stream_controller.dart:628-656`).
+                return Ok(());
+            }
+            return Err(if inner.broadcast {
+                DartError::State("Cannot add new events after calling close".to_owned())
+            } else {
+                DartError::State("Cannot add event after closing".to_owned())
+            });
         }
         if matches!(event, StreamEvent::Done) {
             inner.closed = true;
@@ -745,7 +776,7 @@ impl StreamRuntime {
             if !inner.broadcast {
                 inner.pre_listen.push_back(event);
             }
-            return;
+            return Ok(());
         }
         let ids: Vec<u32> = inner.subscriptions.keys().copied().collect();
         for id in ids {
@@ -808,6 +839,7 @@ impl StreamRuntime {
         }
         drop(inner);
         stream.finalize_pending_cancels();
+        Ok(())
     }
 
     /// Pumps the microtask queue used by async stream controllers

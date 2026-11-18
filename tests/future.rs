@@ -751,3 +751,86 @@ fn uncaught_reporting_keeps_insertion_order() {
         vec![AsyncError::new("first"), AsyncError::new("second")]
     );
 }
+
+#[test]
+fn wait_delivery_reports_cleanup_errors_before_the_combined_future() {
+    // future.dart:542-546,581-585: each cleanup body runs in its own
+    // Future.sync, so its failure is uncaught before the combined future
+    // completes with the first input error.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(_) => Err(AsyncError::new("cleanup")),
+            _ => Ok(()),
+        }),
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    // Nobody listens to the combined future, so its error is uncaught too;
+    // it is reported after the cleanup errors
+    // (`future.dart:550-557,1336-1351`).
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup"),
+            AsyncError::new("cleanup"),
+            AsyncError::new("boom"),
+        ]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn wait_delivery_with_a_listener_keeps_only_cleanup_errors_uncaught() {
+    // future.dart:819-823: a handled error is not reported as unhandled.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(_) => Err(AsyncError::new("cleanup")),
+            _ => Ok(()),
+        }),
+    );
+    let future = step.deliver(&runtime);
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("cleanup"), AsyncError::new("cleanup")]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn wait_delivery_of_a_successful_wait_yields_the_value_list() {
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::List(vec![int(1), int(2)])))
+    );
+    assert!(runtime.unhandled_errors().is_empty());
+}
