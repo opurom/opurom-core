@@ -6,6 +6,7 @@
 
 pub mod async_sched;
 pub mod capabilities;
+pub mod clamping_scroll;
 pub mod convert;
 pub mod drag_axis;
 pub mod error;
@@ -28,6 +29,10 @@ pub mod text_input;
 
 pub use async_sched::{AsyncScheduler, SchedulingHook, SchedulingTask, TaskContext, TaskId};
 pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
+pub use clamping_scroll::{
+    deceleration_rate, ClampingScrollSimulation, DEFAULT_FRICTION, INFLEXION, PHYSICAL_COEFF,
+    TOLERANCE,
+};
 pub use convert::{
     base64_decode, base64_encode, clamp_i64, uri_encode_component, uri_encode_query_component,
     utf8_decode, utf8_encode, Base64Variant, ConvertError,
