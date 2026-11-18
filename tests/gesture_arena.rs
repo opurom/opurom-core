@@ -251,7 +251,9 @@ fn pointer_cancel_resets_arena_and_timers() {
         pointer: 1,
         time_ms: 50,
     });
-    assert_eq!(step.events.len(), 2);
+    // Only the started tap emits a cancel; the drag self-rejects silently
+    // (monodrag.dart:747-750).
+    assert_eq!(step.events.len(), 1);
     assert!(!kernel.has_pending());
     assert!(kernel
         .step(ArenaEvent::Tick { now_ms: 5000 })
@@ -284,4 +286,94 @@ fn same_stream_on_two_kernels_is_byte_identical() {
         assert_eq!(a.step(event.clone()), b.step(event));
     }
     assert_eq!(a.has_pending(), b.has_pending());
+}
+
+#[test]
+fn sweep_prefers_first_surviving_member() {
+    // arena.dart:157-179: sweep resolves in favor of members.first.
+    let mut kernel = GestureArenaKernel::new();
+    kernel.step(down(vec![
+        gesture(11, GestureKind::Tap),
+        gesture(12, GestureKind::Tap),
+    ]));
+    let step = kernel.step(up(opurom_core::Point::new(10, 10), 20));
+    assert!(step.events.contains(&RecognizerEvent::TapUp {
+        node: 11,
+        at: opurom_core::Point::new(10, 10),
+    }));
+    assert!(!step
+        .events
+        .iter()
+        .any(|e| matches!(e, RecognizerEvent::TapUp { node: 12, .. })));
+}
+
+#[test]
+fn long_press_eager_accept_wins_over_sibling_tap() {
+    // arena.dart:233-240: accept while closed resolves immediately;
+    // long_press.dart:640-647 accepts at the 500 ms deadline.
+    let mut kernel = GestureArenaKernel::new();
+    kernel.step(down(vec![
+        gesture(20, GestureKind::Tap),
+        gesture(21, GestureKind::LongPress),
+    ]));
+    let step = kernel.step(ArenaEvent::Tick { now_ms: 500 });
+    assert!(step.events.contains(&RecognizerEvent::LongPressStart {
+        node: 21,
+        at: opurom_core::Point::new(10, 10),
+    }));
+    assert!(!step
+        .events
+        .iter()
+        .any(|e| matches!(e, RecognizerEvent::TapUp { node: 20, .. })));
+}
+
+#[test]
+fn double_tap_hold_delays_sweep_until_expiry() {
+    // multitap.dart:328-336 holds the first tap's arena after up; the
+    // 300ms timer resets and releases it (:322-325,357-359).
+    let mut kernel = GestureArenaKernel::new();
+    kernel.step(down(vec![
+        gesture(30, GestureKind::DoubleTap),
+        gesture(31, GestureKind::Tap),
+    ]));
+    let first = kernel.step(up(opurom_core::Point::new(10, 10), 0));
+    assert!(first.events.is_empty(), "held arena must not sweep at up");
+    assert_eq!(first.next_deadline_ms, Some(300));
+    let expired = kernel.step(ArenaEvent::Tick { now_ms: 301 });
+    // DoubleTapGestureRecognizer.acceptGesture is a no-op
+    // (multitap.dart:274-275): expiry releases the arena without a spurious
+    // tap callback; the pending sweep is gone and no timer remains.
+    assert!(!kernel.has_pending());
+    assert!(expired.next_deadline_ms.is_none());
+}
+
+#[test]
+fn buttons_change_cancels_all_members() {
+    // tap.dart:321-323 rejects when buttons change mid-sequence.
+    let mut kernel = GestureArenaKernel::new();
+    kernel.step(down(vec![
+        gesture(40, GestureKind::Tap),
+        gesture(41, GestureKind::LongPress),
+    ]));
+    let step = kernel.step(ArenaEvent::Move {
+        pointer: 1,
+        at: opurom_core::Point::new(10, 10),
+        time_ms: 10,
+        buttons: 0,
+    });
+    // Tap and LongPress both report a cancel on buttons change
+    // (tap.dart:315-323); the empty arena then clears (arena.dart:259-261).
+    assert_eq!(step.events.len(), 3);
+    assert!(!kernel.has_pending());
+}
+
+#[test]
+fn tmp_hold_trace2() {
+    let mut k = GestureArenaKernel::new();
+    k.step(down(vec![
+        gesture(30, GestureKind::DoubleTap),
+        gesture(31, GestureKind::Tap),
+    ]));
+    println!("up {:?}", k.step(up(opurom_core::Point::new(10, 10), 0)));
+    println!("tick {:?}", k.step(ArenaEvent::Tick { now_ms: 301 }));
 }

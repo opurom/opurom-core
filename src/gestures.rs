@@ -342,6 +342,11 @@ impl PointerArena {
             }
             return;
         }
+        if self.held {
+            // Double-tap keeps the arena open past up until its timer fires
+            // (`multitap.dart:328-336`, `arena.dart:181-191`).
+            return;
+        }
         self.resolve_in_favor_of(node, events);
     }
 
@@ -779,17 +784,22 @@ impl GestureArenaKernel {
                     return ArenaStep::empty();
                 };
                 for member in &arena.members {
-                    events.push(if member.started {
-                        RecognizerEvent::Cancel {
-                            node: member.node,
-                            reason: CancelReason::PointerCancel,
+                    match member.kind {
+                        GestureKind::Tap | GestureKind::LongPress => {
+                            events.push(if member.started {
+                                RecognizerEvent::Cancel {
+                                    node: member.node,
+                                    reason: CancelReason::PointerCancel,
+                                }
+                            } else {
+                                RecognizerEvent::TapCancel {
+                                    node: member.node,
+                                    reason: CancelReason::PointerCancel,
+                                }
+                            });
                         }
-                    } else {
-                        RecognizerEvent::TapCancel {
-                            node: member.node,
-                            reason: CancelReason::PointerCancel,
-                        }
-                    });
+                        GestureKind::Drag | GestureKind::DoubleTap => {}
+                    }
                 }
                 arena.members.clear();
                 if self.first_tap.is_some_and(|t| t.pointer == pointer) {
@@ -822,9 +832,25 @@ impl GestureArenaKernel {
                 }
                 if let Some(first) = self.first_tap {
                     if first.expiry <= now_ms {
+                        // Dart's Timer callback re-enters the event loop;
+                        // take the arena out so pointer-up bookkeeping cannot
+                        // re-clear the newly resolved winner.
                         self.first_tap = None; // multitap.dart:357-359
-                        if let Some(arena) = self.arenas.get_mut(&first.pointer) {
-                            arena.release(&mut events);
+                        let mut held = self.arenas.remove(&first.pointer);
+                        if let Some(arena) = held.as_mut() {
+                            // The arena was held at pointer-up, so a sweep
+                            // is pending (`arena.dart:163-167`). Expiry calls
+                            // `release`, which performs that deferred sweep
+                            // (`arena.dart:211-221`, `multitap.dart:322-325`).
+                            arena.held = false;
+                            let first = arena.members.first().map(|m| m.node);
+                            if let Some(node) = first {
+                                arena.resolve_in_favor_of(node, &mut events);
+                            }
+                            arena.pending_sweep = false;
+                        }
+                        if let Some(arena) = held {
+                            self.arenas.insert(first.pointer, arena);
                         }
                     }
                 }
