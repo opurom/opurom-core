@@ -311,3 +311,93 @@ fn error_events_bypass_where_filters() {
         .iter()
         .any(|error| error.message == "passthrough"));
 }
+
+#[test]
+fn nested_pause_needs_matching_resumes() {
+    // stream_impl.dart:204-229: pause count is nested; one resume does not
+    // unpause a doubly-paused subscription.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = stream.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    subscription.pause();
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    subscription.resume();
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn pause_after_cancel_is_a_no_op() {
+    // stream_impl.dart:204-205,215-216: a canceled subscription ignores
+    // pause and resume.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    subscription.cancel();
+    subscription.pause();
+    subscription.resume();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_clone = Rc::clone(&seen);
+    stream.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn done_is_delivered_to_each_listener_exactly_once() {
+    // broadcast_stream_controller.dart:404-413: _sendDone closes every
+    // current listener.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let counts = Rc::new(RefCell::new(vec![0, 0]));
+    for index in 0..2 {
+        let counts = Rc::clone(&counts);
+        stream.listen(
+            None,
+            None,
+            Some(Rc::new(move || counts.borrow_mut()[index] += 1) as DoneCallback),
+        );
+    }
+    runtime.add(&stream, StreamEvent::Done);
+    runtime.add(&stream, StreamEvent::Done); // closed controller ignores it
+    assert_eq!(*counts.borrow(), vec![1, 1]);
+}
+
+#[test]
+fn broadcast_event_order_is_independent_per_listener() {
+    // stream_controller.dart:160-166: each subscription receives all events
+    // in order, although listeners may interleave.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let first = Rc::new(RefCell::new(Vec::new()));
+    let second = Rc::new(RefCell::new(Vec::new()));
+    let first_clone = Rc::clone(&first);
+    let second_clone = Rc::clone(&second);
+    stream.listen(
+        Some(Rc::new(move |value| first_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    stream.listen(
+        Some(Rc::new(move |value| second_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    for value in [1, 2, 3, 4] {
+        runtime.add(&stream, StreamEvent::Data(int(value)));
+    }
+    assert_eq!(*first.borrow(), vec![int(1), int(2), int(3), int(4)]);
+    assert_eq!(*second.borrow(), vec![int(1), int(2), int(3), int(4)]);
+}

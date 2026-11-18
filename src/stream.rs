@@ -52,7 +52,9 @@ pub type DoneCallback = Rc<dyn Fn()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubscriptionState {
-    paused: bool,
+    /// Dart counts nested pauses in `_STATE_PAUSE_COUNT`
+    /// (`async/stream_impl.dart:204-229`); one resume only decrements.
+    pause_count: usize,
     canceled: bool,
 }
 
@@ -74,7 +76,7 @@ impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Subscription")
             .field("id", &self.id)
-            .field("paused", &self.state.paused)
+            .field("pause_count", &self.state.pause_count)
             .field("canceled", &self.state.canceled)
             .field("buffered", &self.buffered.len())
             .finish()
@@ -91,7 +93,7 @@ impl Subscription {
         Self {
             id,
             state: SubscriptionState {
-                paused: false,
+                pause_count: 0,
                 canceled: false,
             },
             on_data,
@@ -140,7 +142,7 @@ impl StreamSubscription {
     pub fn pause(&self) {
         let mut inner = self.inner.borrow_mut();
         if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
-            subscription.state.paused = true;
+            subscription.state.pause_count += 1;
         }
         if let Some(hook) = inner.hooks.on_pause.clone() {
             drop(inner);
@@ -149,17 +151,30 @@ impl StreamSubscription {
     }
 
     pub fn resume(&self) {
-        let (buffered, hook) = {
+        let (buffered, hook, still_paused) = {
             let mut inner = self.inner.borrow_mut();
             let Some(subscription) = inner.subscriptions.get_mut(&self.id) else {
                 return;
             };
-            subscription.state.paused = false;
+            subscription.state.pause_count = subscription.state.pause_count.saturating_sub(1);
+            let still_paused = subscription.state.pause_count > 0;
             (
                 std::mem::take(&mut subscription.buffered),
                 inner.hooks.on_resume.clone(),
+                still_paused,
             )
         };
+        if still_paused {
+            // Nested pause: input stays paused until the last resume
+            // (`stream_impl.dart:217-228`). Re-buffer the events.
+            let mut inner = self.inner.borrow_mut();
+            if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
+                for event in buffered {
+                    subscription.buffered.push_back(event);
+                }
+            }
+            return;
+        }
         for event in buffered {
             self.deliver(&event);
         }
@@ -428,7 +443,7 @@ impl StreamRuntime {
         let ids: Vec<u32> = inner.subscriptions.keys().copied().collect();
         for id in ids {
             let subscription = inner.subscriptions.get_mut(&id).unwrap();
-            if subscription.state.paused {
+            if subscription.state.pause_count > 0 {
                 subscription.buffered.push_back(event.clone());
             } else {
                 subscription.deliver(&event);
