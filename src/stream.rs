@@ -39,8 +39,9 @@
 //!   subscription; the returned future completes after source done is
 //!   forwarded; the controller `done` future is completed at the terminal
 //!   event even without listeners, and a canceled single subscription
-//!   completes it immediately; `cancel()` returns the controller's cancel
-//!   future, which waits for an asynchronous `onCancel` hook
+//!   completes it immediately, both after the done event and after the
+//!   subscription cancel; `cancel()` returns the controller's cancel future,
+//!   which waits for an asynchronous `onCancel` hook
 //!   (`async/stream_impl.dart:232-240,287-294`,
 //!   `async/stream_controller.dart:465-469,528-552,590-613,725-775,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
@@ -968,12 +969,19 @@ impl StreamRuntime {
     }
 
     /// Returns a future completed when the controller's terminal event has
-    /// been delivered (`async/stream_controller.dart:605-613`,
+    /// been delivered: the single subscriber's done callback, or its cancel.
+    /// An already-canceled or already-closed controller completes immediately
+    /// (`async/stream_controller.dart:605-613,762-773`,
     /// `async/broadcast_stream_controller.dart:84-95,278`).
     pub fn done_future(&self, stream: &Stream, runtime: &FutureRuntime) -> Future {
         let mut inner = stream.inner.borrow_mut();
         let completer = runtime.completer();
-        if inner.closed {
+        let canceled = !inner.broadcast
+            && inner
+                .subscriptions
+                .values()
+                .all(|subscription| subscription.state.canceled);
+        if inner.closed || canceled {
             let _ = completer.complete(FutureValue::Null);
         } else {
             inner.done_waiters.push(completer.clone());

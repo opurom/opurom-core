@@ -1358,3 +1358,42 @@ fn on_cancel_future_delays_cancel_and_done_futures() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+#[test]
+fn done_future_completes_after_listener_done_and_subscription_cancel_paths() {
+    // stream_controller.dart:605-613,762-773: both the terminal done event
+    // and the single subscription cancel complete controller.done.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let done_stream = stream_runtime.controller(StreamHooks::default());
+    let done_waiter = stream_runtime.done_future(&done_stream, &future_runtime);
+    let done_subscription = done_stream.listen(None, None, None);
+    let cancel_stream = stream_runtime.controller(StreamHooks::default());
+    let cancel_waiter = stream_runtime.done_future(&cancel_stream, &future_runtime);
+    let cancel_subscription = cancel_stream.listen(None, None, None);
+    done_subscription.cancel();
+    cancel_subscription.cancel();
+    future_runtime.pump(16);
+    assert_eq!(
+        done_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        cancel_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn late_done_future_after_terminal_event_completes_immediately() {
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = stream_runtime.controller(StreamHooks::default());
+    stream_runtime.add(&stream, StreamEvent::Done);
+    let stream_done = stream_runtime.done_future(&stream, &future_runtime);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}

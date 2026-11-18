@@ -34,7 +34,8 @@
 //!   before the combined result, and eager mode reports only cleanup futures
 //!   produced before the first error; non-eager delivery keeps that order
 //!   while waiting for all inputs, and cleanup errors that arrive later are
-//!   reported after the result, even when the combined wait succeeded
+//!   reported after the result, even when the combined wait succeeded; a
+//!   fully late set of cleanup futures aggregates in cleanup order
 //!   (`async/future.dart:322-330,542-558,574-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
@@ -838,6 +839,17 @@ pub fn wait_cleanup_future_errors(
         .into_iter()
         .filter_map(|slot| slot.borrow().clone())
         .collect()
+}
+
+/// Aggregates the errors of every cleanup future, all of which become
+/// observable only after the combined wait future has completed. The errors
+/// keep cleanup order (`async/future.dart:538-558,579-590`).
+pub fn aggregate_late_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    cleanup_futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    wait_cleanup_future_errors(runtime, cleanup_futures, limit)
 }
 
 /// Reports cleanup-future errors that become observable only after the

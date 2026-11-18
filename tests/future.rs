@@ -428,8 +428,9 @@ fn for_each_values_are_discarded() {
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
 use opurom_core::{
-    report_eager_cleanup_future_errors, report_late_cleanup_future_errors,
-    wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors,
+    aggregate_late_cleanup_future_errors, report_eager_cleanup_future_errors,
+    report_late_cleanup_future_errors, wait_cleanup_future_errors, wait_error_at,
+    wait_uncaught_errors,
 };
 
 #[test]
@@ -1108,4 +1109,23 @@ fn late_cleanup_after_successful_wait_is_reported() {
     );
     assert_eq!(errors, vec![AsyncError::new("late-after-success")]);
     assert_eq!(runtime.unhandled_errors(), errors);
+}
+
+#[test]
+fn all_late_cleanup_future_errors_are_aggregated_in_cleanup_order() {
+    // future.dart:538-558,579-590: every cleanup future that completes after
+    // the combined result contributes its error in cleanup order.
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("late-1"));
+    let second = runtime.error(AsyncError::new("late-2"));
+    let third = runtime.error(AsyncError::new("late-3"));
+    let errors = aggregate_late_cleanup_future_errors(&runtime, &[first, second, third], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("late-1"),
+            AsyncError::new("late-2"),
+            AsyncError::new("late-3"),
+        ]
+    );
 }
