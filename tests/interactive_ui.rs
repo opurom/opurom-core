@@ -612,13 +612,6 @@ fn malformed_ir_is_rejected_with_a_readable_diagnostic() {
         (
             ir_document(
                 json!([{"name": "a", "type": "int", "init": 0}]),
-                json!({"tap": {"actions": [{"op": "mul", "target": "a", "value": 1}]}}),
-            ),
-            "is not set, add, sub",
-        ),
-        (
-            ir_document(
-                json!([{"name": "a", "type": "int", "init": 0}]),
                 json!({"tap": {"actions": [{"op": "add", "target": "a"}]}}),
             ),
             "add requires an integer value",

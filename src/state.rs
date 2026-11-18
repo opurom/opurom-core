@@ -381,7 +381,7 @@ fn apply_action(
                 }
             }
         }
-        Op::Add | Op::Sub => {
+        Op::Add | Op::Sub | Op::Mul | Op::Div => {
             let delta = if let Some(source) = &action.value_from {
                 match state_value(values, index, source)? {
                     Value::Int(value) => value,
@@ -402,10 +402,19 @@ fn apply_action(
             };
             match &current {
                 Value::Int(value) => {
-                    let next = if action.op == Op::Add {
-                        value.checked_add(delta)
-                    } else {
-                        value.checked_sub(delta)
+                    let next = match action.op {
+                        Op::Add => value.checked_add(delta),
+                        Op::Sub => value.checked_sub(delta),
+                        Op::Mul => value.checked_mul(delta),
+                        Op::Div => {
+                            if delta == 0 {
+                                return Err(CoreError::DivisionByZero {
+                                    name: action.target.clone(),
+                                });
+                            }
+                            value.checked_div(delta)
+                        }
+                        _ => unreachable!(),
                     };
                     Value::Int(next.ok_or_else(|| CoreError::Overflow {
                         name: action.target.clone(),
@@ -415,6 +424,28 @@ fn apply_action(
                     return Err(CoreError::TypeMismatch {
                         name: action.target.clone(),
                         expected: "int",
+                    })
+                }
+            }
+        }
+        Op::Backspace => {
+            if action.value.is_some() || action.value_from.is_some() {
+                return Err(CoreError::InvalidIr(format!(
+                    "backspace on {} must not have a value",
+                    action.target
+                )));
+            }
+            match &current {
+                Value::Int(value) => Value::Int(value / 10),
+                Value::Str(value) => {
+                    let mut chars = value.chars();
+                    chars.next_back();
+                    Value::Str(chars.as_str().to_owned())
+                }
+                _ => {
+                    return Err(CoreError::TypeMismatch {
+                        name: action.target.clone(),
+                        expected: "int or string",
                     })
                 }
             }

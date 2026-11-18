@@ -202,11 +202,6 @@ fn rejects_illegal_event_actions() {
         ),
         (
             int_state.clone(),
-            json!({"tap": {"op": "mul", "target": "count", "value": 2}}),
-            "is not set, add, sub",
-        ),
-        (
-            int_state.clone(),
             json!({"hover": {"op": "add", "target": "count", "value": 1}}),
             "unknown event name",
         ),

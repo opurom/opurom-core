@@ -30,6 +30,9 @@ pub enum CoreError {
     Overflow {
         name: String,
     },
+    DivisionByZero {
+        name: String,
+    },
     Plugin(PluginError),
     Resource(ResourceError),
     TextInput(TextInputError),
@@ -57,6 +60,7 @@ impl fmt::Display for CoreError {
             }
             Self::InvalidLocale { message } => write!(f, "@locale {message}"),
             Self::Overflow { name } => write!(f, "integer overflow while updating {name}"),
+            Self::DivisionByZero { name } => write!(f, "division by zero while updating {name}"),
             Self::Plugin(error) => write!(f, "plugin error: {error}"),
             Self::Resource(error) => write!(f, "resource error: {error}"),
             Self::TextInput(error) => write!(f, "text input error: {error}"),
