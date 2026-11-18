@@ -1636,3 +1636,33 @@ fn async_on_cancel_error_reaches_cancel_future_and_done_still_completes() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+#[test]
+fn reentrant_cancel_error_suppresses_done_and_keeps_error() {
+    // stream_impl.dart:392-395, stream_controller.dart:750-755: a cancel
+    // raised from an error callback is terminal; later done is suppressed.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let errors = Rc::new(RefCell::new(Vec::<String>::new()));
+    let done = Rc::new(RefCell::new(0));
+    let errors_clone = Rc::clone(&errors);
+    let done_clone = Rc::clone(&done);
+    let subscription: Rc<RefCell<Option<opurom_core::StreamSubscription>>> =
+        Rc::new(RefCell::new(None));
+    let subscription_clone = Rc::clone(&subscription);
+    *subscription.borrow_mut() = Some(stream.listen_with(
+        None,
+        Some(Rc::new(move |error: &AsyncError| {
+            errors_clone.borrow_mut().push(error.message.clone());
+            if let Some(subscription) = subscription_clone.borrow().as_ref() {
+                subscription.cancel();
+            }
+        }) as ErrorCallback),
+        Some(Rc::new(move || *done_clone.borrow_mut() += 1) as DoneCallback),
+        ListenOptions::default(),
+    ));
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&stream, StreamEvent::Done);
+    assert_eq!(*errors.borrow(), vec!["boom".to_owned()]);
+    assert_eq!(*done.borrow(), 0);
+}

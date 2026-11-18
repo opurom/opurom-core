@@ -1368,3 +1368,37 @@ fn combined_future_listener_chain_stays_stable_across_completions() {
         ]
     );
 }
+
+#[test]
+fn wait_mixed_completion_listener_chain_replays_byte_identically() {
+    // future_impl.dart:593-612: listener order is stable across mixed
+    // completion rounds; repeated replays yield identical chains.
+    let build = || {
+        let runtime = FutureRuntime::new();
+        let outcomes = vec![Completion::Value(int(1)), Completion::Value(int(2))];
+        let inputs = outcomes.iter().map(|c| Some(c.clone())).collect::<Vec<_>>();
+        let step = WaitStep::advance(&inputs, FutureCombineErrorPolicy::Wait, None);
+        let combined = step.deliver(&runtime);
+        runtime.pump(16);
+        let chain = Rc::new(RefCell::new(Vec::<String>::new()));
+        for tag in ["then-1", "then-2"] {
+            let chain = Rc::clone(&chain);
+            let tag = tag.to_owned();
+            let _ = combined.then(
+                &runtime,
+                Rc::new(move |value| {
+                    chain.borrow_mut().push(format!("{tag}:{value:?}"));
+                    value
+                }) as OnValue,
+            );
+        }
+        runtime.pump(16);
+        let replay = chain.borrow().clone();
+        replay
+    };
+    let first = build();
+    for _ in 0..4 {
+        assert_eq!(build(), first);
+    }
+    assert!(!first.is_empty());
+}

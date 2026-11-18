@@ -24,7 +24,8 @@
 //!   repeated or re-entrant cancel reuses the cached cancel state; an error
 //!   from an asynchronous cancel hook reaches the cancel future while the
 //!   controller done future still completes, and repeated cancellation rounds
-//!   keep the first terminal result
+//!   keep the first terminal result; a cancel raised from an error callback
+//!   is finalized immediately
 //!   (`async/stream_impl.dart:69-76,232-240,287-294,392-395,429-445`,
 //!   `async/stream_controller.dart:725-775`);
 //! - `asFuture` overwrites the terminal handlers: done completes with a
@@ -1076,6 +1077,22 @@ impl StreamRuntime {
             let is_done = matches!(event, StreamEvent::Done);
             if !existing.state.canceled || existing.waiting_for_cancel {
                 existing.deliver(&event);
+            }
+            if matches!(event, StreamEvent::Error(_))
+                && inner
+                    .subscriptions
+                    .get(&id)
+                    .is_some_and(|subscription| subscription.pending_cancel.get())
+            {
+                // A cancel raised by an error callback is finalized before the
+                // next event; Dart routes hook errors to the cancel future
+                // (`stream_impl.dart:392-395,stream_controller.dart:750-755`).
+                if let Some(mut subscription) = inner.subscriptions.get_mut(&id).cloned() {
+                    subscription.state.canceled = true;
+                    subscription.waiting_for_cancel = false;
+                    subscription.pending_cancel.set(false);
+                    let _ = inner.subscriptions.insert(id, subscription);
+                }
             }
             if error_cancels {
                 // `_sendError` marks wait-for-cancel before invoking the
