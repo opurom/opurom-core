@@ -115,3 +115,121 @@ fn empty_containers_encode_compactly() {
         "[]"
     );
 }
+
+#[test]
+fn i64_boundary_integers_decode_exactly() {
+    // core/int.dart:7-10: Dart's VM int is signed 64-bit two's complement.
+    assert_eq!(
+        json_decode("9223372036854775807").unwrap(),
+        FutureValue::Int(i64::MAX)
+    );
+    assert_eq!(
+        json_decode("-9223372036854775808").unwrap(),
+        FutureValue::Int(i64::MIN)
+    );
+    assert_eq!(
+        json_encode(&FutureValue::Int(i64::MAX)).unwrap(),
+        "9223372036854775807"
+    );
+}
+
+#[test]
+fn integer_above_i64_max_never_wraps_negative() {
+    // core/int.dart:7-16: no silent two's-complement wrap; a value outside
+    // the signed 64-bit range stays a double (as with Dart's JS backend).
+    let value = json_decode("9223372036854775808").unwrap();
+    assert!(
+        matches!(value, FutureValue::Float(number) if number > 9.0e18),
+        "{value:?}"
+    );
+    let value = json_decode("18446744073709551615").unwrap();
+    assert!(
+        matches!(value, FutureValue::Float(number) if number > 0.0),
+        "{value:?}"
+    );
+}
+
+#[test]
+fn double_precision_boundaries_are_deterministic() {
+    // core/double.dart:7-12: IEEE 754 binary64. Values that are exactly
+    // representable must round-trip byte-identically.
+    for token in ["1.5", "0.1", "1e308", "5e-324", "2.2250738585072014e-308"] {
+        let first = json_decode(token).unwrap();
+        let encoded = json_encode(&first).unwrap();
+        let second = json_decode(&encoded).unwrap();
+        assert_eq!(first, second, "token {token} encoded as {encoded}");
+    }
+}
+
+#[test]
+fn overflowing_exponent_is_a_typed_json_error() {
+    // A literal that overflows binary64 has no finite Dart double value
+    // (core/double.dart:7-12), so it is rejected rather than becoming inf.
+    assert!(matches!(
+        json_decode("1e400"),
+        Err(JsonError::InvalidJson(_))
+    ));
+}
+
+#[test]
+fn surrogate_pair_escapes_decode_to_single_code_point() {
+    // convert/json.dart:683-686,1143-1152: a lead+trail surrogate pair is
+    // one Unicode scalar in UTF-8 output.
+    let value = json_decode(r#""🌍""#).unwrap();
+    assert_eq!(value, text("🌍"));
+    assert_eq!(json_encode(&value).unwrap(), r#""🌍""#);
+}
+
+#[test]
+fn escaped_control_characters_and_solidus_round_trip() {
+    // convert/json.dart:714-745: control chars are escaped as \u00XX; the
+    // solidus may be escaped but does not have to be.
+    let value = json_decode(r#""a\/b\u0000c""#).unwrap();
+    assert_eq!(value, text("a/b\0c"));
+    let encoded = json_encode(&value).unwrap();
+    assert_eq!(json_decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn utf8_bom_is_a_real_character_not_silently_dropped() {
+    // convert/utf.dart:8-11: U+FEFF is a Unicode character; the codec does
+    // not strip it implicitly.
+    let bytes = [0xEF, 0xBB, 0xBF, b'A'];
+    assert_eq!(
+        opurom_core::utf8_decode(&bytes, false).unwrap(),
+        "\u{feff}A"
+    );
+    assert_eq!(opurom_core::utf8_encode("\u{feff}A"), bytes);
+}
+
+#[test]
+fn truncated_bom_is_malformed_utf8() {
+    // convert/utf.dart:571: an unterminated sequence is a FormatException
+    // unless malformed input is explicitly allowed.
+    let partial = [0xEF, 0xBB];
+    assert!(opurom_core::utf8_decode(&partial, false).is_err());
+    assert!(opurom_core::utf8_decode(&partial, true)
+        .unwrap()
+        .contains('\u{fffd}'));
+}
+
+#[test]
+fn overlong_and_invalid_utf8_sequences_are_rejected() {
+    // convert/utf.dart:32-40: malformed octet sequences throw by default.
+    assert!(opurom_core::utf8_decode(&[0xC0, 0xAF], false).is_err()); // overlong '/'
+    assert!(opurom_core::utf8_decode(&[0xED, 0xA0, 0x80], false).is_err()); // surrogate
+    assert!(opurom_core::utf8_decode(&[0xF4, 0x90, 0x80, 0x80], false).is_err()); // > U+10FFFF
+    assert_eq!(
+        opurom_core::utf8_decode(&[0xF0, 0x9F, 0x8C, 0x8D], false).unwrap(),
+        "🌍"
+    );
+}
+
+#[test]
+fn json_string_raw_newline_is_invalid() {
+    // convert/json.dart:592: unescaped control characters are invalid JSON.
+    assert!(matches!(
+        json_decode("\"line\nbreak\""),
+        Err(JsonError::InvalidJson(_))
+    ));
+}

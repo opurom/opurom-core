@@ -158,9 +158,11 @@ fn from_json(value: &Json) -> Result<FutureValue, JsonError> {
         Json::Number(number) => {
             if let Some(integer) = number.as_i64() {
                 Ok(FutureValue::Int(integer))
-            } else if let Some(unsigned) = number.as_u64() {
-                Ok(FutureValue::Int(unsigned as i64))
             } else {
+                // Dart's int is a signed 64-bit two's-complement value
+                // (`core/int.dart:7-10`). A positive literal above i64::MAX
+                // must never wrap into a negative int; keep it as a double,
+                // which is also what Dart's JS backend does (int.dart:12-16).
                 number
                     .as_f64()
                     .map(FutureValue::Float)

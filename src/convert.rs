@@ -211,7 +211,23 @@ pub fn utf8_decode(bytes: &[u8], allow_malformed: bool) -> Result<String, Conver
             value = (value << 6) | (continuation & 0x3f) as u32;
         }
         if !malformed {
-            if let Some(character) = char::from_u32(value) {
+            // Reject overlong encodings and values outside Unicode's scalar
+            // range (convert/utf.dart:32-40,571): every scalar must use the
+            // shortest byte sequence and must not be a surrogate.
+            let minimal_width = match value {
+                0..=0x7f => 1,
+                0x80..=0x7ff => 2,
+                0x800..=0xffff => 3,
+                _ => 4,
+            };
+            let invalid_scalar = (0xd800..=0xdfff).contains(&value) || value > 0x10ffff;
+            if minimal_width != width || invalid_scalar {
+                if allow_malformed {
+                    out.push('\u{fffd}');
+                } else {
+                    return Err(ConvertError::InvalidUtf8(index));
+                }
+            } else if let Some(character) = char::from_u32(value) {
                 out.push(character);
             } else if allow_malformed {
                 out.push('\u{fffd}');
