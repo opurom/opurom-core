@@ -634,6 +634,27 @@ pub fn should_complete_wait_early(inputs: &[Completion], policy: FutureCombineEr
             .any(|input| matches!(input, Completion::Error(_)))
 }
 
+/// The error that an eager `wait` reports at a given step, together with the
+/// source position where its listener fired. `Future.wait` registers listeners
+/// in source order, so the first failed input in that order wins even when a
+/// later input completes first in wall-clock time
+/// (`future.dart:528-537,550-559`).
+pub fn wait_error_at(
+    inputs: &[Option<Completion>],
+    policy: FutureCombineErrorPolicy,
+) -> Option<(usize, AsyncError)> {
+    if policy != FutureCombineErrorPolicy::WaitEager {
+        return None;
+    }
+    inputs
+        .iter()
+        .enumerate()
+        .find_map(|(index, input)| match input {
+            Some(Completion::Error(error)) => Some((index, error.clone())),
+            _ => None,
+        })
+}
+
 /// Deterministic result of a host-driven `Future.forEach` sequence
 /// (`async/future.dart:672-699`): actions run in source order, and the first
 /// error stops the loop (`:686-687`).

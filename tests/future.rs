@@ -424,3 +424,56 @@ fn for_each_values_are_discarded() {
     let result = for_each_outcomes(&elements, &outcomes);
     assert_eq!(result.processed, vec![int(7)]);
 }
+
+// Future.wait after-error ordering, pinned to Dart 3.14
+// (async/future.dart:517-600).
+use opurom_core::wait_error_at;
+
+#[test]
+fn wait_error_uses_source_order_not_completion_order() {
+    // future.dart:528-537,550-559: listeners are attached in source order;
+    // the first failed input wins even when a later input completed earlier.
+    let inputs = [None, Some(err("late")), None, Some(err("early"))];
+    let outcome = wait_error_at(&inputs, FutureCombineErrorPolicy::WaitEager);
+    assert_eq!(outcome, Some((1, AsyncError::new("late"))));
+    assert_eq!(
+        combine_completions(
+            &[
+                Completion::Value(int(1)),
+                Completion::Error(AsyncError::new("late")),
+                Completion::Error(AsyncError::new("early")),
+            ],
+            FutureCombineErrorPolicy::WaitEager,
+        ),
+        CombineOutcome::Error(AsyncError::new("late"))
+    );
+}
+
+#[test]
+fn wait_error_waits_for_all_inputs_without_eager_error() {
+    // future.dart:587-590: without eagerError the combined future completes
+    // only after every input, even if one has already failed.
+    let inputs = [None, Some(err("boom")), None];
+    assert_eq!(wait_error_at(&inputs, FutureCombineErrorPolicy::Wait), None);
+    assert_eq!(
+        should_complete_wait_early(
+            &[Completion::Error(AsyncError::new("boom"))],
+            FutureCombineErrorPolicy::Wait
+        ),
+        false
+    );
+}
+
+#[test]
+fn wait_error_keeps_stack_trace_byte_for_byte() {
+    let original = AsyncError {
+        message: "first".to_owned(),
+        stack_trace: "frame-a\nframe-b".to_owned(),
+    };
+    let inputs = [
+        Some(Completion::Error(original.clone())),
+        Some(err("second")),
+    ];
+    let outcome = wait_error_at(&inputs, FutureCombineErrorPolicy::WaitEager);
+    assert_eq!(outcome, Some((0, original)));
+}

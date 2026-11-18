@@ -564,3 +564,78 @@ fn done_after_error_without_cancel_is_suppressed_by_closed_controller() {
     runtime.add(&stream, StreamEvent::Done);
     assert_eq!(*counts.borrow(), 1);
 }
+
+// Pipe cancellation propagation, pinned to Dart 3.14
+// (async/stream_pipe.dart:213-253,485-530, async/stream_impl.dart:386-421).
+#[test]
+fn pipe_cancel_on_error_stops_upstream_after_delivery() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let mapped = source.map(Rc::new(|value| value));
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    mapped.listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(
+            Rc::new(move |_: &AsyncError| error_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["data", "error"]);
+}
+
+#[test]
+fn pipe_cancel_on_error_false_keeps_upstream_open() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let filtered = source.r#where(Rc::new(|_| true));
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    filtered.listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(
+            Rc::new(move |_: &AsyncError| error_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        None,
+        ListenOptions::default(),
+    );
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("soft")));
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*events.borrow(), vec!["error", "data"]);
+}
+
+#[test]
+fn chained_pipes_propagate_cancel_to_the_source() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let pipeline = source.map(Rc::new(|value| value)).distinct();
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let error_events = Rc::clone(&events);
+    pipeline.listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        Some(
+            Rc::new(move |_: &AsyncError| error_events.borrow_mut().push("error".to_owned()))
+                as ErrorCallback,
+        ),
+        None,
+        ListenOptions {
+            cancel_on_error: true,
+        },
+    );
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("boom")));
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*events.borrow(), vec!["error"]);
+}

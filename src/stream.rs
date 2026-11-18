@@ -254,6 +254,11 @@ impl StreamSubscription {
 #[derive(Clone, Default)]
 pub struct StreamHooks {
     pub on_listen: Option<Rc<dyn Fn()>>,
+    /// Notified when `listen_with` changes the error policy, so forwarding
+    /// pipes can apply the same policy to their upstream subscription
+    /// (`stream_pipe.dart:213-253`).
+    #[doc(hidden)]
+    pub on_error_options: Option<Rc<dyn Fn(ListenOptions)>>,
     pub on_pause: Option<Rc<dyn Fn()>>,
     pub on_resume: Option<Rc<dyn Fn()>>,
     pub on_cancel: Option<Rc<dyn Fn()>>,
@@ -335,6 +340,7 @@ impl Stream {
             .with_cancel_on_error(options.cancel_on_error);
         let first = inner.subscriptions.is_empty();
         inner.subscriptions.insert(id, subscription);
+        let on_error_options = inner.hooks.on_error_options.clone();
         let on_listen = if first {
             inner.hooks.on_listen.clone()
         } else {
@@ -346,6 +352,9 @@ impl Stream {
             VecDeque::new()
         };
         drop(inner);
+        if let Some(on_error_options) = on_error_options {
+            on_error_options(options);
+        }
         if let Some(on_listen) = on_listen {
             on_listen();
         }
@@ -405,6 +414,9 @@ impl Stream {
     /// Builds a forwarding pipe (`stream_pipe.dart:_ForwardingStream`):
     /// subscribing to the pipe subscribes to the source, and every source
     /// event passes through `filter` before reaching the pipe's listeners.
+    /// `cancelOnError` is forwarded so an error cancels the whole listener
+    /// chain after it has been delivered to the pipe's listener
+    /// (`stream_pipe.dart:213-253,485-530`, `stream_impl.dart:386-421`).
     fn forwarding_stream(&self, filter: Rc<dyn Fn(StreamEvent) -> Option<StreamEvent>>) -> Stream {
         let is_broadcast = self.inner.borrow().broadcast;
         let target = Stream::new(Rc::new(RefCell::new(StreamInner::new(
@@ -415,36 +427,66 @@ impl Stream {
         let closure_inner = Rc::clone(&hook_inner);
         let source_inner = Rc::clone(&self.inner);
         let filter_for_listen = Rc::clone(&filter);
+        let cancel_on_error = Rc::new(RefCell::new(false));
         {
             let mut state = hook_inner.borrow_mut();
-            state.hooks.on_listen = Some(Rc::new(move || {
-                let target = Stream::new(Rc::clone(&closure_inner));
-                let source = Stream::new(Rc::clone(&source_inner));
-                let data_target = target.clone();
-                let error_target = target.clone();
-                let done_target = target;
-                let forward_data = Rc::clone(&filter_for_listen);
-                let forward_error = Rc::clone(&filter_for_listen);
-                let subscription = source.listen(
-                    Some(Rc::new(move |value| {
-                        if let Some(StreamEvent::Data(mapped)) =
-                            forward_data(StreamEvent::Data(value))
-                        {
-                            StreamRuntime::default().add(&data_target, StreamEvent::Data(mapped));
-                        }
-                    })),
-                    Some(Rc::new(move |error| {
-                        if let Some(StreamEvent::Error(mapped)) =
-                            forward_error(StreamEvent::Error(error.clone()))
-                        {
-                            StreamRuntime::default().add(&error_target, StreamEvent::Error(mapped));
-                        }
-                    })),
-                    Some(Rc::new(move || {
-                        StreamRuntime::default().add(&done_target, StreamEvent::Done);
-                    })),
-                );
-                let _ = subscription;
+            state.hooks.on_listen = {
+                let cancel_on_error = Rc::clone(&cancel_on_error);
+                Some(Rc::new(move || {
+                    let target = Stream::new(Rc::clone(&closure_inner));
+                    let source = Stream::new(Rc::clone(&source_inner));
+                    let data_target = target.clone();
+                    let error_target = target.clone();
+                    let done_target = target.clone();
+                    let options_target = target.clone();
+                    let cancel_target = target;
+                    let forward_data = Rc::clone(&filter_for_listen);
+                    let forward_error = Rc::clone(&filter_for_listen);
+                    let hook_cancel = Rc::clone(&cancel_on_error);
+                    let options_hook = Rc::new(move |options: ListenOptions| {
+                        *hook_cancel.borrow_mut() = options.cancel_on_error;
+                    });
+                    let options_hook_target = Rc::clone(&options_hook);
+                    {
+                        let mut state = options_target.inner.borrow_mut();
+                        state.hooks.on_error_options = Some(options_hook_target);
+                    }
+                    let subscription = source.listen_with(
+                        Some(Rc::new(move |value| {
+                            if let Some(StreamEvent::Data(mapped)) =
+                                forward_data(StreamEvent::Data(value))
+                            {
+                                StreamRuntime::default()
+                                    .add(&data_target, StreamEvent::Data(mapped));
+                            }
+                        })),
+                        Some(Rc::new(move |error| {
+                            if let Some(StreamEvent::Error(mapped)) =
+                                forward_error(StreamEvent::Error(error.clone()))
+                            {
+                                StreamRuntime::default()
+                                    .add(&error_target, StreamEvent::Error(mapped));
+                            }
+                        })),
+                        Some(Rc::new(move || {
+                            StreamRuntime::default().add(&done_target, StreamEvent::Done);
+                        })),
+                        ListenOptions {
+                            cancel_on_error: *cancel_on_error.borrow(),
+                        },
+                    );
+                    let source_subscription = Rc::new(subscription);
+                    let cancel_source = Rc::clone(&source_subscription);
+                    let mut state = cancel_target.inner.borrow_mut();
+                    state.hooks.on_cancel = Some(Rc::new(move || cancel_source.cancel()));
+                }))
+            };
+        }
+        let forward_cancel = Rc::clone(&cancel_on_error);
+        {
+            let mut state = hook_inner.borrow_mut();
+            state.hooks.on_error_options = Some(Rc::new(move |options| {
+                *forward_cancel.borrow_mut() = options.cancel_on_error;
             }));
         }
         target
