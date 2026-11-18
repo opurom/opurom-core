@@ -16,6 +16,7 @@ pub mod plugin;
 pub mod plugin_host;
 pub mod render;
 pub mod resource;
+pub mod scale;
 pub mod scheduler;
 pub mod state;
 pub mod text_buffer;
@@ -39,6 +40,10 @@ pub use plugin::{PluginBus, PluginMetrics};
 pub use plugin_host::{BreakerState, PluginHost, PluginInfo, PluginStatus, DEFAULT_PLUGIN_TIMEOUT};
 pub use render::RenderingHook;
 pub use resource::{ResourceError, ResourceManager};
+pub use scale::{
+    compute_pan_slop, compute_scale_slop, DragStartBehavior, PointerLine, ScaleDetails,
+    ScaleRecognizer, ScaleState, PAN_SLOP, SCALE_ACCEPT_RATIO, SCALE_SLOP,
+};
 pub use scheduler::{Scheduler, TaskHandle};
 pub use state::{
     Event, FrameRecord, FrameReport, FrameSample, NetworkRecord, Patch, Runtime, Value,

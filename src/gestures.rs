@@ -38,6 +38,7 @@ pub const DOUBLE_TAP_MIN_MS: Ms = 40; // gestures/constants.dart:39; multitap.da
 pub const DOUBLE_TAP_SLOP: Px = 100; // gestures/constants.dart:49; multitap.dart:225,911
 pub const TOUCH_SLOP: Px = 18; // gestures/constants.dart:65; events.dart:2550-2561
 pub const PRECISE_HIT_SLOP: Px = 1; // gestures/constants.dart:103; events.dart:2552-2553
+pub const PRECISE_POINTER_PAN_SLOP: Px = 2; // gestures/constants.dart:106; events.dart:2564-2575
 pub const MIN_FLING_VELOCITY: Px = 50; // gestures/constants.dart:90; monodrag.dart:943
 pub const MAX_FLING_VELOCITY: Px = 8000; // gestures/constants.dart:95; monodrag.dart:954
 
@@ -502,7 +503,7 @@ fn emit_accept(member: &mut Member, events: &mut Vec<RecognizerEvent>) {
 /// Quadratic least-squares fit ported from `gestures/lsq_solver.dart:88-203`.
 /// Inputs are `(t, x)`, `(t, y)` arrays with unit weights, exactly as the
 /// tracker builds them (`velocity_tracker.dart:190-235`).
-fn least_squares_quadratic(time: &[f64], values: &[f64]) -> Option<[f64; 3]> {
+pub(crate) fn least_squares_quadratic(time: &[f64], values: &[f64]) -> Option<[f64; 3]> {
     const TOLERANCE: f64 = 1e-10; // foundation/constants.dart:71
     let m = time.len();
     let n = 3usize;
