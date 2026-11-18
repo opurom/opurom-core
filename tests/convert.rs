@@ -103,3 +103,56 @@ fn clamp_matches_bounds() {
     assert_eq!(clamp_i64(-1, 0, 10), 0);
     assert_eq!(clamp_i64(11, 0, 10), 10);
 }
+
+#[test]
+fn base64_rejects_non_canonical_padding_bits() {
+    // convert/base64.dart:737-758: low bits before '=' must be zero.
+    // "Zh==" and "Zi==" have non-zero discarded bits (h=33, i=34), while
+    // "Zg==" is canonical for 'f'. "Zm9=" has a non-zero final sextet.
+    assert_eq!(base64_decode("Zh=="), Err(ConvertError::InvalidEncoding));
+    assert_eq!(base64_decode("Zi=="), Err(ConvertError::InvalidEncoding));
+    assert_eq!(base64_decode("Zm9="), Err(ConvertError::InvalidEncoding));
+    assert_eq!(base64_decode("Zg=="), Ok(vec![b'f']));
+    assert_eq!(base64_decode("Zm8="), Ok(b"fo".to_vec()));
+}
+
+#[test]
+fn base64_empty_and_round_trip_all_byte_values() {
+    assert_eq!(base64_decode(""), Ok(Vec::new()));
+    assert_eq!(base64_encode(&[], Base64Variant::Standard), "");
+    let bytes: Vec<u8> = (0..=255).collect();
+    for variant in [Base64Variant::Standard, Base64Variant::UrlSafe] {
+        let encoded = base64_encode(&bytes, variant);
+        assert_eq!(encoded.len(), 344);
+        assert_eq!(base64_decode(&encoded), Ok(bytes.clone()));
+    }
+}
+
+#[test]
+fn utf8_boundary_code_points_round_trip() {
+    // convert/utf.dart:24-43: all scalar values must round-trip.
+    for code_point in [0x7f, 0x80, 0x7ff, 0x800, 0xffff, 0x10000, 0x10ffff] {
+        if let Some(character) = char::from_u32(code_point) {
+            let text = character.to_string();
+            assert_eq!(utf8_decode(&utf8_encode(&text), false), Ok(text));
+        }
+    }
+}
+
+#[test]
+fn uri_encoding_handles_empty_and_binary_text() {
+    assert_eq!(uri_encode_component(""), "");
+    assert_eq!(uri_encode_query_component(""), "");
+    assert_eq!(uri_encode_component("\u{0000}"), "%00");
+    assert_eq!(
+        uri_encode_query_component("世界 / 你好"),
+        "%E4%B8%96%E7%95%8C+%2F+%E4%BD%A0%E5%A5%BD"
+    );
+}
+
+#[test]
+fn clamp_handles_full_i64_range() {
+    assert_eq!(clamp_i64(i64::MIN, -5, 5), -5);
+    assert_eq!(clamp_i64(i64::MAX, -5, 5), 5);
+    assert_eq!(clamp_i64(0, i64::MIN, i64::MAX), 0);
+}

@@ -33,6 +33,9 @@ pub enum ConvertError {
     InvalidBase64(usize),
     /// Invalid base64 padding.
     InvalidPadding,
+    /// Non-zero discarded bits before padding
+    /// (`convert/base64.dart:741,747`).
+    InvalidEncoding,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -41,6 +44,7 @@ impl std::fmt::Display for ConvertError {
             Self::InvalidUtf8(index) => write!(f, "invalid UTF-8 byte at {index}"),
             Self::InvalidBase64(index) => write!(f, "invalid base64 byte at {index}"),
             Self::InvalidPadding => f.write_str("invalid base64 padding"),
+            Self::InvalidEncoding => f.write_str("invalid base64 encoding"),
         }
     }
 }
@@ -120,6 +124,17 @@ pub fn base64_decode(source: &str) -> Result<Vec<u8>, ConvertError> {
         if padding > 2 {
             return Err(ConvertError::InvalidPadding);
         }
+        // base64.dart:737-758 accumulates only the *non-padding* sextets.
+        // The low bits of that accumulator must be zero before padding.
+        let data_count = 4 - padding;
+        let mut bits = 0u32;
+        for &sextet in sextets.iter().take(data_count) {
+            bits = ((bits << 6) | sextet as u32) & 0x00ff_ffff;
+        }
+        if (padding == 1 && bits & 0x03 != 0) || (padding == 2 && bits & 0x0f != 0) {
+            return Err(ConvertError::InvalidEncoding);
+        }
+        // Reassemble the full 24-bit block for byte extraction.
         let bits = ((sextets[0] as u32) << 18)
             | ((sextets[1] as u32) << 12)
             | ((sextets[2] as u32) << 6)
