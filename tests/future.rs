@@ -231,3 +231,49 @@ fn a_listener_added_after_completion_runs_immediately() {
     );
     assert_eq!(mapped.completion(), Some(Completion::Value(int(8))));
 }
+
+#[test]
+fn false_error_test_preserves_stack_trace_byte_for_byte() {
+    // future.dart:836-841: a false test leaves the error AND stack trace
+    // untouched.
+    let runtime = FutureRuntime::new();
+    let original = AsyncError {
+        message: "boom".to_owned(),
+        stack_trace: "frame0\nframe1".to_owned(),
+    };
+    let future = runtime.error(original.clone());
+    let chained = future.catch_error_test(
+        &runtime,
+        Rc::new(|_: &AsyncError| false),
+        Rc::new(|_: &AsyncError| int(0)) as OnError,
+    );
+    runtime.pump(16);
+    assert_eq!(chained.completion(), Some(Completion::Error(original)));
+}
+
+#[test]
+fn unhandled_errors_keep_insertion_order() {
+    // future.dart:819-823: errors are reported as unhandled in completion
+    // order.
+    let runtime = FutureRuntime::new();
+    runtime.error(AsyncError::new("first"));
+    runtime.error(AsyncError::new("second"));
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("first"), AsyncError::new("second")]
+    );
+}
+
+#[test]
+fn chained_error_becomes_handled_at_the_end() {
+    // future.dart:812-813,840-841: a rejected future is unhandled only until
+    // a listener handles it somewhere in the chain.
+    let runtime = FutureRuntime::new();
+    let source = runtime.error(AsyncError::new("caught"));
+    let _ = source
+        .then(&runtime, Rc::new(|value| value) as OnValue)
+        .catch_error(&runtime, Rc::new(|_: &AsyncError| int(1)) as OnError);
+    runtime.pump(16);
+    assert!(runtime.unhandled_errors().is_empty());
+}

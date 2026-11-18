@@ -247,3 +247,67 @@ fn closed_stream_ignores_new_events() {
     runtime.add(&stream, StreamEvent::Data(int(1)));
     assert!(seen.borrow().is_empty());
 }
+
+#[test]
+fn broadcast_errors_drop_without_listeners() {
+    // stream_controller.dart:132-139: addError without a listener is dropped.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    runtime.add(&stream, StreamEvent::Error(AsyncError::new("lost")));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let errors_clone = Rc::clone(&errors);
+    stream.listen(
+        None,
+        Some(
+            Rc::new(move |error: &AsyncError| errors_clone.borrow_mut().push(error.clone()))
+                as ErrorCallback,
+        ),
+        None,
+    );
+    assert!(errors.borrow().is_empty());
+}
+
+#[test]
+fn cancelling_during_pause_discards_buffered_events() {
+    // stream_controller.dart:141-143: cancel ends the subscription, so
+    // buffered events are no longer delivered on resume.
+    let runtime = StreamRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = stream.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    runtime.add(&stream, StreamEvent::Data(int(1)));
+    subscription.cancel();
+    subscription.resume();
+    assert!(seen.borrow().is_empty());
+}
+
+#[test]
+fn error_events_bypass_where_filters() {
+    // stream_pipe.dart:220-231: _WhereStream forwards error/done unchanged;
+    // only data is tested.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let filtered = source.r#where(Rc::new(|_| false));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let errors_clone = Rc::clone(&errors);
+    filtered.listen(
+        None,
+        Some(
+            Rc::new(move |error: &AsyncError| errors_clone.borrow_mut().push(error.clone()))
+                as ErrorCallback,
+        ),
+        None,
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Error(AsyncError::new("passthrough")));
+    assert!(errors
+        .borrow()
+        .iter()
+        .any(|error| error.message == "passthrough"));
+}
