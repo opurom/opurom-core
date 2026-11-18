@@ -20,11 +20,17 @@
 //!   delivered (`async/stream_impl.dart:50-51,386-421`,
 //!   `async/stream_controller.dart:141-143`);
 //! - during an error or done callback a terminal event waits for cancellation;
-//!   an explicit cancel clears that state and suppresses the pending done
-//!   (`async/stream_impl.dart:69-76,392-395,429-445`);
+//!   an explicit cancel clears that state and suppresses the pending done; a
+//!   repeated or re-entrant cancel reuses the cached cancel state; an error
+//!   from an asynchronous cancel hook reaches the cancel future while the
+//!   controller done future still completes
+//!   (`async/stream_impl.dart:69-76,232-240,287-294,392-395,429-445`,
+//!   `async/stream_controller.dart:725-775`);
 //! - `asFuture` overwrites the terminal handlers: done completes with a
 //!   supplied value, error cancels first and then completes with the original
-//!   error and stack trace (`async/stream_impl.dart:243-270`);
+//!   error and stack trace. On an already-done subscription it completes
+//!   immediately with the supplied value
+//!   (`async/stream_impl.dart:243-270,785-802`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
 //! - `close` sends a done event to the listeners subscribed at close time;
@@ -34,7 +40,23 @@
 //!   `async/stream_controller.dart:581-587,628-656`);
 //! - `addStream` forwards source events in order; `cancelOnError=true`
 //!   forwards the first error and closes the target, while `false` forwards
-//!   all errors (`async/stream_controller.dart:590-603,913-938`);
+//!   all errors. Direct adds and closes during pumping are refused with the
+//!   controller's state error, and a paused target pauses its source
+//!   subscription; the returned future completes after source done is
+//!   forwarded; the controller `done` future is completed at the terminal
+//!   event even without listeners, and a canceled single subscription
+//!   completes it immediately, both after the done event and after the
+//!   subscription cancel; `cancel()` returns the controller's cancel future,
+//!   which waits for an asynchronous `onCancel` hook
+//!   (`async/stream_impl.dart:232-240,287-294`,
+//!   `async/stream_controller.dart:465-469,528-552,590-613,725-775,913-967`,
+//!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
+//! - `asBroadcastStream` shares one source subscription between all view
+//!   listeners, forwards source done to every current listener, and shuts
+//!   down the source when the last listener leaves; a closed view hands out
+//!   done-only subscriptions, and pausing the view pauses the shared source
+//!   subscription until the last nested resume
+//!   (`async/stream.dart:681-686`, `async/stream_impl.dart:820-919`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -45,12 +67,12 @@
 //! always yields the same data on every host.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::dart_error::DartError;
 use crate::future::{AsyncError, Future, FutureRuntime, FutureValue};
 use crate::microtask::{CallbackId, MicrotaskQueue};
+use std::collections::VecDeque;
 
 /// An event carried by a stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -305,29 +327,75 @@ impl StreamSubscription {
         let error_completer = completer.clone();
         let cancel_self = self.clone();
         let mut overrides = self.inner.borrow_mut();
-        if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
+        let closed_value = value.clone();
+        let mut already_closed = false;
+        let installed = if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
             // The overrides replace this subscription's terminal handlers
             // only (`stream_impl.dart:253-269`); other listeners keep theirs.
-            subscription.on_done = Some(Rc::new(move || {
-                let _ = done_completer.complete(value.clone());
-            }));
-            subscription.on_error = Some(Rc::new(move |error| {
-                cancel_self.cancel();
-                let _ = error_completer.complete_error(error.clone());
-            }));
-        }
+            already_closed = subscription.closed;
+            if !already_closed {
+                subscription.on_done = Some(Rc::new(move || {
+                    let _ = done_completer.complete(value.clone());
+                }));
+                subscription.on_error = Some(Rc::new(move |error| {
+                    cancel_self.cancel();
+                    let _ = error_completer.complete_error(error.clone());
+                }));
+            }
+            true
+        } else {
+            false
+        };
         drop(overrides);
+        if installed && already_closed {
+            let _ = completer.complete(closed_value);
+        }
+        completer.future()
+    }
+
+    /// Cancels this subscription and returns the controller's cancel future.
+    /// Dart returns `_cancelFuture` (or a null future) from
+    /// `StreamSubscription.cancel` (`async/stream_impl.dart:232-240,287-294`).
+    pub fn cancel_future(&self, runtime: &FutureRuntime) -> Future {
+        let completer = runtime.completer();
+        self.cancel_with_completer(Some(completer.clone()));
         completer.future()
     }
 
     pub fn cancel(&self) {
-        let on_cancel = {
+        self.cancel_with_completer(None);
+    }
+
+    fn cancel_with_completer(&self, cancel_completer: Option<crate::future::Completer>) {
+        let already_canceled = self.pending_cancel.get() || {
+            let Ok(inner) = self.inner.try_borrow() else {
+                // Re-entrant cancel from a callback: mark cancellation
+                // now and finalize when delivery ends
+                // (`stream_impl.dart:287-294`).
+                self.pending_cancel.set(true);
+                return;
+            };
+            !inner
+                .subscriptions
+                .get(&self.id)
+                .is_some_and(|subscription| !subscription.state.canceled)
+        };
+        if already_canceled {
+            // Dart's cancel() returns the cached cancel future on a repeated
+            // cancel (`async/stream_impl.dart:232-240,287-294`).
+            if let Some(completer) = cancel_completer {
+                let _ = completer.complete(FutureValue::Null);
+            }
+            return;
+        }
+        let (on_cancel, done_waiters) = {
             let Ok(mut inner) = self.inner.try_borrow_mut() else {
                 // Re-entrant cancel during callback delivery; finalize after
                 // the current delivery step releases the controller borrow.
                 self.pending_cancel.set(true);
                 return;
             };
+            self.pending_cancel.set(false);
             let was_subscribed = !inner.subscriptions.is_empty();
             if let Some(subscription) = inner.subscriptions.get_mut(&self.id) {
                 subscription.state.canceled = true;
@@ -336,15 +404,38 @@ impl StreamSubscription {
             }
             inner.subscriptions.remove(&self.id);
             let no_subscribers = inner.subscriptions.values().all(|s| s.state.canceled);
-            if was_subscribed && no_subscribers {
+            let done_waiters = if was_subscribed && no_subscribers && !inner.broadcast {
+                std::mem::take(&mut inner.done_waiters)
+            } else {
+                Vec::new()
+            };
+            let on_cancel = if was_subscribed && no_subscribers {
                 inner.hooks.on_cancel.take()
             } else {
                 None
-            }
+            };
+            (on_cancel, done_waiters)
         };
         self.pending_cancel.set(false);
-        if let Some(on_cancel) = on_cancel {
-            on_cancel();
+        let hook_future = on_cancel.and_then(|hook| hook());
+        // Dart waits for the controller's onCancel future before completing
+        // the cancel future and the controller done future
+        // (`stream_controller.dart:725-775`).
+        if let Some(hook_future) = hook_future {
+            StreamRuntime::complete_terminal_waiters_after(
+                &hook_future,
+                cancel_completer,
+                done_waiters,
+            );
+            return;
+        }
+        if let Some(completer) = cancel_completer {
+            let _ = completer.complete(FutureValue::Null);
+        }
+        // A single-subscription controller's `done` future completes as soon
+        // as its subscriber cancels (`stream_controller.dart:605-613`).
+        for waiter in done_waiters {
+            let _ = waiter.complete(FutureValue::Null);
         }
     }
 
@@ -371,7 +462,7 @@ pub struct StreamHooks {
     pub on_resume: Option<Rc<dyn Fn()>>,
     #[doc(hidden)]
     pub on_resume_input: Option<Rc<dyn Fn()>>,
-    pub on_cancel: Option<Rc<dyn Fn()>>,
+    pub on_cancel: Option<Rc<dyn Fn() -> Option<Future>>>,
 }
 
 impl std::fmt::Debug for StreamHooks {
@@ -388,20 +479,34 @@ struct StreamInner {
     /// rejects every later listen, even after the first one was canceled
     /// (`async/stream_controller.dart:440-452,509-519,688-696`).
     ever_listened: bool,
+    /// Set by an `asBroadcastStream` view after its source subscription was
+    /// shut down; unlike a normal closed controller, late listens are refused.
+    view_shutdown: bool,
     /// Error raised while the `onListen` hook subscribed to the source. A
     /// forwarding pipe reports the source's refusal through this field
     /// (`async/stream_pipe.dart:134-146`).
     listen_error: Option<DartError>,
+    /// Mirrors `_STATE_ADDSTREAM`: direct adds are refused while a source is
+    /// being pumped (`async/stream_controller.dart:465-469,528-552`).
+    adding_stream: bool,
+    /// True while `add_stream` forwards an event through `try_add`; direct
+    /// host adds during the same period are refused.
+    forwarding_add_stream: bool,
     /// Events buffered for a single-subscription controller before listen
     /// (`stream_controller.dart:97-98`).
     pre_listen: VecDeque<StreamEvent>,
+    /// The controller's `done` future: completed when the terminal event has
+    /// been delivered or the subscription canceled
+    /// (`async/stream_controller.dart:605-613`,
+    /// `async/broadcast_stream_controller.dart:84-95,156`).
+    done_waiters: Vec<crate::future::Completer>,
     subscriptions: std::collections::BTreeMap<u32, Subscription>,
     hooks: StreamHooks,
     next_subscription: u32,
 }
 
 impl StreamInner {
-    fn take_cancel_hook_if_last(&mut self) -> Option<Rc<dyn Fn()>> {
+    fn take_cancel_hook_if_last(&mut self) -> Option<Rc<dyn Fn() -> Option<Future>>> {
         if self.subscriptions.values().all(|s| s.state.canceled) {
             self.hooks.on_cancel.take()
         } else {
@@ -414,8 +519,12 @@ impl StreamInner {
             broadcast,
             closed: false,
             ever_listened: false,
+            view_shutdown: false,
             listen_error: None,
+            adding_stream: false,
+            forwarding_add_stream: false,
             pre_listen: VecDeque::new(),
+            done_waiters: Vec::new(),
             subscriptions: std::collections::BTreeMap::new(),
             hooks,
             next_subscription: 1,
@@ -503,6 +612,11 @@ impl Stream {
         options: ListenOptions,
     ) -> Result<StreamSubscription, DartError> {
         let mut inner = self.inner.borrow_mut();
+        if inner.view_shutdown {
+            return Err(DartError::State(
+                "Cannot add new events after calling close".to_owned(),
+            ));
+        }
         if !inner.broadcast && inner.ever_listened {
             // `_subscribe` rejects every listen after the first one
             // (`async/stream_controller.dart:688-696`).
@@ -695,7 +809,10 @@ impl Stream {
                     let mut state = cancel_target.inner.borrow_mut();
                     state.hooks.on_pause_input = Some(Rc::new(move || pause_source.pause()));
                     state.hooks.on_resume_input = Some(Rc::new(move || resume_source.resume()));
-                    state.hooks.on_cancel = Some(Rc::new(move || cancel_source.cancel()));
+                    state.hooks.on_cancel = Some(Rc::new(move || {
+                        cancel_source.cancel();
+                        None
+                    }));
                 }))
             };
         }
@@ -738,6 +855,136 @@ impl StreamRuntime {
         self.controller_with(hooks, true)
     }
 
+    /// Wraps `source` in a broadcast view like `Stream.asBroadcastStream`
+    /// (`async/stream_impl.dart:820-919`).
+    ///
+    /// The view subscribes to `source` once, when its first listener
+    /// registers; every later listener joins the same broadcast. When the
+    /// last listener leaves, the view cancels the source subscription and
+    /// stops accepting listeners (`async/stream_impl.dart:874-906`).
+    pub fn as_broadcast_stream(&self, source: &Stream) -> Stream {
+        let target = Stream::new(Rc::new(RefCell::new(StreamInner::new(
+            true,
+            StreamHooks::default(),
+        ))));
+        let listen_inner = Rc::clone(&target.inner);
+        let closure_inner = Rc::clone(&target.inner);
+        let source_inner = Rc::clone(&source.inner);
+        let source_attached = Rc::new(Cell::new(false));
+        {
+            let attached_for_hook = Rc::clone(&source_attached);
+            let mut state = listen_inner.borrow_mut();
+            state.hooks.on_listen = Some(Rc::new(move || {
+                let target = Stream::new(Rc::clone(&closure_inner));
+                let source = Stream::new(Rc::clone(&source_inner));
+                let data_target = target.clone();
+                let error_target = target.clone();
+                let done_target = target.clone();
+                let cancel_target = target.clone();
+                if attached_for_hook.replace(true) {
+                    return;
+                }
+                let source_handle = Rc::new(
+                    source
+                        .try_listen_with(
+                            Some(Rc::new(move |value| {
+                                StreamRuntime::forward_add(&data_target, StreamEvent::Data(value));
+                            })),
+                            Some(Rc::new(move |error| {
+                                StreamRuntime::forward_add(
+                                    &error_target,
+                                    StreamEvent::Error(error.clone()),
+                                );
+                            })),
+                            Some(Rc::new(move || {
+                                StreamRuntime::forward_add(&done_target, StreamEvent::Done);
+                            })),
+                            ListenOptions::default(),
+                        )
+                        .expect("source must accept the broadcast view subscription"),
+                );
+                let cancel_inner = Rc::clone(&closure_inner);
+                {
+                    let mut state = cancel_target.inner.borrow_mut();
+                    state.hooks.on_cancel = Some(Rc::new(move || {
+                        let last = cancel_inner
+                            .borrow()
+                            .subscriptions
+                            .values()
+                            .all(|subscription| subscription.state.canceled);
+                        if last {
+                            source_handle.cancel();
+                            // The source subscription is gone, so this view
+                            // is no longer listenable
+                            // (`async/stream_impl.dart:897-906`).
+                            let mut state = cancel_inner.borrow_mut();
+                            state.ever_listened = false;
+                            state.closed = true;
+                            state.view_shutdown = true;
+                        }
+                        None
+                    }));
+                }
+            }));
+        }
+        target
+    }
+
+    fn complete_done_waiters(stream: &Stream) {
+        let waiters = {
+            let mut inner = stream.inner.borrow_mut();
+            std::mem::take(&mut inner.done_waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.complete(FutureValue::Null);
+        }
+    }
+
+    fn complete_terminal_waiters_after(
+        trigger: &Future,
+        cancel_completer: Option<crate::future::Completer>,
+        done_waiters: Vec<crate::future::Completer>,
+    ) {
+        let cancel_waiter = Rc::new(RefCell::new(cancel_completer));
+        let cancel_waiter_clone = Rc::clone(&cancel_waiter);
+        let done_waiters = Rc::new(RefCell::new(done_waiters));
+        let done_waiters_clone = Rc::clone(&done_waiters);
+        let runtime = FutureRuntime::new();
+        trigger.clone().then(
+            &runtime,
+            Rc::new(move |value| {
+                if let Some(completer) = cancel_waiter_clone.borrow_mut().take() {
+                    let _ = completer.complete(value);
+                }
+                FutureValue::Null
+            }) as crate::future::OnValue,
+        );
+        trigger.clone().then(
+            &runtime,
+            Rc::new(move |_| {
+                for waiter in done_waiters_clone.borrow_mut().drain(..) {
+                    let _ = waiter.complete(FutureValue::Null);
+                }
+                FutureValue::Null
+            }) as crate::future::OnValue,
+        );
+        // An error from the onCancel future must reach the cancel future,
+        // while controller.done still completes (`stream_controller.dart:
+        // 725-775`).
+        let error_waiter = Rc::new(RefCell::new(cancel_waiter));
+        let error_waiter_clone = Rc::clone(&error_waiter);
+        trigger.catch_error(
+            &runtime,
+            Rc::new(move |error: &crate::future::AsyncError| {
+                if let Some(completer) = error_waiter_clone.borrow_mut().take() {
+                    let _ = completer.complete_error(error.clone());
+                }
+                FutureValue::Null
+            }) as crate::future::OnError,
+        );
+        runtime.pump(16);
+    }
+
     fn controller_with(&self, hooks: StreamHooks, broadcast: bool) -> Stream {
         Stream::new(Rc::new(RefCell::new(StreamInner::new(broadcast, hooks))))
     }
@@ -760,7 +1007,7 @@ impl StreamRuntime {
     /// `async/broadcast_stream_controller.dart:247-257`).
     pub fn try_add(&self, stream: &Stream, event: StreamEvent) -> Result<(), DartError> {
         let mut inner = stream.inner.borrow_mut();
-        if inner.closed {
+        if inner.closed && !inner.adding_stream {
             if matches!(event, StreamEvent::Done) {
                 // `close()` may be called more than once; only the first call
                 // has an effect (`async/stream_controller.dart:628-656`).
@@ -773,12 +1020,27 @@ impl StreamRuntime {
             };
             return Err(DartError::State(error.to_owned()));
         }
+        let direct_add = !inner.forwarding_add_stream;
+        if inner.adding_stream && direct_add {
+            let message = if inner.broadcast {
+                "Cannot add new events while doing an addStream"
+            } else {
+                "Cannot add event while adding a stream"
+            };
+            return Err(DartError::State(message.to_owned()));
+        }
         if matches!(event, StreamEvent::Done) {
             inner.closed = true;
+            inner.adding_stream = false;
         }
+        let was_done = matches!(event, StreamEvent::Done);
         if inner.subscriptions.is_empty() {
             if !inner.broadcast {
                 inner.pre_listen.push_back(event);
+            }
+            drop(inner);
+            if was_done {
+                Self::complete_done_waiters(stream);
             }
             return Ok(());
         }
@@ -843,6 +1105,52 @@ impl StreamRuntime {
         }
         drop(inner);
         stream.finalize_pending_cancels();
+        if was_done {
+            Self::complete_done_waiters(stream);
+        }
+        Ok(())
+    }
+
+    /// Returns a future completed when the controller's terminal event has
+    /// been delivered: the single subscriber's done callback, or its cancel.
+    /// An already-canceled or already-closed controller completes immediately
+    /// (`async/stream_controller.dart:605-613,762-773`,
+    /// `async/broadcast_stream_controller.dart:84-95,278`).
+    pub fn done_future(&self, stream: &Stream, runtime: &FutureRuntime) -> Future {
+        let mut inner = stream.inner.borrow_mut();
+        let completer = runtime.completer();
+        let canceled = !inner.broadcast
+            && inner
+                .subscriptions
+                .values()
+                .all(|subscription| subscription.state.canceled);
+        if inner.closed || canceled {
+            let _ = completer.complete(FutureValue::Null);
+        } else {
+            inner.done_waiters.push(completer.clone());
+        }
+        completer.future()
+    }
+
+    /// Closes `target` from the host. Dart refuses a direct close while a
+    /// controller is pumping an `addStream` source
+    /// (`async/broadcast_stream_controller.dart:266-276,247-252`).
+    pub fn try_close(&self, stream: &Stream) -> Result<(), DartError> {
+        let mut inner = stream.inner.borrow_mut();
+        if inner.adding_stream {
+            let message = if inner.broadcast {
+                "Cannot add new events while doing an addStream"
+            } else {
+                "Cannot add event while adding a stream"
+            };
+            return Err(DartError::State(message.to_owned()));
+        }
+        if inner.closed {
+            return Ok(());
+        }
+        inner.closed = true;
+        drop(inner);
+        Self::complete_done_waiters(stream);
         Ok(())
     }
 
@@ -854,6 +1162,8 @@ impl StreamRuntime {
     /// every error; `true` forwards the first error and then closes `target`,
     /// so later source data/errors are ignored. The returned future completes
     /// synchronously on source done, or after the first error when cancelling.
+    /// Direct adds to `target` are refused while pumping
+    /// (`async/stream_controller.dart:465-469,528-552`).
     pub fn add_stream(
         &self,
         target: &Stream,
@@ -871,6 +1181,10 @@ impl StreamRuntime {
                 return Err(DartError::State(message.to_owned()));
             }
         }
+        {
+            let mut inner = target.inner.borrow_mut();
+            inner.adding_stream = true;
+        }
         let future_runtime = FutureRuntime::new();
         let future = future_runtime.completer();
         let data_target = target.clone();
@@ -880,25 +1194,46 @@ impl StreamRuntime {
         let error_future = future.clone();
         let source_handle = source.try_listen_with(
             Some(Rc::new(move |value| {
-                let _ = StreamRuntime::default().try_add(&data_target, StreamEvent::Data(value));
+                StreamRuntime::forward_add(&data_target, StreamEvent::Data(value));
             })),
             Some(Rc::new(move |error| {
-                let _ = StreamRuntime::default()
-                    .try_add(&error_target, StreamEvent::Error(error.clone()));
+                StreamRuntime::forward_add(&error_target, StreamEvent::Error(error.clone()));
                 if cancel_on_error {
-                    let _ = StreamRuntime::default().try_add(&error_target, StreamEvent::Done);
+                    StreamRuntime::forward_add(&error_target, StreamEvent::Done);
                     let _ = error_future.complete(FutureValue::Null);
                 }
             })),
             Some(Rc::new(move || {
-                let _ = StreamRuntime::default().try_add(&done_target, StreamEvent::Done);
+                StreamRuntime::forward_add(&done_target, StreamEvent::Done);
                 let _ = done_future.complete(FutureValue::Null);
             })),
             ListenOptions { cancel_on_error },
         )?;
-        let _ = source_handle;
+        let source_handle = Rc::new(source_handle);
+        {
+            let mut state = target.inner.borrow_mut();
+            state.hooks.on_pause_input = Some(Rc::new({
+                let handle = Rc::clone(&source_handle);
+                move || handle.pause()
+            }));
+            state.hooks.on_resume_input = Some(Rc::new({
+                let handle = Rc::clone(&source_handle);
+                move || handle.resume()
+            }));
+        }
         future_runtime.pump(16);
         Ok(future.future())
+    }
+
+    fn forward_add(target: &Stream, event: StreamEvent) {
+        {
+            let mut inner = target.inner.borrow_mut();
+            inner.forwarding_add_stream = true;
+        }
+        let _ = StreamRuntime::default().try_add(target, event);
+        if let Ok(mut inner) = target.inner.try_borrow_mut() {
+            inner.forwarding_add_stream = false;
+        }
     }
 
     /// Pumps the microtask queue used by async stream controllers

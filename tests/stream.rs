@@ -137,7 +137,10 @@ fn hooks_fire_on_first_listen_and_last_cancel() {
     let canceled_clone = Rc::clone(&canceled);
     let hooks = StreamHooks {
         on_listen: Some(Rc::new(move || *listened_clone.borrow_mut() += 1)),
-        on_cancel: Some(Rc::new(move || *canceled_clone.borrow_mut() += 1)),
+        on_cancel: Some(Rc::new(move || {
+            *canceled_clone.borrow_mut() += 1;
+            None
+        })),
         ..StreamHooks::default()
     };
     let stream = runtime.broadcast_controller(hooks);
@@ -1075,4 +1078,561 @@ fn add_stream_after_close_is_rejected() {
     runtime.add(&target, StreamEvent::Done);
     let error = runtime.add_stream(&target, &source, false);
     assert!(matches!(error, Err(DartError::State(_))));
+}
+
+#[test]
+fn direct_add_during_add_stream_is_rejected() {
+    // stream_controller.dart:528-552: while addStream is active, a direct
+    // add is a state error and never reaches target listeners.
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    target.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_add(&target, StreamEvent::Data(int(99)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add event while adding a stream".to_owned()
+        ))
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn paused_target_pauses_the_add_stream_source() {
+    // stream_controller.dart:970-986: a paused single-subscription controller
+    // pauses its addStream subscription until resumed.
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = target.listen(
+        Some(Rc::new(move |value| seen_clone.borrow_mut().push(value)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+// Broadcast addStream snapshot and close ordering, pinned to Dart 3.14
+// (async/broadcast_stream_controller.dart:247-276,266-303,404-413).
+#[test]
+fn broadcast_add_stream_delivers_to_listeners_subscribed_before_source_event() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let first = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let second = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let first_clone = Rc::clone(&first);
+    let second_clone = Rc::clone(&second);
+    target.listen(
+        Some(Rc::new(move |v| first_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    target.listen(
+        Some(Rc::new(move |v| second_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    // The first listener was present when addStream subscribed, so it forwards
+    // the source event through the controller; the later listener is still a
+    // current target listener and receives the same forwarded event.
+    assert_eq!(*first.borrow(), vec![int(1)]);
+    assert_eq!(*second.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn broadcast_direct_add_during_add_stream_has_official_message() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_add(&target, StreamEvent::Data(int(1)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add new events while doing an addStream".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn broadcast_close_during_add_stream_is_refused() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_close(&target);
+    assert!(matches!(error, Err(DartError::State(_))));
+    runtime.add(&source, StreamEvent::Done);
+    assert!(runtime.try_close(&target).is_ok());
+}
+
+#[test]
+fn single_subscription_add_stream_completion_future_order() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let done_events = Rc::clone(&events);
+    target.listen(
+        None,
+        None,
+        Some(
+            Rc::new(move || done_events.borrow_mut().push("target-done".to_owned()))
+                as DoneCallback,
+        ),
+    );
+    let future = runtime.add_stream(&target, &source, false).unwrap();
+    assert!(!future.is_completed());
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*events.borrow(), vec!["target-done"]);
+    // The addStream future is completed after source done is forwarded
+    // (stream_controller.dart:965-967); completion is observable even before
+    // the host drains the microtask queue in this data model.
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+// Controller done future and addStream completion ordering, pinned to Dart 3.14
+// (async/stream_controller.dart:605-613,913-967,
+//  async/broadcast_stream_controller.dart:84-95,278).
+#[test]
+fn done_future_completes_with_source_done() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    assert!(!stream_done.is_completed());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn add_stream_done_and_controller_done_keep_order() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let target_done = runtime.done_future(&target, &future_runtime);
+    let add_done = runtime.add_stream(&target, &source, false).unwrap();
+    runtime.add(&source, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        target_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        add_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn single_subscription_done_future_completes_on_cancel() {
+    // stream_controller.dart:605-613: controller.done completes when the
+    // single subscriber is canceled, even without a done event.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    assert!(!stream_done.is_completed());
+    subscription.cancel();
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn broadcast_done_future_waits_for_done_not_cancel() {
+    // broadcast_stream_controller.dart:84-95,278: a broadcast controller's
+    // done future completes only when its close event is processed.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    subscription.cancel();
+    future_runtime.pump(16);
+    assert!(!stream_done.is_completed());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+// Cancel future and controller done future ordering, pinned to Dart 3.14
+// (async/stream_impl.dart:232-240,287-294, stream_controller.dart:605-613).
+#[test]
+fn cancel_future_completes_with_or_before_controller_done() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn cancel_future_without_a_cancel_hook_completes_immediately() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn on_cancel_future_delays_cancel_and_done_futures() {
+    // stream_controller.dart:725-775: when onCancel returns a future, both
+    // subscription.cancel's future and controller.done wait for it.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let cancel_gate = future_runtime.completer();
+    let cancel_gate_future = cancel_gate.future();
+    let cancel_calls = Rc::new(RefCell::new(0));
+    let cancel_calls_clone = Rc::clone(&cancel_calls);
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || {
+            *cancel_calls_clone.borrow_mut() += 1;
+            Some(cancel_gate_future.clone())
+        })),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    let stream_done = stream_runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert_eq!(*cancel_calls.borrow(), 1);
+    assert!(!cancel_future.is_completed());
+    assert!(!stream_done.is_completed());
+    let _ = cancel_gate.complete(FutureValue::Int(7));
+    future_runtime.pump(16);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Int(7)))
+    );
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn done_future_completes_after_listener_done_and_subscription_cancel_paths() {
+    // stream_controller.dart:605-613,762-773: both the terminal done event
+    // and the single subscription cancel complete controller.done.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let done_stream = stream_runtime.controller(StreamHooks::default());
+    let done_waiter = stream_runtime.done_future(&done_stream, &future_runtime);
+    let done_subscription = done_stream.listen(None, None, None);
+    let cancel_stream = stream_runtime.controller(StreamHooks::default());
+    let cancel_waiter = stream_runtime.done_future(&cancel_stream, &future_runtime);
+    let cancel_subscription = cancel_stream.listen(None, None, None);
+    done_subscription.cancel();
+    cancel_subscription.cancel();
+    future_runtime.pump(16);
+    assert_eq!(
+        done_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        cancel_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn late_done_future_after_terminal_event_completes_immediately() {
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = stream_runtime.controller(StreamHooks::default());
+    stream_runtime.add(&stream, StreamEvent::Done);
+    let stream_done = stream_runtime.done_future(&stream, &future_runtime);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn as_future_on_closed_subscription_completes_immediately() {
+    // stream_impl.dart:785-802: asFuture on an already done subscription
+    // returns a future completed with the supplied value.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    runtime.add(&stream, StreamEvent::Done);
+    let future = subscription.as_future(&future_runtime, int(9));
+    future_runtime.pump(16);
+    assert_eq!(future.completion(), Some(Completion::Value(int(9))));
+}
+
+#[test]
+fn controller_done_and_as_future_share_the_same_terminal_step() {
+    // stream_controller.dart:605-613,762-773, stream_impl.dart:253-269: the
+    // controller done future and the per-subscription asFuture complete from
+    // the same terminal dispatch.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let controller_done = runtime.done_future(&stream, &future_runtime);
+    let bridge = subscription.as_future(&future_runtime, int(42));
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        controller_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(bridge.completion(), Some(Completion::Value(int(42))));
+}
+
+// asBroadcastStream listen/cancel ordering, pinned to Dart 3.14
+// (async/stream_impl.dart:681-686,849-906).
+#[test]
+fn as_broadcast_stream_shares_one_source_subscription() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let first = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let second = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let first_clone = Rc::clone(&first);
+    let second_clone = Rc::clone(&second);
+    view.listen(
+        Some(Rc::new(move |v| first_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    view.listen(
+        Some(Rc::new(move |v| second_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    assert_eq!(*first.borrow(), vec![int(1)]);
+    assert_eq!(*second.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn as_broadcast_stream_cancels_source_when_last_listener_leaves() {
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let first = view.listen(None, None, None);
+    let second = view.listen(None, None, None);
+    first.cancel();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    second.cancel();
+    let observed = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let observed_clone = Rc::clone(&observed);
+    let late = view.try_listen_with(
+        Some(Rc::new(move |v| observed_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+        ListenOptions::default(),
+    );
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    assert!(late.is_err());
+    assert!(observed.borrow().is_empty());
+}
+
+#[test]
+fn broadcast_view_forwards_source_done_to_all_listeners() {
+    // stream_impl.dart:849-872,903-906: source done closes the view's
+    // broadcast controller, so every current view listener sees done once.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let counts = Rc::new(RefCell::new(vec![0, 0]));
+    for index in 0..2 {
+        let counts = Rc::clone(&counts);
+        view.listen(
+            None,
+            None,
+            Some(Rc::new(move || counts.borrow_mut()[index] += 1) as DoneCallback),
+        );
+    }
+    runtime.add(&source, StreamEvent::Done);
+    assert_eq!(*counts.borrow(), vec![1, 1]);
+}
+
+#[test]
+fn broadcast_view_after_source_done_only_receives_done() {
+    // stream_impl.dart:855-860: a closed view hands out a done-only
+    // subscription.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    runtime.add(&source, StreamEvent::Done);
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data_events = Rc::clone(&events);
+    let done_events = Rc::clone(&events);
+    view.try_listen_with(
+        Some(Rc::new(move |_| data_events.borrow_mut().push("data".to_owned())) as DataCallback),
+        None,
+        Some(Rc::new(move || done_events.borrow_mut().push("done".to_owned())) as DoneCallback),
+        ListenOptions::default(),
+    )
+    .expect("closed view must hand out a done-only subscription");
+    assert_eq!(*events.borrow(), vec!["done"]);
+}
+
+#[test]
+fn broadcast_view_pause_buffers_and_resume_forwards_in_order() {
+    // stream_impl.dart:908-914: pausing the view pauses the shared source
+    // subscription; resuming forwards buffered events in order.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = view.listen(
+        Some(Rc::new(move |v| seen_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    runtime.add(&source, StreamEvent::Data(int(2)));
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1), int(2)]);
+    runtime.add(&source, StreamEvent::Data(int(3)));
+    assert_eq!(*seen.borrow(), vec![int(1), int(2), int(3)]);
+}
+
+#[test]
+fn broadcast_view_nested_pause_waits_for_last_resume() {
+    // stream_impl.dart:908-914: the view forwards pause/resume until the
+    // last nested pause is released.
+    let runtime = StreamRuntime::new();
+    let source = runtime.controller(StreamHooks::default());
+    let view = runtime.as_broadcast_stream(&source);
+    let seen = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let seen_clone = Rc::clone(&seen);
+    let subscription = view.listen(
+        Some(Rc::new(move |v| seen_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    subscription.pause();
+    subscription.pause();
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    subscription.resume();
+    assert!(seen.borrow().is_empty());
+    subscription.resume();
+    assert_eq!(*seen.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn reentrant_on_cancel_cancels_once_and_suppresses_done() {
+    // stream_impl.dart:232-240,287-294: cancel() sets CANCELED before calling
+    // onCancel; a nested cancel from the hook reuses that state.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let calls = Rc::new(RefCell::new(0));
+    let calls_clone = Rc::clone(&calls);
+    let subscription: Rc<RefCell<Option<opurom_core::StreamSubscription>>> =
+        Rc::new(RefCell::new(None));
+    let subscription_clone = Rc::clone(&subscription);
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || {
+            *calls_clone.borrow_mut() += 1;
+            if let Some(subscription) = subscription_clone.borrow().as_ref() {
+                subscription.cancel();
+            }
+            None
+        })),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    *subscription.borrow_mut() = Some(stream.listen(None, None, None));
+    let cancel_future = subscription
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .cancel_future(&future_runtime);
+    future_runtime.pump(16);
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    let late = stream.try_listen_with(None, None, None, ListenOptions::default());
+    assert!(late.is_err());
+}
+
+#[test]
+fn async_on_cancel_error_reaches_cancel_future_and_done_still_completes() {
+    // stream_controller.dart:725-775: an onCancel error is returned through
+    // the cancel future, while controller.done completes in whenComplete.
+    let stream_runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let hook_error = future_runtime.completer();
+    let hook_future = hook_error.future();
+    let hooks = StreamHooks {
+        on_cancel: Some(Rc::new(move || Some(hook_future.clone()))),
+        ..StreamHooks::default()
+    };
+    let stream = stream_runtime.controller(hooks);
+    let done_waiter = stream_runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    let cancel_future = subscription.cancel_future(&future_runtime);
+    assert!(!cancel_future.is_completed());
+    assert!(!done_waiter.is_completed());
+    let _ = hook_error.complete_error(AsyncError::new("cancel-failed"));
+    future_runtime.pump(16);
+    assert_eq!(
+        cancel_future.completion(),
+        Some(Completion::Error(AsyncError::new("cancel-failed")))
+    );
+    assert_eq!(
+        done_waiter.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
 }

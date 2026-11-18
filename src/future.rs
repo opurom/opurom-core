@@ -27,9 +27,21 @@
 //! - an uncaught error is reported once and kept in reporting order
 //!   (`async/future.dart:819-823,1336-1351`);
 //! - a failing `cleanUp` body is uncaught and reported before the combined
-//!   future completes; eager wait discards inputs that arrive after the first
-//!   error instead of cleaning them up
-//!   (`async/future.dart:542-546,550-552,579-590`);
+//!   future completes; with several values the cleanup errors follow source
+//!   order. Eager wait discards inputs that arrive after the first error
+//!   instead of cleaning them up; a future returned by cleanUp reports its
+//!   own error asynchronously; a combined delivery reports those errors
+//!   before the combined result, and eager mode reports only cleanup futures
+//!   produced before the first error; non-eager delivery keeps that order
+//!   while waiting for all inputs, and cleanup errors that arrive later are
+//!   reported after the result, even when the combined wait succeeded; a
+//!   fully late set of cleanup futures aggregates in cleanup order, with the
+//!   combined error last; repeated wait rounds replay byte-identically,
+//!   including cleaned-up values, cleanup errors, and the arrival order of
+//!   values around the first error (`async/future.dart:322-330,517-600`);
+//! - a future may only complete once; repeated combined deliveries preserve
+//!   the first result, and listeners attached repeatedly are notified in
+//!   registration order (`async/future_impl.dart:485-491,593-612,745-755`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -790,6 +802,138 @@ impl WaitStep {
     }
 }
 
+/// What a `cleanUp` body produced for a successful value. Dart's
+/// `Future.sync(() { cleanUp(value); })` discards a returned future, but that
+/// future still reports its own error asynchronously
+/// (`async/future.dart:542-546,581-585`).
+#[derive(Debug, Clone)]
+pub enum CleanupResult {
+    /// No error.
+    Done,
+    /// A synchronous error, surfaced through `Future.sync`.
+    Error(AsyncError),
+    /// A future whose later error is still uncaught.
+    Future(Future),
+}
+
+/// Collects errors from futures returned by cleanUp bodies, in cleanup order.
+/// Each error is observed after the host pumps the runtime, matching Dart's
+/// async reporting through `Future.sync` (`async/future.dart:322-330`).
+pub fn wait_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    let observed: Vec<Rc<RefCell<Option<AsyncError>>>> = futures
+        .iter()
+        .map(|future| {
+            let slot = Rc::new(RefCell::new(None));
+            let handler_slot = Rc::clone(&slot);
+            let _ = future.catch_error(
+                runtime,
+                Rc::new(move |error: &AsyncError| {
+                    *handler_slot.borrow_mut() = Some(error.clone());
+                    FutureValue::Null
+                }) as OnError,
+            );
+            slot
+        })
+        .collect();
+    runtime.pump(limit);
+    observed
+        .into_iter()
+        .filter_map(|slot| slot.borrow().clone())
+        .collect()
+}
+
+/// Aggregates the errors of every cleanup future, all of which become
+/// observable only after the combined wait future has completed. The errors
+/// keep cleanup order (`async/future.dart:538-558,579-590`).
+pub fn aggregate_late_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    cleanup_futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    wait_cleanup_future_errors(runtime, cleanup_futures, limit)
+}
+
+/// Final joint aggregation of cleanup-future and combined-future errors.
+///
+/// Cleanup errors keep cleanup order; the combined error, if present, comes
+/// last because `Future.wait` completes its own future after scheduling each
+/// cleanup body (`async/future.dart:542-558,579-590`). Hosts that observe the
+/// cleanup futures later can append them with
+/// [`aggregate_late_cleanup_future_errors`].
+pub fn aggregate_wait_uncaught_errors(
+    step: &WaitStep,
+    cleanup_futures: &[Future],
+    combined_future: Option<&Future>,
+    limit: usize,
+) -> Vec<AsyncError> {
+    let mut errors =
+        aggregate_late_cleanup_future_errors(&FutureRuntime::new(), cleanup_futures, limit);
+    if let Some(combined) = combined_future {
+        if let Some(Completion::Error(error)) = combined.completion() {
+            errors.push(error);
+        }
+    } else if let Some(CombineOutcome::Error(error)) = &step.outcome {
+        errors.push(error.clone());
+    }
+    errors
+}
+
+/// Reports cleanup-future errors that become observable only after the
+/// combined wait future has completed.
+///
+/// Dart reports each cleanup error to the zone as soon as its returned future
+/// completes; when that completion is later than the wait future's, its error
+/// still appears in the uncaught-error stream after the combined error
+/// (`async/future.dart:322-330,542-546,550-557,581-590`).
+pub fn report_late_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    cleanup_futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    let errors = wait_cleanup_future_errors(runtime, cleanup_futures, limit);
+    for error in &errors {
+        runtime.report_uncaught(error.clone());
+    }
+    errors
+}
+
+impl WaitStep {
+    /// Delivers the combined result and reports cleanup-future errors in one
+    /// deterministic pass.
+    ///
+    /// Order: each cleanup-future error (source order), then the combined
+    /// result. The combined error is reported as uncaught only when no
+    /// listener handles it; `Future.wait`'s own future always carries it
+    /// (`async/future.dart:322-330,542-546,550-557,581-590`). A returned
+    /// `None` means the host has not supplied every input yet.
+    pub fn deliver_with_cleanup_futures(
+        &self,
+        runtime: &FutureRuntime,
+        cleanup_futures: &[Future],
+        limit: usize,
+    ) -> Option<Future> {
+        if self.outcome.is_none() {
+            return None;
+        }
+        let observed = wait_cleanup_future_errors(runtime, cleanup_futures, limit);
+        for error in observed {
+            runtime.report_uncaught(error);
+        }
+        for error in &self.cleanup_errors {
+            runtime.report_uncaught(error.clone());
+        }
+        Some(match &self.outcome {
+            Some(CombineOutcome::Wait(values)) => runtime.value(FutureValue::List(values.clone())),
+            Some(CombineOutcome::Error(error)) => runtime.error(error.clone()),
+            _ => runtime.value(FutureValue::Null),
+        })
+    }
+}
+
 /// The order in which a host must surface uncaught errors after
 /// `Future.wait` finishes. Cleanup errors are represented in the order their
 /// values were cleaned up (`async/future.dart:542-546,581-585`); each one is
@@ -813,6 +957,23 @@ pub fn wait_uncaught_errors(step: &WaitStep) -> WaitUncaughtErrors {
             _ => None,
         },
     }
+}
+
+/// Reports cleanup-future errors for an eager wait in cleanup order.
+///
+/// Dart completes eager wait immediately on the first error; cleanup futures
+/// already produced are still uncaught, but later inputs never produce
+/// cleanup bodies (`async/future.dart:550-552,579-590`).
+pub fn report_eager_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    cleanup_futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    let errors = wait_cleanup_future_errors(runtime, cleanup_futures, limit);
+    for error in &errors {
+        runtime.report_uncaught(error.clone());
+    }
+    errors
 }
 
 impl WaitUncaughtErrors {

@@ -427,7 +427,11 @@ fn for_each_values_are_discarded() {
 
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
-use opurom_core::{wait_error_at, wait_uncaught_errors};
+use opurom_core::{
+    aggregate_late_cleanup_future_errors, aggregate_wait_uncaught_errors,
+    report_eager_cleanup_future_errors, report_late_cleanup_future_errors,
+    wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors,
+};
 
 #[test]
 fn wait_error_uses_source_order_not_completion_order() {
@@ -886,4 +890,446 @@ fn wait_eager_delivery_ignores_later_values_and_cleanup() {
         Some(Completion::Error(AsyncError::new("boom")))
     );
     assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("boom")]);
+}
+
+#[test]
+fn wait_cleanup_errors_global_order_across_first_error_and_late_values() {
+    // future.dart:538-548,579-586: cleanup for values already present runs
+    // in source order when the first error fires; values completing later are
+    // cleaned up in source order after that, still before the non-eager
+    // combined error is delivered.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(ok(0)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+            Some(ok(3)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+            _ => Ok(()),
+        }),
+    );
+    assert_eq!(
+        step.outcome,
+        Some(CombineOutcome::Error(AsyncError::new("boom")))
+    );
+    assert_eq!(
+        step.cleanup_errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-0"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+    let future = step.deliver(&runtime);
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-0"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+}
+
+// cleanUp returning a Future, pinned to Dart 3.14
+// (async/future.dart:322-330,542-546,581-585).
+#[test]
+fn cleanup_future_errors_are_observed_after_pumping_in_cleanup_order() {
+    // Future.sync ignores a returned future, but its error is still reported
+    // to the zone when that future completes (`future.dart:322-330`).
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("cleanup-future-1"));
+    let second = runtime.error(AsyncError::new("cleanup-future-2"));
+    let errors = wait_cleanup_future_errors(&runtime, &[first, second], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("cleanup-future-1"),
+            AsyncError::new("cleanup-future-2")
+        ]
+    );
+}
+
+#[test]
+fn wait_delivery_reports_cleanup_future_errors_before_the_combined_error() {
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|value| match value {
+            FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+            _ => Ok(()),
+        }),
+    );
+    let cleanup_first = runtime.error(AsyncError::new("cleanup-future-1"));
+    let cleanup_second = runtime.error(AsyncError::new("cleanup-future-2"));
+    let future = step.deliver_with_cleanup_futures(&runtime, &[cleanup_first, cleanup_second], 16);
+    assert!(future.is_some());
+    let future = future.unwrap();
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![
+            AsyncError::new("cleanup-future-1"),
+            AsyncError::new("cleanup-future-2"),
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+        ]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn wait_delivery_with_cleanup_futures_waits_for_all_inputs() {
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), None],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    assert!(step
+        .deliver_with_cleanup_futures(&runtime, &[], 16)
+        .is_none());
+}
+
+#[test]
+fn eager_cleanup_future_errors_are_reported_in_cleanup_order() {
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("eager-cleanup-1"));
+    let second = runtime.error(AsyncError::new("eager-cleanup-2"));
+    let errors = report_eager_cleanup_future_errors(&runtime, &[first, second], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("eager-cleanup-1"),
+            AsyncError::new("eager-cleanup-2")
+        ]
+    );
+    assert_eq!(runtime.unhandled_errors(), errors);
+}
+
+#[test]
+fn non_eager_cleanup_future_and_combined_error_delivery_order() {
+    // future.dart:538-558,579-590: cleanup futures run via Future.sync and
+    // their errors are reported before the combined wait future completes.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let cleanup_future = runtime.error(AsyncError::new("cleanup-future"));
+    let future = step
+        .deliver_with_cleanup_futures(&runtime, &[cleanup_future], 16)
+        .unwrap();
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("cleanup-future")]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}
+
+#[test]
+fn late_cleanup_future_errors_follow_the_combined_error() {
+    // future.dart:322-330,542-546,550-557: a cleanup future completing after
+    // the wait future reports its error after the combined error in the
+    // uncaught sequence.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let future = step.deliver(&runtime);
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert!(runtime.unhandled_errors().is_empty());
+    let late = report_late_cleanup_future_errors(
+        &runtime,
+        &[runtime.error(AsyncError::new("late-cleanup"))],
+        16,
+    );
+    assert_eq!(late, vec![AsyncError::new("late-cleanup")]);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("late-cleanup")]
+    );
+}
+
+#[test]
+fn late_cleanup_after_successful_wait_is_reported() {
+    // future.dart:574-577,579-586: a late cleanup future is not part of the
+    // successful wait result, but its error is still reported to the zone.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let future = step.deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::List(vec![int(1), int(2)])))
+    );
+    let errors = report_late_cleanup_future_errors(
+        &runtime,
+        &[runtime.error(AsyncError::new("late-after-success"))],
+        16,
+    );
+    assert_eq!(errors, vec![AsyncError::new("late-after-success")]);
+    assert_eq!(runtime.unhandled_errors(), errors);
+}
+
+#[test]
+fn all_late_cleanup_future_errors_are_aggregated_in_cleanup_order() {
+    // future.dart:538-558,579-590: every cleanup future that completes after
+    // the combined result contributes its error in cleanup order.
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("late-1"));
+    let second = runtime.error(AsyncError::new("late-2"));
+    let third = runtime.error(AsyncError::new("late-3"));
+    let errors = aggregate_late_cleanup_future_errors(&runtime, &[first, second, third], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("late-1"),
+            AsyncError::new("late-2"),
+            AsyncError::new("late-3"),
+        ]
+    );
+}
+
+#[test]
+fn aggregate_wait_uncaught_errors_final_order() {
+    // future.dart:542-558,579-590: cleanup errors keep order and the combined
+    // error belongs to the wait future, so it is the final uncaught item.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let cleanup_first = runtime.error(AsyncError::new("cleanup-1"));
+    let cleanup_second = runtime.error(AsyncError::new("cleanup-2"));
+    let combined = step.deliver(&runtime);
+    runtime.pump(16);
+    let errors = aggregate_wait_uncaught_errors(
+        &step,
+        &[cleanup_first, cleanup_second],
+        Some(&combined),
+        16,
+    );
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("boom"),
+        ]
+    );
+}
+
+#[test]
+fn wait_multi_round_results_are_byte_deterministic() {
+    // future.dart:517-600: the same completion sequence always produces the
+    // same wait result, including cleanup and uncaught ordering.
+    let rounds = vec![
+        vec![Some(ok(1)), Some(ok(2))],
+        vec![
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+        ],
+        vec![None, None],
+    ];
+    let mut first = Vec::new();
+    for inputs in &rounds {
+        let step = WaitStep::advance(inputs, FutureCombineErrorPolicy::Wait, None);
+        first.push(format!("{:?}", step.outcome));
+    }
+    for _ in 0..4 {
+        let mut replay = Vec::new();
+        for inputs in &rounds {
+            let step = WaitStep::advance(inputs, FutureCombineErrorPolicy::Wait, None);
+            replay.push(format!("{:?}", step.outcome));
+        }
+        assert_eq!(replay, first);
+    }
+}
+
+#[test]
+fn wait_cleanup_multi_round_replay_is_byte_deterministic() {
+    // future.dart:517-600: the same completion sequence produces identical
+    // cleaned_up, cleanup_errors and outcome on every replay.
+    let rounds = vec![
+        vec![
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        vec![
+            Some(ok(1)),
+            Some(ok(2)),
+            Some(Completion::Error(AsyncError::new("first"))),
+            Some(Completion::Error(AsyncError::new("second"))),
+        ],
+    ];
+    let snapshot = |rounds: &Vec<Vec<Option<Completion>>>| {
+        rounds
+            .iter()
+            .map(|inputs| {
+                let step = WaitStep::advance(
+                    inputs,
+                    FutureCombineErrorPolicy::Wait,
+                    Some(&|value| match value {
+                        FutureValue::Int(v) if *v == 1 => Err(AsyncError::new("cleanup-1")),
+                        _ => Ok(()),
+                    }),
+                );
+                format!("{:?}", (step.cleaned_up, step.cleanup_errors, step.outcome))
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = snapshot(&rounds);
+    for _ in 0..4 {
+        assert_eq!(snapshot(&rounds), first);
+    }
+}
+
+#[test]
+fn wait_cleanup_arrival_order_is_deterministic_across_replays() {
+    // future.dart:538-548,579-590: values present before the first error are
+    // cleaned up first; values completing later follow in source order. The
+    // same completion sequence replays the same joint order every time.
+    let build = |values_before: &[i64], error_at: usize, values_after: &[i64]| {
+        let mut inputs: Vec<Option<Completion>> = Vec::new();
+        for value in values_before {
+            inputs.push(Some(ok(*value)));
+        }
+        inputs.push(Some(Completion::Error(AsyncError::new("boom"))));
+        for _ in 0..error_at.saturating_sub(values_before.len() + 1) {
+            inputs.push(None);
+        }
+        for value in values_after {
+            inputs.push(Some(ok(*value)));
+        }
+        WaitStep::advance(
+            &inputs,
+            FutureCombineErrorPolicy::Wait,
+            Some(&|value| match value {
+                FutureValue::Int(v) => Err(AsyncError::new(format!("cleanup-{v}"))),
+                _ => Ok(()),
+            }),
+        )
+    };
+    let first = build(&[1], 3, &[2, 3]);
+    assert_eq!(first.cleaned_up, vec![int(1), int(2), int(3)]);
+    assert_eq!(
+        first.cleanup_errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("cleanup-3"),
+        ]
+    );
+    for _ in 0..4 {
+        let replay = build(&[1], 3, &[2, 3]);
+        assert_eq!(replay.cleaned_up, first.cleaned_up);
+        assert_eq!(replay.cleanup_errors, first.cleanup_errors);
+    }
+}
+
+#[test]
+fn wait_combined_future_ignores_repeated_delivery() {
+    // future_impl.dart:485-491,745-755: a future may only complete once;
+    // repeated combined completions keep the first result byte for byte.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[Some(ok(1)), Some(ok(2))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    );
+    let future = step.deliver(&runtime);
+    let first = step.deliver(&runtime);
+    let failed = WaitStep::advance(
+        &[Some(Completion::Error(AsyncError::new("late")))],
+        FutureCombineErrorPolicy::Wait,
+        None,
+    )
+    .deliver(&runtime);
+    runtime.pump(16);
+    assert_eq!(first.completion(), future.completion());
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Value(FutureValue::List(vec![int(1), int(2)])))
+    );
+    assert_eq!(
+        failed.completion(),
+        Some(Completion::Error(AsyncError::new("late")))
+    );
+    // The late error future is a separate future and is unhandled.
+    assert_eq!(runtime.unhandled_errors(), vec![AsyncError::new("late")]);
+}
+
+#[test]
+fn repeated_listener_attachments_follow_source_order() {
+    // future_impl.dart:593-612: listeners are stored in registration order
+    // and delivered in that order. Repeated attachments each notify once.
+    let runtime = FutureRuntime::new();
+    let future = runtime.value(int(1));
+    let order = Rc::new(RefCell::new(Vec::<String>::new()));
+    for tag in ["first", "second", "third"] {
+        let order = Rc::clone(&order);
+        let tag = tag.to_owned();
+        let _ = future.then(
+            &runtime,
+            Rc::new(move |value| {
+                order.borrow_mut().push(format!("{tag}:{value:?}"));
+                value
+            }) as OnValue,
+        );
+    }
+    runtime.pump(16);
+    assert_eq!(
+        *order.borrow(),
+        vec![
+            "first:Int(1)".to_owned(),
+            "second:Int(1)".to_owned(),
+            "third:Int(1)".to_owned(),
+        ]
+    );
 }
