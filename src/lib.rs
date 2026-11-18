@@ -10,6 +10,7 @@ pub mod error;
 pub mod gestures;
 pub mod host;
 pub mod ir;
+pub mod microtask;
 pub mod parallel_sched;
 pub mod plugin;
 pub mod plugin_host;
@@ -29,6 +30,7 @@ pub use gestures::{
 };
 pub use host::{AdapterFault, Host};
 pub use ir::{Action, Ir, Locale, Node, Op, Route, StateDecl, IR_VERSION};
+pub use microtask::{CallbackId, FrameCallbacks, FramePhase, FramePump, FrameStep, MicrotaskQueue};
 pub use parallel_sched::{
     cpu_bound_workload, measure_speedup, Clock, CounterClock, SchedulerMetrics, SpeedupMeasurement,
     SystemClock, WorkStealingScheduler, WorkStealingTaskHandle,
