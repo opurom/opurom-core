@@ -7,6 +7,7 @@
 pub mod async_sched;
 pub mod capabilities;
 pub mod convert;
+pub mod drag_axis;
 pub mod error;
 pub mod future;
 pub mod gestures;
@@ -30,6 +31,10 @@ pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
 pub use convert::{
     base64_decode, base64_encode, clamp_i64, uri_encode_component, uri_encode_query_component,
     utf8_decode, utf8_encode, Base64Variant, ConvertError,
+};
+pub use drag_axis::{
+    consider_fling, has_sufficient_distance, is_fling_gesture, primary_delta, primary_value,
+    DragAxis,
 };
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use future::{
