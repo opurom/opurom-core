@@ -201,6 +201,14 @@ fn rejects_illegal_event_actions() {
             "only legal for input events",
         ),
         (
+            // An op name outside the documented set stays rejected. `mul`,
+            // `div` and `backspace` are legal ops now, so the unknown-op
+            // diagnostic needs a name that is never legal.
+            int_state.clone(),
+            json!({"tap": {"op": "frobnicate", "target": "count", "value": 1}}),
+            "is not set, add, sub",
+        ),
+        (
             int_state.clone(),
             json!({"hover": {"op": "add", "target": "count", "value": 1}}),
             "unknown event name",
