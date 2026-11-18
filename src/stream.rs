@@ -38,8 +38,9 @@
 //!   controller's state error, and a paused target pauses its source
 //!   subscription; the returned future completes after source done is
 //!   forwarded; the controller `done` future is completed at the terminal
-//!   event even without listeners
-//!   (`async/stream_controller.dart:465-469,528-552,590-603,605-613,913-967`,
+//!   event even without listeners, and a canceled single subscription
+//!   completes it immediately
+//!   (`async/stream_controller.dart:465-469,528-552,590-613,913-967`,
 //!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
@@ -327,7 +328,7 @@ impl StreamSubscription {
     }
 
     pub fn cancel(&self) {
-        let on_cancel = {
+        let (on_cancel, done_waiters) = {
             let Ok(mut inner) = self.inner.try_borrow_mut() else {
                 // Re-entrant cancel during callback delivery; finalize after
                 // the current delivery step releases the controller borrow.
@@ -342,15 +343,26 @@ impl StreamSubscription {
             }
             inner.subscriptions.remove(&self.id);
             let no_subscribers = inner.subscriptions.values().all(|s| s.state.canceled);
-            if was_subscribed && no_subscribers {
+            let done_waiters = if was_subscribed && no_subscribers && !inner.broadcast {
+                std::mem::take(&mut inner.done_waiters)
+            } else {
+                Vec::new()
+            };
+            let on_cancel = if was_subscribed && no_subscribers {
                 inner.hooks.on_cancel.take()
             } else {
                 None
-            }
+            };
+            (on_cancel, done_waiters)
         };
         self.pending_cancel.set(false);
         if let Some(on_cancel) = on_cancel {
             on_cancel();
+        }
+        // A single-subscription controller's `done` future completes as soon
+        // as its subscriber cancels (`stream_controller.dart:605-613`).
+        for waiter in done_waiters {
+            let _ = waiter.complete(FutureValue::Null);
         }
     }
 

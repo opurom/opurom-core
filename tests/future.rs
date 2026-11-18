@@ -1023,3 +1023,33 @@ fn eager_cleanup_future_errors_are_reported_in_cleanup_order() {
     );
     assert_eq!(runtime.unhandled_errors(), errors);
 }
+
+#[test]
+fn non_eager_cleanup_future_and_combined_error_delivery_order() {
+    // future.dart:538-558,579-590: cleanup futures run via Future.sync and
+    // their errors are reported before the combined wait future completes.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let cleanup_future = runtime.error(AsyncError::new("cleanup-future"));
+    let future = step
+        .deliver_with_cleanup_futures(&runtime, &[cleanup_future], 16)
+        .unwrap();
+    let _handled = future.catch_error(&runtime, Rc::new(|_: &AsyncError| int(0)) as OnError);
+    runtime.pump(16);
+    assert_eq!(
+        runtime.unhandled_errors(),
+        vec![AsyncError::new("cleanup-future")]
+    );
+    assert_eq!(
+        future.completion(),
+        Some(Completion::Error(AsyncError::new("boom")))
+    );
+}

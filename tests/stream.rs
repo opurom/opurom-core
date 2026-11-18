@@ -1248,3 +1248,41 @@ fn add_stream_done_and_controller_done_keep_order() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+#[test]
+fn single_subscription_done_future_completes_on_cancel() {
+    // stream_controller.dart:605-613: controller.done completes when the
+    // single subscriber is canceled, even without a done event.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    assert!(!stream_done.is_completed());
+    subscription.cancel();
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn broadcast_done_future_waits_for_done_not_cancel() {
+    // broadcast_stream_controller.dart:84-95,278: a broadcast controller's
+    // done future completes only when its close event is processed.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    let subscription = stream.listen(None, None, None);
+    subscription.cancel();
+    future_runtime.pump(16);
+    assert!(!stream_done.is_completed());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
