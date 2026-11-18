@@ -31,8 +31,9 @@
 //!   order. Eager wait discards inputs that arrive after the first error
 //!   instead of cleaning them up; a future returned by cleanUp reports its
 //!   own error asynchronously; a combined delivery reports those errors
-//!   before the combined result (`async/future.dart:322-330,542-546,550-552,
-//!   579-590`);
+//!   before the combined result, and eager mode reports only cleanup futures
+//!   produced before the first error (`async/future.dart:322-330,542-546,
+//!   550-552,579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -893,6 +894,23 @@ pub fn wait_uncaught_errors(step: &WaitStep) -> WaitUncaughtErrors {
             _ => None,
         },
     }
+}
+
+/// Reports cleanup-future errors for an eager wait in cleanup order.
+///
+/// Dart completes eager wait immediately on the first error; cleanup futures
+/// already produced are still uncaught, but later inputs never produce
+/// cleanup bodies (`async/future.dart:550-552,579-590`).
+pub fn report_eager_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    cleanup_futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    let errors = wait_cleanup_future_errors(runtime, cleanup_futures, limit);
+    for error in &errors {
+        runtime.report_uncaught(error.clone());
+    }
+    errors
 }
 
 impl WaitUncaughtErrors {

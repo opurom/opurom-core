@@ -37,8 +37,10 @@
 //!   all errors. Direct adds and closes during pumping are refused with the
 //!   controller's state error, and a paused target pauses its source
 //!   subscription; the returned future completes after source done is
-//!   forwarded (`async/stream_controller.dart:465-469,528-552,590-603,
-//!   913-967`, `async/broadcast_stream_controller.dart:247-276`);
+//!   forwarded; the controller `done` future is completed at the terminal
+//!   event even without listeners
+//!   (`async/stream_controller.dart:465-469,528-552,590-603,605-613,913-967`,
+//!   `async/broadcast_stream_controller.dart:84-95,247-276,278`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -49,12 +51,12 @@
 //! always yields the same data on every host.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::dart_error::DartError;
 use crate::future::{AsyncError, Future, FutureRuntime, FutureValue};
 use crate::microtask::{CallbackId, MicrotaskQueue};
+use std::collections::VecDeque;
 
 /// An event carried by a stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -405,6 +407,11 @@ struct StreamInner {
     /// Events buffered for a single-subscription controller before listen
     /// (`stream_controller.dart:97-98`).
     pre_listen: VecDeque<StreamEvent>,
+    /// The controller's `done` future: completed when the terminal event has
+    /// been delivered or the subscription canceled
+    /// (`async/stream_controller.dart:605-613`,
+    /// `async/broadcast_stream_controller.dart:84-95,156`).
+    done_waiters: Vec<crate::future::Completer>,
     subscriptions: std::collections::BTreeMap<u32, Subscription>,
     hooks: StreamHooks,
     next_subscription: u32,
@@ -428,6 +435,7 @@ impl StreamInner {
             adding_stream: false,
             forwarding_add_stream: false,
             pre_listen: VecDeque::new(),
+            done_waiters: Vec::new(),
             subscriptions: std::collections::BTreeMap::new(),
             hooks,
             next_subscription: 1,
@@ -750,6 +758,16 @@ impl StreamRuntime {
         self.controller_with(hooks, true)
     }
 
+    fn complete_done_waiters(stream: &Stream) {
+        let waiters = {
+            let mut inner = stream.inner.borrow_mut();
+            std::mem::take(&mut inner.done_waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.complete(FutureValue::Null);
+        }
+    }
+
     fn controller_with(&self, hooks: StreamHooks, broadcast: bool) -> Stream {
         Stream::new(Rc::new(RefCell::new(StreamInner::new(broadcast, hooks))))
     }
@@ -798,9 +816,14 @@ impl StreamRuntime {
             inner.closed = true;
             inner.adding_stream = false;
         }
+        let was_done = matches!(event, StreamEvent::Done);
         if inner.subscriptions.is_empty() {
             if !inner.broadcast {
                 inner.pre_listen.push_back(event);
+            }
+            drop(inner);
+            if was_done {
+                Self::complete_done_waiters(stream);
             }
             return Ok(());
         }
@@ -865,7 +888,24 @@ impl StreamRuntime {
         }
         drop(inner);
         stream.finalize_pending_cancels();
+        if was_done {
+            Self::complete_done_waiters(stream);
+        }
         Ok(())
+    }
+
+    /// Returns a future completed when the controller's terminal event has
+    /// been delivered (`async/stream_controller.dart:605-613`,
+    /// `async/broadcast_stream_controller.dart:84-95,278`).
+    pub fn done_future(&self, stream: &Stream, runtime: &FutureRuntime) -> Future {
+        let mut inner = stream.inner.borrow_mut();
+        let completer = runtime.completer();
+        if inner.closed {
+            let _ = completer.complete(FutureValue::Null);
+        } else {
+            inner.done_waiters.push(completer.clone());
+        }
+        completer.future()
     }
 
     /// Closes `target` from the host. Dart refuses a direct close while a
@@ -885,6 +925,8 @@ impl StreamRuntime {
             return Ok(());
         }
         inner.closed = true;
+        drop(inner);
+        Self::complete_done_waiters(stream);
         Ok(())
     }
 

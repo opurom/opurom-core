@@ -1210,3 +1210,41 @@ fn single_subscription_add_stream_completion_future_order() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+// Controller done future and addStream completion ordering, pinned to Dart 3.14
+// (async/stream_controller.dart:605-613,913-967,
+//  async/broadcast_stream_controller.dart:84-95,278).
+#[test]
+fn done_future_completes_with_source_done() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let stream_done = runtime.done_future(&stream, &future_runtime);
+    assert!(!stream_done.is_completed());
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        stream_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}
+
+#[test]
+fn add_stream_done_and_controller_done_keep_order() {
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let target_done = runtime.done_future(&target, &future_runtime);
+    let add_done = runtime.add_stream(&target, &source, false).unwrap();
+    runtime.add(&source, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        target_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(
+        add_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+}

@@ -427,7 +427,10 @@ fn for_each_values_are_discarded() {
 
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
-use opurom_core::{wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors};
+use opurom_core::{
+    report_eager_cleanup_future_errors, wait_cleanup_future_errors, wait_error_at,
+    wait_uncaught_errors,
+};
 
 #[test]
 fn wait_error_uses_source_order_not_completion_order() {
@@ -1003,4 +1006,20 @@ fn wait_delivery_with_cleanup_futures_waits_for_all_inputs() {
     assert!(step
         .deliver_with_cleanup_futures(&runtime, &[], 16)
         .is_none());
+}
+
+#[test]
+fn eager_cleanup_future_errors_are_reported_in_cleanup_order() {
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("eager-cleanup-1"));
+    let second = runtime.error(AsyncError::new("eager-cleanup-2"));
+    let errors = report_eager_cleanup_future_errors(&runtime, &[first, second], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("eager-cleanup-1"),
+            AsyncError::new("eager-cleanup-2")
+        ]
+    );
+    assert_eq!(runtime.unhandled_errors(), errors);
 }
