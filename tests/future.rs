@@ -428,9 +428,9 @@ fn for_each_values_are_discarded() {
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
 use opurom_core::{
-    aggregate_late_cleanup_future_errors, report_eager_cleanup_future_errors,
-    report_late_cleanup_future_errors, wait_cleanup_future_errors, wait_error_at,
-    wait_uncaught_errors,
+    aggregate_late_cleanup_future_errors, aggregate_wait_uncaught_errors,
+    report_eager_cleanup_future_errors, report_late_cleanup_future_errors,
+    wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors,
 };
 
 #[test]
@@ -1126,6 +1126,40 @@ fn all_late_cleanup_future_errors_are_aggregated_in_cleanup_order() {
             AsyncError::new("late-1"),
             AsyncError::new("late-2"),
             AsyncError::new("late-3"),
+        ]
+    );
+}
+
+#[test]
+fn aggregate_wait_uncaught_errors_final_order() {
+    // future.dart:542-558,579-590: cleanup errors keep order and the combined
+    // error belongs to the wait future, so it is the final uncaught item.
+    let runtime = FutureRuntime::new();
+    let step = WaitStep::advance(
+        &[
+            Some(ok(1)),
+            Some(Completion::Error(AsyncError::new("boom"))),
+            Some(ok(2)),
+        ],
+        FutureCombineErrorPolicy::Wait,
+        Some(&|_| Ok(())),
+    );
+    let cleanup_first = runtime.error(AsyncError::new("cleanup-1"));
+    let cleanup_second = runtime.error(AsyncError::new("cleanup-2"));
+    let combined = step.deliver(&runtime);
+    runtime.pump(16);
+    let errors = aggregate_wait_uncaught_errors(
+        &step,
+        &[cleanup_first, cleanup_second],
+        Some(&combined),
+        16,
+    );
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("cleanup-1"),
+            AsyncError::new("cleanup-2"),
+            AsyncError::new("boom"),
         ]
     );
 }

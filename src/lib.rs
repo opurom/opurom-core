@@ -55,8 +55,8 @@ pub use drag_axis::{
 };
 pub use error::{CoreError, PluginError, SchedulerError};
 pub use future::{
-    aggregate_late_cleanup_future_errors, combine_completions, for_each_outcomes,
-    report_eager_cleanup_future_errors, report_late_cleanup_future_errors,
+    aggregate_late_cleanup_future_errors, aggregate_wait_uncaught_errors, combine_completions,
+    for_each_outcomes, report_eager_cleanup_future_errors, report_late_cleanup_future_errors,
     should_complete_wait_early, wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors,
     AsyncError, CleanupResult, CombineOutcome, Completer, Completion, ErrorTest, ForEachResult,
     Future, FutureCombineErrorPolicy, FutureRuntime, FutureValue, OnError, OnValue, WaitStep,

@@ -1397,3 +1397,37 @@ fn late_done_future_after_terminal_event_completes_immediately() {
         Some(Completion::Value(FutureValue::Null))
     );
 }
+
+#[test]
+fn as_future_on_closed_subscription_completes_immediately() {
+    // stream_impl.dart:785-802: asFuture on an already done subscription
+    // returns a future completed with the supplied value.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.broadcast_controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    runtime.add(&stream, StreamEvent::Done);
+    let future = subscription.as_future(&future_runtime, int(9));
+    future_runtime.pump(16);
+    assert_eq!(future.completion(), Some(Completion::Value(int(9))));
+}
+
+#[test]
+fn controller_done_and_as_future_share_the_same_terminal_step() {
+    // stream_controller.dart:605-613,762-773, stream_impl.dart:253-269: the
+    // controller done future and the per-subscription asFuture complete from
+    // the same terminal dispatch.
+    let runtime = StreamRuntime::new();
+    let future_runtime = FutureRuntime::new();
+    let stream = runtime.controller(StreamHooks::default());
+    let subscription = stream.listen(None, None, None);
+    let controller_done = runtime.done_future(&stream, &future_runtime);
+    let bridge = subscription.as_future(&future_runtime, int(42));
+    runtime.add(&stream, StreamEvent::Done);
+    future_runtime.pump(16);
+    assert_eq!(
+        controller_done.completion(),
+        Some(Completion::Value(FutureValue::Null))
+    );
+    assert_eq!(bridge.completion(), Some(Completion::Value(int(42))));
+}

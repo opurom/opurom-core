@@ -35,8 +35,8 @@
 //!   produced before the first error; non-eager delivery keeps that order
 //!   while waiting for all inputs, and cleanup errors that arrive later are
 //!   reported after the result, even when the combined wait succeeded; a
-//!   fully late set of cleanup futures aggregates in cleanup order
-//!   (`async/future.dart:322-330,542-558,574-590`);
+//!   fully late set of cleanup futures aggregates in cleanup order, with the
+//!   combined error last (`async/future.dart:322-330,542-558,574-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -850,6 +850,31 @@ pub fn aggregate_late_cleanup_future_errors(
     limit: usize,
 ) -> Vec<AsyncError> {
     wait_cleanup_future_errors(runtime, cleanup_futures, limit)
+}
+
+/// Final joint aggregation of cleanup-future and combined-future errors.
+///
+/// Cleanup errors keep cleanup order; the combined error, if present, comes
+/// last because `Future.wait` completes its own future after scheduling each
+/// cleanup body (`async/future.dart:542-558,579-590`). Hosts that observe the
+/// cleanup futures later can append them with
+/// [`aggregate_late_cleanup_future_errors`].
+pub fn aggregate_wait_uncaught_errors(
+    step: &WaitStep,
+    cleanup_futures: &[Future],
+    combined_future: Option<&Future>,
+    limit: usize,
+) -> Vec<AsyncError> {
+    let mut errors =
+        aggregate_late_cleanup_future_errors(&FutureRuntime::new(), cleanup_futures, limit);
+    if let Some(combined) = combined_future {
+        if let Some(Completion::Error(error)) = combined.completion() {
+            errors.push(error);
+        }
+    } else if let Some(CombineOutcome::Error(error)) = &step.outcome {
+        errors.push(error.clone());
+    }
+    errors
 }
 
 /// Reports cleanup-future errors that become observable only after the

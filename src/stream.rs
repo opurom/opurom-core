@@ -24,7 +24,9 @@
 //!   (`async/stream_impl.dart:69-76,392-395,429-445`);
 //! - `asFuture` overwrites the terminal handlers: done completes with a
 //!   supplied value, error cancels first and then completes with the original
-//!   error and stack trace (`async/stream_impl.dart:243-270`);
+//!   error and stack trace. On an already-done subscription it completes
+//!   immediately with the supplied value
+//!   (`async/stream_impl.dart:243-270,785-802`);
 //! - `onListen` is called on the first subscriber and `onCancel` when the
 //!   last subscriber leaves (`async/stream_controller.dart:168-171`);
 //! - `close` sends a done event to the listeners subscribed at close time;
@@ -315,18 +317,29 @@ impl StreamSubscription {
         let error_completer = completer.clone();
         let cancel_self = self.clone();
         let mut overrides = self.inner.borrow_mut();
-        if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
+        let closed_value = value.clone();
+        let mut already_closed = false;
+        let installed = if let Some(subscription) = overrides.subscriptions.get_mut(&self.id) {
             // The overrides replace this subscription's terminal handlers
             // only (`stream_impl.dart:253-269`); other listeners keep theirs.
-            subscription.on_done = Some(Rc::new(move || {
-                let _ = done_completer.complete(value.clone());
-            }));
-            subscription.on_error = Some(Rc::new(move |error| {
-                cancel_self.cancel();
-                let _ = error_completer.complete_error(error.clone());
-            }));
-        }
+            already_closed = subscription.closed;
+            if !already_closed {
+                subscription.on_done = Some(Rc::new(move || {
+                    let _ = done_completer.complete(value.clone());
+                }));
+                subscription.on_error = Some(Rc::new(move |error| {
+                    cancel_self.cancel();
+                    let _ = error_completer.complete_error(error.clone());
+                }));
+            }
+            true
+        } else {
+            false
+        };
         drop(overrides);
+        if installed && already_closed {
+            let _ = completer.complete(closed_value);
+        }
         completer.future()
     }
 
