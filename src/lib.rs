@@ -7,6 +7,7 @@
 pub mod async_sched;
 pub mod capabilities;
 pub mod error;
+pub mod future;
 pub mod gestures;
 pub mod host;
 pub mod ir;
@@ -25,6 +26,10 @@ pub mod text_input;
 pub use async_sched::{AsyncScheduler, SchedulingHook, SchedulingTask, TaskContext, TaskId};
 pub use capabilities::{CapabilityHost, NATIVE_CAPABILITIES};
 pub use error::{CoreError, PluginError, SchedulerError};
+pub use future::{
+    AsyncError, Completer, Completion, ErrorTest, Future, FutureRuntime, FutureValue, OnError,
+    OnValue,
+};
 pub use gestures::{
     ArenaEvent, ArenaStep, CancelReason, GestureArenaKernel, GestureKind, HitEntry, Point,
     PointerKind, RecognizerEvent, Velocity, PRESS_TIMEOUT_MS,
