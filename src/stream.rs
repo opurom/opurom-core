@@ -34,9 +34,10 @@
 //!   `async/stream_controller.dart:581-587,628-656`);
 //! - `addStream` forwards source events in order; `cancelOnError=true`
 //!   forwards the first error and closes the target, while `false` forwards
-//!   all errors. Direct adds during pumping are refused, and a paused target
-//!   pauses its source subscription
-//!   (`async/stream_controller.dart:465-469,528-552,590-603,913-938`);
+//!   all errors. Direct adds and closes during pumping are refused with the
+//!   controller's state error, and a paused target pauses its source
+//!   subscription (`async/stream_controller.dart:465-469,528-552,590-603,
+//!   913-938`, `async/broadcast_stream_controller.dart:247-276`);
 //! - `map`, `where` and `distinct` are forwarding pipes: errors and done
 //!   events pass through unchanged; a callback error becomes an error event
 //!   (`async/stream_pipe.dart:213-253,485-530`, `async/stream.dart:751-795,1626-1628`).
@@ -785,9 +786,12 @@ impl StreamRuntime {
         }
         let direct_add = !inner.forwarding_add_stream;
         if inner.adding_stream && direct_add {
-            return Err(DartError::State(
-                "Cannot add event while adding a stream".to_owned(),
-            ));
+            let message = if inner.broadcast {
+                "Cannot add new events while doing an addStream"
+            } else {
+                "Cannot add event while adding a stream"
+            };
+            return Err(DartError::State(message.to_owned()));
         }
         if matches!(event, StreamEvent::Done) {
             inner.closed = true;
@@ -860,6 +864,26 @@ impl StreamRuntime {
         }
         drop(inner);
         stream.finalize_pending_cancels();
+        Ok(())
+    }
+
+    /// Closes `target` from the host. Dart refuses a direct close while a
+    /// controller is pumping an `addStream` source
+    /// (`async/broadcast_stream_controller.dart:266-276,247-252`).
+    pub fn try_close(&self, stream: &Stream) -> Result<(), DartError> {
+        let mut inner = stream.inner.borrow_mut();
+        if inner.adding_stream {
+            let message = if inner.broadcast {
+                "Cannot add new events while doing an addStream"
+            } else {
+                "Cannot add event while adding a stream"
+            };
+            return Err(DartError::State(message.to_owned()));
+        }
+        if inner.closed {
+            return Ok(());
+        }
+        inner.closed = true;
         Ok(())
     }
 

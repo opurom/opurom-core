@@ -1124,3 +1124,60 @@ fn paused_target_pauses_the_add_stream_source() {
     subscription.resume();
     assert_eq!(*seen.borrow(), vec![int(1)]);
 }
+
+// Broadcast addStream snapshot and close ordering, pinned to Dart 3.14
+// (async/broadcast_stream_controller.dart:247-276,266-303,404-413).
+#[test]
+fn broadcast_add_stream_delivers_to_listeners_subscribed_before_source_event() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let first = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let second = Rc::new(RefCell::new(Vec::<FutureValue>::new()));
+    let first_clone = Rc::clone(&first);
+    let second_clone = Rc::clone(&second);
+    target.listen(
+        Some(Rc::new(move |v| first_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    let _ = runtime.add_stream(&target, &source, false);
+    target.listen(
+        Some(Rc::new(move |v| second_clone.borrow_mut().push(v)) as DataCallback),
+        None,
+        None,
+    );
+    runtime.add(&source, StreamEvent::Data(int(1)));
+    // The first listener was present when addStream subscribed, so it forwards
+    // the source event through the controller; the later listener is still a
+    // current target listener and receives the same forwarded event.
+    assert_eq!(*first.borrow(), vec![int(1)]);
+    assert_eq!(*second.borrow(), vec![int(1)]);
+}
+
+#[test]
+fn broadcast_direct_add_during_add_stream_has_official_message() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_add(&target, StreamEvent::Data(int(1)));
+    assert_eq!(
+        error.err(),
+        Some(DartError::State(
+            "Cannot add new events while doing an addStream".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn broadcast_close_during_add_stream_is_refused() {
+    let runtime = StreamRuntime::new();
+    let target = runtime.broadcast_controller(StreamHooks::default());
+    let source = runtime.broadcast_controller(StreamHooks::default());
+    let _ = runtime.add_stream(&target, &source, false);
+    let error = runtime.try_close(&target);
+    assert!(matches!(error, Err(DartError::State(_))));
+    runtime.add(&source, StreamEvent::Done);
+    assert!(runtime.try_close(&target).is_ok());
+}

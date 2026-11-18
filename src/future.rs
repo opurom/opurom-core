@@ -29,8 +29,9 @@
 //! - a failing `cleanUp` body is uncaught and reported before the combined
 //!   future completes; with several values the cleanup errors follow source
 //!   order. Eager wait discards inputs that arrive after the first error
-//!   instead of cleaning them up
-//!   (`async/future.dart:542-546,550-552,579-590`);
+//!   instead of cleaning them up; a future returned by cleanUp reports its
+//!   own error asynchronously (`async/future.dart:322-330,542-546,550-552,
+//!   579-590`);
 //! - completing with an error before any listener is attached reports an
 //!   unhandled error (`async/future.dart:819-823,1336-1351`);
 //! - `Future.value` and `Completer.complete` propagate through the microtask
@@ -789,6 +790,50 @@ impl WaitStep {
             outcome,
         }
     }
+}
+
+/// What a `cleanUp` body produced for a successful value. Dart's
+/// `Future.sync(() { cleanUp(value); })` discards a returned future, but that
+/// future still reports its own error asynchronously
+/// (`async/future.dart:542-546,581-585`).
+#[derive(Debug, Clone)]
+pub enum CleanupResult {
+    /// No error.
+    Done,
+    /// A synchronous error, surfaced through `Future.sync`.
+    Error(AsyncError),
+    /// A future whose later error is still uncaught.
+    Future(Future),
+}
+
+/// Collects errors from futures returned by cleanUp bodies, in cleanup order.
+/// Each error is observed after the host pumps the runtime, matching Dart's
+/// async reporting through `Future.sync` (`async/future.dart:322-330`).
+pub fn wait_cleanup_future_errors(
+    runtime: &FutureRuntime,
+    futures: &[Future],
+    limit: usize,
+) -> Vec<AsyncError> {
+    let observed: Vec<Rc<RefCell<Option<AsyncError>>>> = futures
+        .iter()
+        .map(|future| {
+            let slot = Rc::new(RefCell::new(None));
+            let handler_slot = Rc::clone(&slot);
+            let _ = future.catch_error(
+                runtime,
+                Rc::new(move |error: &AsyncError| {
+                    *handler_slot.borrow_mut() = Some(error.clone());
+                    FutureValue::Null
+                }) as OnError,
+            );
+            slot
+        })
+        .collect();
+    runtime.pump(limit);
+    observed
+        .into_iter()
+        .filter_map(|slot| slot.borrow().clone())
+        .collect()
 }
 
 /// The order in which a host must surface uncaught errors after

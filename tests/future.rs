@@ -427,7 +427,7 @@ fn for_each_values_are_discarded() {
 
 // Future.wait after-error ordering, pinned to Dart 3.14
 // (async/future.dart:517-600).
-use opurom_core::{wait_error_at, wait_uncaught_errors};
+use opurom_core::{wait_cleanup_future_errors, wait_error_at, wait_uncaught_errors};
 
 #[test]
 fn wait_error_uses_source_order_not_completion_order() {
@@ -932,6 +932,25 @@ fn wait_cleanup_errors_global_order_across_first_error_and_late_values() {
             AsyncError::new("cleanup-0"),
             AsyncError::new("cleanup-2"),
             AsyncError::new("cleanup-3"),
+        ]
+    );
+}
+
+// cleanUp returning a Future, pinned to Dart 3.14
+// (async/future.dart:322-330,542-546,581-585).
+#[test]
+fn cleanup_future_errors_are_observed_after_pumping_in_cleanup_order() {
+    // Future.sync ignores a returned future, but its error is still reported
+    // to the zone when that future completes (`future.dart:322-330`).
+    let runtime = FutureRuntime::new();
+    let first = runtime.error(AsyncError::new("cleanup-future-1"));
+    let second = runtime.error(AsyncError::new("cleanup-future-2"));
+    let errors = wait_cleanup_future_errors(&runtime, &[first, second], 16);
+    assert_eq!(
+        errors,
+        vec![
+            AsyncError::new("cleanup-future-1"),
+            AsyncError::new("cleanup-future-2")
         ]
     );
 }
