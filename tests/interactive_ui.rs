@@ -610,9 +610,11 @@ fn malformed_ir_is_rejected_with_a_readable_diagnostic() {
             "expects int",
         ),
         (
+            // Unknown op names stay rejected; `mul` is a legal op now, so the
+            // diagnostic is pinned with a name that is never legal.
             ir_document(
                 json!([{"name": "a", "type": "int", "init": 0}]),
-                json!({"tap": {"actions": [{"op": "mul", "target": "a", "value": 1}]}}),
+                json!({"tap": {"actions": [{"op": "frobnicate", "target": "a", "value": 1}]}}),
             ),
             "is not set, add, sub",
         ),

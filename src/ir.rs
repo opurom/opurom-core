@@ -14,6 +14,9 @@ pub enum Op {
     Set,
     Add,
     Sub,
+    Mul,
+    Div,
+    Backspace,
     Toggle,
     Append,
     RemoveAt,
@@ -353,7 +356,7 @@ fn parse_action(
     let value;
     let value_from;
     match op.as_str() {
-        "add" | "sub" => {
+        "add" | "sub" | "mul" | "div" => {
             if !matches!(declared, Value::Int(_)) {
                 return Err(invalid(format!(
                     "{at}: {op} requires an int target, {target:?} is {}",
@@ -463,6 +466,19 @@ fn parse_action(
                 }
             }
         }
+        "backspace" => {
+            if !matches!(declared, Value::Int(_) | Value::Str(_)) {
+                return Err(invalid(format!(
+                    "{at}: backspace requires an int or string target, {target:?} is {}",
+                    declared.type_name()
+                )));
+            }
+            if raw_value.is_some() || raw_from.is_some() {
+                return Err(invalid(format!("{at}: backspace must not have a value")));
+            }
+            value = None;
+            value_from = None;
+        }
         "set" => {
             // A list is replaced whole by `assign`, so no `set` spelling
             // (literal, valueFrom or input text) may reach a list target.
@@ -503,7 +519,7 @@ fn parse_action(
         }
         _ => {
             return Err(invalid(format!(
-                "{at}.op {op:?} is not set, add, sub, toggle, append, removeAt or assign"
+                "{at}.op {op:?} is not set, add, sub, mul, div, backspace, toggle, append, removeAt or assign"
             )))
         }
     };
@@ -511,6 +527,9 @@ fn parse_action(
         "set" => Op::Set,
         "add" => Op::Add,
         "sub" => Op::Sub,
+        "mul" => Op::Mul,
+        "div" => Op::Div,
+        "backspace" => Op::Backspace,
         "append" => Op::Append,
         "removeAt" => Op::RemoveAt,
         "assign" => Op::Assign,
